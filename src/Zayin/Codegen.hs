@@ -255,6 +255,7 @@ builtinIdentCodegen ident = do
   let (numParams, runtimeName) = case ident of
         "tostring" -> (2, "to_string_k")
         "display" -> (2, "display_k")
+        "spawn" -> (2, "spawn_k")
         "exit" -> (1, "exit_k")
         "+" -> (2, "add_k")
         "-" -> (2, "sub_k")
@@ -271,7 +272,7 @@ builtinIdentCodegen ident = do
         "null?" -> (2, "is_null_k")
         "car" -> (2, "car_k")
         "cdr" -> (2, "cdr_k")
-        "string-concat" -> (2, "string_concat_k")
+        "<>" -> (2, "string_concat_k")
         "string-chars" -> (2, "string_chars_k")
         "ht-new" -> (2, "ht_new_k")
         "ht-set!" -> (2, "ht_set_k")
