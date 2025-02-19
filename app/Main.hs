@@ -207,7 +207,7 @@ main = do
   -- Read the source file provided on the command line
   src <- TIO.readFile (sourceFile opts)
 
-  putStrLn("\nSource being compiled: " ++ T.unpack src)
+  putStrLn("\nSource being compiled:\n" ++ T.unpack src)
 
   -- Parse the file using your top-level parser.
   case parse parseProgram "" src of
