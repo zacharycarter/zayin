@@ -239,7 +239,8 @@ main = do
   putStrLn "\nBound Expression:"
   putStrLn (renderBExpr boundExpr)
 
-  let k = CPS.BuiltinIdent "exit"
+  let
+      k = CPS.BuiltinIdent "exit"
       (fExpr, _) = runState (toFExprM boundExpr k) state1
   putStrLn "\nAfter Conversion:"
   print fExpr

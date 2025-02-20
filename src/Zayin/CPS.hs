@@ -18,4 +18,6 @@ data CExp
   | SetThen T.Text AExp CExp
   | Call1 AExp AExp
   | Call2 AExp AExp AExp
+  | DupThen T.Text AExp CExp
+  | DropThen T.Text CExp
   deriving (Show, Eq)

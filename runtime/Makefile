@@ -9,7 +9,7 @@ SANITIZE ?=
 # Set SAN_FLAGS based on the SANITIZE variable.
 SAN_FLAGS :=
 ifeq ($(SANITIZE),asan)
-  SAN_FLAGS = -fsanitize=address
+  SAN_FLAGS = -fsanitize=thread
 endif
 ifeq ($(SANITIZE),tsan)
   SAN_FLAGS = -fsanitize=thread
@@ -23,7 +23,7 @@ TESTS = test_queue test_base
 default: compiled_result
 
 compiled_result: compiled_result.c gc.c base.c builtin.c bit_array.c scheduler.c thread_context.c
-	$(CC) $(ALL_CFLAGS) compiled_result.c gc.c base.c builtin.c bit_array.c scheduler.c thread_context.c -o compiled_result -static-libasan
+	$(CC) $(ALL_CFLAGS) compiled_result.c gc.c base.c builtin.c bit_array.c scheduler.c thread_context.c -o compiled_result
 
 base.o: base.c base.h gc.h queue.h vec.h common.h
 	$(CC) $(ALL_CFLAGS) -c base.c -o base.o

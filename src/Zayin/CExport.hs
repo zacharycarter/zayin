@@ -80,7 +80,10 @@ generateC rootStmts protos decls =
       toC mainLambda
     ]
   where
-    finalStmts = rootStmts ++ [SExpr (EMacroCall "__builtin_unreachable" [])]
+    finalStmts = case last rootStmts of
+      SExpr (EMacroCall "call_closure_one" [EVar "exit_k", _]) ->
+        init rootStmts ++ [SExpr (EMacroCall "__builtin_unreachable" [])]
+      _ -> rootStmts ++ [SExpr (EMacroCall "__builtin_unreachable" [])]
     mainLambda =
       DFun
         { dName = "main_lambda",
@@ -89,5 +92,6 @@ generateC rootStmts protos decls =
             [ ("input_obj", TPtr (TStruct "obj")),
               ("input_env", TPtr (TStruct "env_obj"))
             ],
-          dBody = finalStmts
+          dBody = finalStmts ++
+                  [ SExpr (EMacroCall "OBJECT_ENV_OBJ_NEW" [EVar "var_main", EVar $ "struct env_0"]) ]
         }

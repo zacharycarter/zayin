@@ -4,7 +4,6 @@ module Zayin.LiftedExpr (LExpr (..), LiftedLambda (..)) where
 
 import Data.HashMap.Strict (HashMap)
 import Data.Set (Set)
-import qualified Data.Set as Set
 import qualified Data.Text as T
 import Zayin.Literals (Literal)
 
