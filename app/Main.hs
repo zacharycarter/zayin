@@ -23,6 +23,8 @@ import Text.Parsec (parse)
 
 -- Import your own modules (make sure these are available in your project)
 import Zayin.AST
+import Zayin.AST.Pretty
+import Zayin.BoundExpr.Pretty
 import Zayin.CExport (generateC)
 import qualified Zayin.CPS as CPS
 import Zayin.Codegen (codegen)
@@ -210,74 +212,83 @@ main = do
   putStrLn("\nSource being compiled:\n" ++ T.unpack src)
 
   -- Parse the file using your top-level parser.
-  case parse parseProgram "" src of
-    Left err -> do
-      putStrLn ("Parse error:\n" ++ show err)
+  -- case parse parseProgram "" src of
+  --   Left err -> do
+  --     putStrLn ("Parse error:\n" ++ show err)
+  --     exitFailure
+  --   Right expr -> do
+  --     putStrLn "High-level AST:"
+  --     print expr
+
+  let
+    wrappedExpr =
+      EApp
+        (ELam [] (ExprBody
+          { bodyExprs = [ Def "addOne" (ELam ["x"] (ExprBody [] (EApp (EVar "+") [EVar "x", ELit (LInt 1)]))) ]
+          , finalExpr = EApp (EVar "addOne") [ELit (LInt 1)]
+          }))
+        []
+
+      -- EApp (ELam [] (ExprBody [] expr)) []  -- wrapping the AST
+  putStrLn "Wrapped AST:"
+  putStrLn (renderExpr wrappedExpr)
+
+  -- Original processing of the AST:
+  let initial = Gen id
+      (boundExpr, state1) = runState (toBoundExprM wrappedExpr) initial
+  putStrLn "\nBound Expression:"
+  putStrLn (renderBExpr boundExpr)
+
+  let k = CPS.BuiltinIdent "exit"
+      (fExpr, _) = runState (toFExprM boundExpr k) state1
+  putStrLn "\nAfter Conversion:"
+  print fExpr
+
+  let (e, lambdas) = liftLambdas fExpr
+  putStrLn "\nFinal expr before codegen:"
+  traverse_ (\(k', v) -> putStrLn $ "Lambda " ++ show k' ++ ":\n" ++ show v) (toList lambdas)
+
+  let (rootStmts, protos, decls) = codegen e lambdas
+  putStrLn "\nCodegen Context:"
+  traverse_ (\s -> putStrLn $ "Root statement: " ++ show s) rootStmts
+  traverse_ (\p -> putStrLn $ "Proto: " ++ show p) protos
+  traverse_ (\d -> putStrLn $ "Decl: " ++ show d) decls
+
+  -- Generate the build directory and write the generated C code:
+  buildDir <- generateBuildDir
+  let cCode = generateC rootStmts protos decls
+      fullSource = generateProgramSource cCode
+  putStrLn "\nGenerated C Code:"
+  TIO.putStrLn fullSource
+  insertSourceIntoBuildDir buildDir fullSource
+
+  -- Invoke make to build the C code:
+  makeResult <- invokeMake buildDir
+  case makeResult of
+    Left errMsg -> do
+      putStrLn $ "\nFailed compiling generated C code: " ++ errMsg
       exitFailure
-    Right expr -> do
-      putStrLn "High-level AST:"
-      print expr
+    Right stdoutStr -> do
+      putStrLn "\nCompilation result:"
+      putStrLn stdoutStr
+      when (debug opts) $ putStrLn stdoutStr
 
-      let wrappedExpr = EApp (ELam [] (ExprBody [] expr)) []  -- wrapping the AST
-      putStrLn "Wrapped AST:"
-      print wrappedExpr
+  -- Depending on the command, either copy the binary or run it:
+  case cmd opts of
+    Compile { output = out } -> do
+      copyBinary buildDir out `catch` handlerCopy
+      putStrLn $ "Compiled binary copied to " ++ out
+    Run -> do
+      let exePath = buildDir </> "compiled_result"
+      putStrLn $ "Running " ++ exePath
+      callProcess exePath []
 
-      -- Original processing of the AST:
-      let initial = Gen id
-          (boundExpr, state1) = runState (toBoundExprM wrappedExpr) initial
-      putStrLn "\nBound Expression:"
-      print boundExpr
-
-      let k = CPS.BuiltinIdent "exit"
-          (fExpr, _) = runState (toFExprM boundExpr k) state1
-      putStrLn "\nAfter Conversion:"
-      print fExpr
-
-      let (e, lambdas) = liftLambdas fExpr
-      putStrLn "\nFinal expr before codegen:"
-      traverse_ (\(k', v) -> putStrLn $ "Lambda " ++ show k' ++ ":\n" ++ show v) (toList lambdas)
-
-      let (rootStmts, protos, decls) = codegen e lambdas
-      putStrLn "\nCodegen Context:"
-      traverse_ (\s -> putStrLn $ "Root statement: " ++ show s) rootStmts
-      traverse_ (\p -> putStrLn $ "Proto: " ++ show p) protos
-      traverse_ (\d -> putStrLn $ "Decl: " ++ show d) decls
-
-      -- Generate the build directory and write the generated C code:
-      buildDir <- generateBuildDir
-      let cCode = generateC rootStmts protos decls
-          fullSource = generateProgramSource cCode
-      putStrLn "\nGenerated C Code:"
-      TIO.putStrLn fullSource
-      insertSourceIntoBuildDir buildDir fullSource
-
-      -- Invoke make to build the C code:
-      makeResult <- invokeMake buildDir
-      case makeResult of
-        Left errMsg -> do
-          putStrLn $ "\nFailed compiling generated C code: " ++ errMsg
-          exitFailure
-        Right stdoutStr -> do
-          putStrLn "\nCompilation result:"
-          putStrLn stdoutStr
-          when (debug opts) $ putStrLn stdoutStr
-
-      -- Depending on the command, either copy the binary or run it:
-      case cmd opts of
-        Compile { output = out } -> do
-          copyBinary buildDir out `catch` handlerCopy
-          putStrLn $ "Compiled binary copied to " ++ out
-        Run -> do
-          let exePath = buildDir </> "compiled_result"
-          putStrLn $ "Running " ++ exePath
-          callProcess exePath []
-
-      -- Clean up the temporary build directory unless requested otherwise:
-      if not (keepTmpdir opts)
-        then do
-          removeDirectoryRecursive buildDir
-          putStrLn "Temporary build directory removed."
-        else putStrLn $ "Temporary build directory kept: " ++ buildDir
+  -- Clean up the temporary build directory unless requested otherwise:
+  if not (keepTmpdir opts)
+    then do
+      removeDirectoryRecursive buildDir
+      putStrLn "Temporary build directory removed."
+    else putStrLn $ "Temporary build directory kept: " ++ buildDir
 
   where
     handlerCopy :: SomeException -> IO ()

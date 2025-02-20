@@ -1,4 +1,1 @@
-fn threadTest(id) =
-  print(concat(concat("Hello from thread ", id), "\n"))
-
-threadTest(1)
+print (1 + 1)

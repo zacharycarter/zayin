@@ -89,11 +89,5 @@ generateC rootStmts protos decls =
             [ ("input_obj", TPtr (TStruct "obj")),
               ("input_env", TPtr (TStruct "env_obj"))
             ],
-          dBody = finalStmts ++
-                   [ SExpr (EMacroCall "OBJECT_ENV_OBJ_NEW" [EVar "var_main", EVar $ "struct env_1"]),
-                     SExpr (EMacroCall "OBJECT_CLOSURE_TWO_NEW" [EVar "var_entry", EVar "lambda_1", EVar "var_main"]),
-                     SExpr (EMacroCall "OBJECT_CLOSURE_ONE_NEW" [EVar "var_exit", EVar "exit_k", ENull]),
-                     SExpr (EMacroCall "call_closure_two" [EVar "var_entry", ENull, EVar "var_exit"]),
-                     SExpr (EMacroCall "__builtin_unreachable" [])
-                   ]
+          dBody = finalStmts
         }
