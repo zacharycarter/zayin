@@ -1,5 +1,5 @@
-#ifndef SOMESCHEME_BUILTIN_H
-#define SOMESCHEME_BUILTIN_H
+#ifndef ZAYIN_BUILTIN_H
+#define ZAYIN_BUILTIN_H
 
 #include "base.h"
 
@@ -163,4 +163,4 @@ DEFINE_TWO_ARG_FROM_BUILTIN(eq);
 
 _Bool obj_is_truthy(struct obj *);
 
-#endif // SOMESCHEME_BUILTIN_H
+#endif // ZAYIN_BUILTIN_H

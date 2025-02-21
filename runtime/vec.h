@@ -1,6 +1,7 @@
 #ifndef SOMESCHEME_VEC_H
 #define SOMESCHEME_VEC_H
 
+#include <mimalloc.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +28,7 @@
 
 #define MAKE_VECTOR(TYPE, TNAME)                                               \
   struct vector_##TNAME vector_##TNAME##_new(size_t initial) {                 \
-    TYPE *data = malloc(sizeof(TYPE) * initial);                               \
+    TYPE *data = mi_malloc(sizeof(TYPE) * initial);                            \
     return (struct vector_##TNAME){initial, 0, data};                          \
   }                                                                            \
   TYPE vector_##TNAME##_pop(struct vector_##TNAME *vec) {                      \
@@ -73,7 +74,7 @@
     vec->data = realloc(vec->data, vec->length * sizeof(TYPE));                \
     vec->cap = vec->length;                                                    \
   }                                                                            \
-  void vector_##TNAME##_free(struct vector_##TNAME *vec) { free(vec->data); }  \
+  void vector_##TNAME##_free(struct vector_##TNAME *vec) { mi_free(vec->data); }  \
   void vector_##TNAME##_remove(struct vector_##TNAME *vec, size_t idx) {       \
     if (DEBUG_ONLY(idx < 0 || idx >= vec->length)) {                           \
       RUNTIME_ERROR("Indexing vector out of bounds");                          \

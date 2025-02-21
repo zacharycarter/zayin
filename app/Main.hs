@@ -29,7 +29,9 @@ import Zayin.CExport (generateC)
 import qualified Zayin.CPS as CPS
 import Zayin.Codegen (codegen)
 import Zayin.FlatExpr (liftLambdas)
+import Zayin.FlatExpr.Pretty (renderFExpr)
 import Zayin.Literals
+import Zayin.LiftedExpr.Pretty (renderLExpr, renderLiftedLambda)
 import Zayin.Transforms (toFExprM)
 import Zayin.Parser (parseProgram)  -- your top-level parser
 
@@ -93,11 +95,11 @@ runtimeFiles =
     ("gc.c", $(makeRelativeToProject "runtime/gc.c" >>= embedFile)),
     ("hash_table.h", $(makeRelativeToProject "runtime/hash_table.h" >>= embedFile)),
     ("queue.h", $(makeRelativeToProject "runtime/queue.h" >>= embedFile)),
-    ("queue_thunk.h", $(makeRelativeToProject "runtime/queue_thunk.h" >>= embedFile)),
-    ("scheduler.h", $(makeRelativeToProject "runtime/scheduler.h" >>= embedFile)),
-    ("scheduler.c", $(makeRelativeToProject "runtime/scheduler.c" >>= embedFile)),
-    ("thread_context.h", $(makeRelativeToProject "runtime/thread_context.h" >>= embedFile)),
-    ("thread_context.c", $(makeRelativeToProject "runtime/thread_context.c" >>= embedFile)),
+    -- ("queue_thunk.h", $(makeRelativeToProject "runtime/queue_thunk.h" >>= embedFile)),
+    -- ("scheduler.h", $(makeRelativeToProject "runtime/scheduler.h" >>= embedFile)),
+    -- ("scheduler.c", $(makeRelativeToProject "runtime/scheduler.c" >>= embedFile)),
+    -- ("thread_context.h", $(makeRelativeToProject "runtime/thread_context.h" >>= embedFile)),
+    -- ("thread_context.c", $(makeRelativeToProject "runtime/thread_context.c" >>= embedFile)),
     ("test_queue.c", $(makeRelativeToProject "runtime/test_queue.c" >>= embedFile)),
     ("vec.h", $(makeRelativeToProject "runtime/vec.h" >>= embedFile)),
     ("Makefile", $(makeRelativeToProject "runtime/Makefile" >>= embedFile))
@@ -152,49 +154,28 @@ generateProgramSource :: T.Text -> T.Text
 generateProgramSource src =
   T.concat
     [ T.unlines
-        [ "#include <stdlib.h>",
+        [ "#include <mimalloc.h>",
+          "#include <stdlib.h>",
           "#include <string.h>",
-          "#include<unistd.h>",
+          "#include <unistd.h>",
           "#include \"base.h\"",
-          "#include \"builtin.h\"",
-          "#include \"scheduler.h\""
+          "#include \"builtin.h\""
         ],
       src,
       T.unlines
         [ "int main(void) {"
-        , "    start_scheduler();  // Start the scheduler (worker threads run in background)"
-        , "    // Schedule the initial thunk (e.g., the computation for 1+1)"
+        , "    mi_version();"
         , "    struct closure_obj initial_closure = object_closure_one_new(main_lambda, NULL);"
         , "    struct thunk initial_thunk = {"
         , "        .closr = &initial_closure,"
         , "        .one = {NULL},"
         , "    };"
         , ""
-        , "    struct thunk *thnk_heap = malloc(sizeof(struct thunk));"
+        , "    struct thunk *thnk_heap = mi_malloc(sizeof(struct thunk));"
         , "    memcpy(thnk_heap, &initial_thunk, sizeof(struct thunk));"
-        , "    schedule_thunk(thnk_heap);"
-        , ""
-        , "    // Main thread can now either wait, process further work, or exit."
-        , "    while (1) {"
-        , "        sleep(1);"
-        , "    }"
-        , "    return 0;"
+        , "    zayin_start(thnk_heap);"
         , "}"
         ]
-        -- [ "int main() {",
-        --   "  start_scheduler();",
-        --   "  struct closure_obj initial_closure = object_closure_one_new(main_lambda, NULL);",
-        --   "  struct thunk initial_thunk = {",
-        --   "    .closr = &initial_closure,",
-        --   "    .one = {NULL},",
-        --   "  };",
-        --   "",
-        --   "  struct thunk *thnk_heap = malloc(sizeof(struct thunk));",
-        --   "  memcpy(thnk_heap, &initial_thunk, sizeof(struct thunk));",
-        --   "  schedule_thunk(thnk_heap);",
-        --   "  return 0;",
-        --   "}"
-        -- ]
     ]
 
 --------------------------------------------------------------------------------
@@ -236,18 +217,15 @@ main = do
   -- Original processing of the AST:
   let initial = Gen id
       (boundExpr, state1) = runState (toBoundExprM wrappedExpr) initial
-  putStrLn "\nBound Expression:"
-  putStrLn (renderBExpr boundExpr)
+  putStrLn ("\nBound Expression: " ++ (renderBExpr boundExpr))
 
-  let
-      k = CPS.BuiltinIdent "exit"
+  let k = CPS.BuiltinIdent "exit"
       (fExpr, _) = runState (toFExprM boundExpr k) state1
-  putStrLn "\nAfter Conversion:"
-  print fExpr
+  putStrLn ("\nAfter conversion: " ++ (renderFExpr fExpr))
 
   let (e, lambdas) = liftLambdas fExpr
-  putStrLn "\nFinal expr before codegen:"
-  traverse_ (\(k', v) -> putStrLn $ "Lambda " ++ show k' ++ ":\n" ++ show v) (toList lambdas)
+  putStrLn ("\nFinal expr before codegen: " ++ (renderLExpr e))
+  traverse_ (\(k', v) -> putStrLn $ "Lambda " ++ show k' ++ ":\n" ++ (renderLiftedLambda v)) (toList lambdas)
 
   let (rootStmts, protos, decls) = codegen e lambdas
   putStrLn "\nCodegen Context:"

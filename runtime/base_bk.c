@@ -11,13 +11,10 @@
 #include "common.h"
 #include "gc.h"
 #include "hash_table.h"
+#include "thread_context.h"
 #include "vec.h"
 
 static bool stack_check(void);
-
-static struct thunk *current_thunk;
-static void *stack_initial;
-static jmp_buf setjmp_env_buf;
 
 void call_closure_one(struct obj *rator, struct obj *rand) {
   if (rator->tag != OBJ_CLOSURE) {
@@ -91,51 +88,71 @@ static bool stack_check(void) {
   static size_t stack_buffer = 1024 * 256;
   uintptr_t stack_ptr_val = (uintptr_t)stack_ptr();
   uintptr_t stack_end_val =
-      (uintptr_t)(stack_initial - get_stack_limit() + stack_buffer);
+      (uintptr_t)(current_ctx->stack_initial - get_stack_limit() + stack_buffer);
 
   return stack_ptr_val > stack_end_val;
 }
 
-void scheme_start(struct thunk *initial_thunk) {
-  stack_initial = stack_ptr();
-  current_thunk = initial_thunk;
+void zayin_start(struct thunk *initial_thunk) {
+  if (current_ctx == NULL) {
+    current_ctx = mi_malloc(sizeof(thread_context_t));
+    if (!current_ctx) {
+      fprintf(stderr, "Failed to allocate thread context\n");
+      exit(1);
+    }
+  }
+  current_ctx->stack_initial = stack_ptr();
+  current_ctx->current_thunk = initial_thunk;
 
   gc_init();
 
   // This is our trampoline, when we come back from a longjmp a different
   // current_thunk will be set and we will just trampoline into the new
   // thunk
-  setjmp(setjmp_env_buf);
+  if (setjmp(current_ctx->setjmp_env) == 0) {
 
-  DEBUG_FPRINTF(stderr, "bouncing\n");
+  }
 
-  if (current_thunk->closr->size == CLOSURE_ONE) {
-    struct closure_obj *closr = current_thunk->closr;
-    struct obj *rand = current_thunk->one.rand;
-    struct env_obj *env = current_thunk->closr->env;
-    mi_free(current_thunk);
+  DEBUG_FPRINTF(stderr, "Thread %lu bouncing\n", pthread_self());
+
+  // Now dispatch to the correct closure function based on arity.
+  if (current_ctx->current_thunk->closr->size == CLOSURE_ONE) {
+    struct closure_obj *closr = current_ctx->current_thunk->closr;
+    struct obj *rand = current_ctx->current_thunk->one.rand;
+    struct env_obj *env = current_ctx->current_thunk->closr->env;
+    mi_free(current_ctx->current_thunk);
+    // Call the closure directly if the stack is healthy.
     closr->fn_1(rand, env);
-  } else {
-    struct closure_obj *closr = current_thunk->closr;
-    struct obj *rand = current_thunk->two.rand;
-    struct obj *cont = current_thunk->two.cont;
-    struct env_obj *env = current_thunk->closr->env;
-    mi_free(current_thunk);
+  } else if (current_ctx->current_thunk->closr->size == CLOSURE_TWO){
+    struct closure_obj *closr = current_ctx->current_thunk->closr;
+    struct obj *rand = current_ctx->current_thunk->two.rand;
+    struct obj *cont = current_ctx->current_thunk->two.cont;
+    struct env_obj *env = current_ctx->current_thunk->closr->env;
+    mi_free(current_ctx->current_thunk);
     closr->fn_2(rand, cont, env);
+  } else {
+    RUNTIME_ERROR("Unknown closure size in thread context.");
   }
 
   RUNTIME_ERROR("Control flow returned from trampoline function.");
 }
 
 void run_minor_gc(struct thunk *thnk) {
-  current_thunk = thnk;
+  // Update the thread-local current_thunk pointer.
+  current_ctx->current_thunk = thnk;
 
+  // Create a GC context for this thread.
   struct gc_context ctx = gc_make_context();
+
+  // Perform minor GC: this copies all stack-resident objects to the heap.
   gc_minor(&ctx, thnk);
+
+  // Free the GC context.
   gc_free_context(&ctx);
 
-  // Jump back to the start
-  longjmp(setjmp_env_buf, 1);
+  // After GC, jump back to the saved continuation in the current thread.
+  // This longjmp uses the thread-local setjmp_env
+  longjmp(current_ctx->setjmp_env, 1);
 }
 
 struct obj object_base_new(enum object_tag tag) {

@@ -2,6 +2,7 @@
 #ifndef QUEUE_THUNK_H
 #define QUEUE_THUNK_H
 
+#include <mimalloc.h>
 #include <stdlib.h>
 #include "base.h"
 
@@ -18,7 +19,7 @@ static inline queue_thunk queue_thunk_new(size_t initial) {
     q.len = initial;
     q.head = 0;
     q.tail = 0;
-    q.data = malloc(q.len * sizeof(struct thunk *));
+    q.data = mi_malloc(q.len * sizeof(struct thunk *));
     return q;
 }
 
@@ -29,7 +30,7 @@ static inline void queue_thunk_enqueue(queue_thunk *q, struct thunk *t) {
     if (q->head == q->tail) {
         size_t old_len = q->len;
         size_t new_len = old_len + (old_len >> 1) + 1;
-        q->data = realloc(q->data, new_len * sizeof(struct thunk *));
+        q->data = mi_realloc(q->data, new_len * sizeof(struct thunk *));
         q->len = new_len;
     }
 }

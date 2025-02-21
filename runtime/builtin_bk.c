@@ -1,9 +1,11 @@
 #include <mimalloc.h>
-#include "builtin.h"
+#include <stdbool.h>
+
 #include "base.h"
+#include "builtin.h"
 #include "common.h"
 #include "gc.h"
-#include <stdbool.h>
+#include "scheduler.h"
 
 #define MAKE_INT_BINOP(NAME, OP)                                               \
   struct int_obj object_int_obj_##NAME(struct obj *lhs, struct obj *rhs) {     \
@@ -38,7 +40,7 @@ struct int_obj object_int_obj_mod(struct obj *lhs, struct obj *rhs) {
   struct int_obj *rhs_int = (struct int_obj *)rhs;
 
   if (rhs_int->val == 0)
-    RUNTIME_ERROR("Divide by zero (%lld %% %lld)", lhs_int->val, rhs_int->val);
+    RUNTIME_ERROR("Divide by zero (%ld %% %ld)", lhs_int->val, rhs_int->val);
 
   return object_int_obj_new(lhs_int->val % rhs_int->val);
 }
@@ -66,7 +68,7 @@ char *obj_to_string_internal(struct obj *val) {
     ALLOC_SPRINTF(res, "closure|%p", (void *)((struct closure_obj *)val)->fn_1);
     break;
   case OBJ_INT:
-    ALLOC_SPRINTF(res, "%lld", ((struct int_obj *)val)->val);
+    ALLOC_SPRINTF(res, "%ld", ((struct int_obj *)val)->val);
     break;
   case OBJ_STR:
     ALLOC_SPRINTF(res, "%s", ((struct string_obj *)val)->buf);
@@ -198,6 +200,19 @@ void string_concat_k_2(struct obj *v, struct obj *k, struct env_obj *env) {
   call_closure_one(k, result_str);
 
   __builtin_unreachable();
+}
+
+void spawn_k(struct obj *v, struct obj *k, struct env_obj *env) {
+    // v is expected to be a closure (the thread’s entry point).
+    struct thunk *new_thnk = mi_malloc(sizeof(struct thunk));
+    new_thnk->closr = (struct closure_obj *)v;
+    new_thnk->one.rand = NULL; // Adjust if your closures expect arguments.
+
+    schedule_thunk(new_thnk);
+
+    // Return (or continue) in the current thread.
+    call_closure_one(k, NULL);
+    __builtin_unreachable();
 }
 
 struct ht_obj ht_new_inner(struct obj *always_void) {

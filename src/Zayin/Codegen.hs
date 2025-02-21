@@ -211,12 +211,16 @@ generateFunc lambda = do
       }
 
   -- Generate function body
-  let envMove =
+  let envStructType = TStruct $ "env_" <> T.pack (show $ lambdaId lambda)
+      envMove =
         SDecl
           DVar
             { dName = "env",
-              dType = TPtr $ TStruct $ "env_" <> T.pack (show $ lambdaId lambda),
-              dInit = Just $ generateEnvCast lambda (EVar "env_in")
+              dType = TPtr envStructType,
+              -- Add initialization cast like the Rust compiler:
+              dInit = Just $ ECast
+                (EPreUnOp "&" (EArrow (EVar "env_in") "env"))
+                (TPtr envStructType)
             }
 
   -- Copy parameters to environment
@@ -255,7 +259,6 @@ builtinIdentCodegen ident = do
   let (numParams, runtimeName) = case ident of
         "tostring" -> (2, "to_string_k")
         "display" -> (2, "display_k")
-        "spawn" -> (2, "spawn_k")
         "exit" -> (1, "exit_k")
         "+" -> (2, "add_k")
         "-" -> (2, "sub_k")

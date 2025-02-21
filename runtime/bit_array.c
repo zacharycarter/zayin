@@ -1,6 +1,7 @@
-#include "bit_array.h"
-
+#include <mimalloc.h>
 #include <stdio.h>
+
+#include "bit_array.h"
 
 size_t index_in_bitarray(size_t idx) { return idx / 8; }
 
@@ -9,7 +10,7 @@ size_t bit_index_in_bitarray(size_t idx) { return idx % 8; }
 uint8_t *bit_array_new(size_t num_bits) {
   size_t num_bytes = (num_bits + 8) / 8;
 
-  return calloc(num_bytes, sizeof(uint8_t));
+  return mi_calloc(num_bytes, sizeof(uint8_t));
 }
 
 bool get_bit_in_bitarray(uint8_t *bitarray, size_t idx) {

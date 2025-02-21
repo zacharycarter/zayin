@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <mimalloc.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -446,7 +447,7 @@ void gc_major(struct gc_context *ctx, struct thunk *thnk) {
       // execute this object's free function
       gc_func_map[obj->tag].free(obj);
 
-      free(obj);
+      mi_free(obj);
       num_freed++;
 
       // set the pointer in the vector to null
@@ -477,7 +478,7 @@ void gc_init(void) { gc_global_data.nodes = vector_gc_heap_nodes_new(100); }
 
 // wrapped malloc that adds allocated stuff to the bookkeeper
 void *gc_malloc(size_t size) {
-  void *ptr = malloc(size);
+  void *ptr = mi_malloc(size);
 
   vector_gc_heap_nodes_push(&gc_global_data.nodes, ptr);
   return ptr;

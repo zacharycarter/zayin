@@ -136,7 +136,7 @@ liftLambdasM expr ctx =
                   "Direct builtin: " ++ show i ++ "\n" ++
                   "Processed first argument: " ++ show x' ++ "\n" ++
                   "Processed second argument: " ++ show y' ++ "\n" ++
-                  "Final CallTwo: BuiltinIdent " ++ show i ++ " " ++ show x' ++ " " ++ show y')
+                  "Final CallTwo: BuiltinIdent " ++ show i ++ " " ++ show x' ++ " " ++ show y' ++ "\n")
            result
       _ ->
         let (f', ctx1) = liftLambdasM f ctx
@@ -147,7 +147,7 @@ liftLambdasM expr ctx =
                   "Processed function: " ++ show f' ++ "\n" ++
                   "Processed first argument: " ++ show x' ++ "\n" ++
                   "Processed second argument: " ++ show y' ++ "\n" ++
-                  "Final CallTwo: " ++ show f' ++ " " ++ show x' ++ " " ++ show y')
+                  "Final CallTwo: " ++ show f' ++ " " ++ show x' ++ " " ++ show y' ++ "\n")
            result
 
     Var v ->

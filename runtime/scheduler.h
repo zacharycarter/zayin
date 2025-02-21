@@ -2,6 +2,7 @@
 #define SCHEDULER_H
 
 #include "base.h" // Assumes that struct thunk is defined here
+#include "queue_thunk.h"  // Provides the queue_thunk type and functions
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,16 @@ int start_scheduler(void);
  * @param thnk A pointer to the thunk to be scheduled.
  */
 void schedule_thunk(struct thunk *thnk);
+
+/**
+ * @brief Dequeues a thunk from the global work queue.
+ *
+ * This function removes and returns the next thunk from the work queue. If the
+ * queue is empty, it returns NULL.
+ *
+ * @return A pointer to the dequeued thunk, or NULL if the queue is empty.
+ */
+struct thunk *dequeue_thunk(void);
 
 #ifdef __cplusplus
 }
