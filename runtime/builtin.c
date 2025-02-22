@@ -38,7 +38,7 @@ struct int_obj object_int_obj_mod(struct obj *lhs, struct obj *rhs) {
   struct int_obj *rhs_int = (struct int_obj *)rhs;
 
   if (rhs_int->val == 0)
-    RUNTIME_ERROR("Divide by zero (%lld %% %lld)", lhs_int->val, rhs_int->val);
+    RUNTIME_ERROR("Divide by zero (%ld %% %ld)", lhs_int->val, rhs_int->val);
 
   return object_int_obj_new(lhs_int->val % rhs_int->val);
 }
@@ -66,7 +66,7 @@ char *obj_to_string_internal(struct obj *val) {
     ALLOC_SPRINTF(res, "closure|%p", (void *)((struct closure_obj *)val)->fn_1);
     break;
   case OBJ_INT:
-    ALLOC_SPRINTF(res, "%lld", ((struct int_obj *)val)->val);
+    ALLOC_SPRINTF(res, "%ld", ((struct int_obj *)val)->val);
     break;
   case OBJ_STR:
     ALLOC_SPRINTF(res, "%s", ((struct string_obj *)val)->buf);

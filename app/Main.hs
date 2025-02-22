@@ -205,7 +205,7 @@ main = do
     wrappedExpr =
       EApp
         (ELam [] (ExprBody
-          { bodyExprs = [ Def "addOne" (ELam ["x"] (ExprBody [] (EApp (EVar "+") [EVar "x", ELit (LInt 1)]))) ]
+          { bodyExprs = [ Def "addOne" (ELam ["x"] (ExprBody [] (EApp (EBuiltinIdent "+") [EVar "x", ELit (LInt 1)]))) ]
           , finalExpr = EApp (EVar "addOne") [ELit (LInt 1)]
           }))
         []
@@ -227,7 +227,7 @@ main = do
   putStrLn ("\nFinal expr before codegen: " ++ (renderLExpr e))
   traverse_ (\(k', v) -> putStrLn $ "Lambda " ++ show k' ++ ":\n" ++ (renderLiftedLambda v)) (toList lambdas)
 
-  let (rootStmts, protos, decls) = codegen e lambdas
+  (rootStmts, protos, decls) <- codegen e lambdas
   putStrLn "\nCodegen Context:"
   traverse_ (\s -> putStrLn $ "Root statement: " ++ show s) rootStmts
   traverse_ (\p -> putStrLn $ "Proto: " ++ show p) protos

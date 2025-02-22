@@ -5,6 +5,7 @@ module Zayin.CExport (generateC) where
 import Control.Monad (forM_)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
+import Debug.Trace (trace)
 import Zayin.Codegen (CDecl (..), CExpr (..), CStmt (..), CType (..))
 
 class ToC a where
@@ -72,22 +73,29 @@ toCTypeWithName typ name = case typ of
   TPtr t -> toCTypeWithName t ("*" <> name)
   TStruct sname -> "struct " <> sname <> " " <> name
 
+-- Filter out assignments that copy from input_env in the main lambda.
+filterMainLambdaAssignments :: [CStmt] -> [CStmt]
+filterMainLambdaAssignments = filter (not . isInputEnvCopy)
+  where
+    isInputEnvCopy (SExpr (EBinOp "=" _ rhs)) =
+      case rhs of
+        EArrow (EVar v) _ -> v == "env"
+        _ -> False
+    isInputEnvCopy _ = False
+
 generateC :: [CStmt] -> [CDecl] -> [CDecl] -> T.Text
 generateC rootStmts protos decls =
-  T.concat
-    [ T.unlines (map toC protos),
-      T.unlines (map toC decls),
-      toC mainLambda
-    ]
+  T.concat [ T.unlines (map toC protos)
+           , T.unlines (map toC decls)
+           , toC mainLambda
+           ]
   where
-    finalStmts = rootStmts ++ [SExpr (EMacroCall "__builtin_unreachable" [])]
+    finalStmts = rootStmts ++ [ SExpr (EMacroCall "__builtin_unreachable" []) ]
     mainLambda =
-      DFun
-        { dName = "main_lambda"
-        , dRetType = TVoid
-        , dParams =
-          [ ("input_obj", TPtr (TStruct "obj"))
-          , ("input_env", TPtr (TStruct "env_obj"))
-          ]
-        , dBody = finalStmts  -- Just use the root statements directly without extra env initialization
-        }
+      DFun { dName    = "main_lambda"
+           , dRetType = TVoid
+           , dParams  = [ ("input_obj", TPtr (TStruct "obj"))
+                        , ("env", TPtr (TStruct "env_obj"))
+                        ]
+           , dBody    = filterMainLambdaAssignments finalStmts
+           }

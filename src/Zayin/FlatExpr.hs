@@ -52,6 +52,17 @@ freeVars expr = case expr of
   CallOne f x -> Set.union (freeVars f) (freeVars x)
   CallTwo f x y -> Set.unions [freeVars f, freeVars x, freeVars y]
 
+freeVarsLExpr :: L.LExpr -> Set T.Text
+freeVarsLExpr = \case
+  L.Var v -> Set.singleton v
+  L.Lit _ -> Set.empty
+  L.BuiltinIdent _ -> Set.empty
+  L.SetThen v e1 e2 -> Set.insert v (freeVarsLExpr e1 `Set.union` freeVarsLExpr e2)
+  L.If c t f -> freeVarsLExpr c `Set.union` freeVarsLExpr t `Set.union` freeVarsLExpr f
+  L.Lifted _ -> Set.empty  -- Key change: Lifted nodes have no free variables
+  L.CallOne f x -> freeVarsLExpr f `Set.union` freeVarsLExpr x
+  L.CallTwo f x y -> freeVarsLExpr f `Set.union` freeVarsLExpr x `Set.union` freeVarsLExpr y
+
 liftLambdasM :: FExpr -> LiftingContext -> (L.LExpr, LiftingContext)
 liftLambdasM expr ctx =
   trace ("\n=== Lambda Lifting: Processing expression ===\n" ++
@@ -59,9 +70,9 @@ liftLambdasM expr ctx =
          "Current context ID: " ++ show (nextId ctx)) $
   case expr of
     LamOne param body ->
-      let free = freeVars body
-          (id, ctx1) = getFreshId ctx
-          (body', ctx2) = liftLambdasM body ctx1
+      let (body', ctx1) = liftLambdasM body ctx
+          free = freeVarsLExpr body'  -- Compute free vars AFTER lifting nested lambdas
+          (id, ctx2) = getFreshId ctx1
           lambda = L.LiftedLambda id [param] free body'
           ctx3 = addLambda lambda ctx2
           result = (L.Lifted id, ctx3)
@@ -73,9 +84,9 @@ liftLambdasM expr ctx =
          result
 
     LamTwo p1 p2 body ->
-      let free = freeVars body
-          (id, ctx1) = getFreshId ctx
-          (body', ctx2) = liftLambdasM body ctx1
+      let (body', ctx1) = liftLambdasM body ctx
+          free = freeVarsLExpr body'  -- Compute free vars AFTER lifting nested lambdas
+          (id, ctx2) = getFreshId ctx1
           lambda = L.LiftedLambda id [p1, p2] free body'
           ctx3 = addLambda lambda ctx2
           result = (L.Lifted id, ctx3)
@@ -86,6 +97,7 @@ liftLambdasM expr ctx =
                 "Created lambda: " ++ show lambda)
          result
 
+       
     If c t f ->
       let (c', ctx1) = liftLambdasM c ctx
           (t', ctx2) = liftLambdasM t ctx1

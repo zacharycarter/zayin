@@ -96,7 +96,7 @@ static bool stack_check(void) {
   return stack_ptr_val > stack_end_val;
 }
 
-void scheme_start(struct thunk *initial_thunk) {
+void zayin_start(struct thunk *initial_thunk) {
   stack_initial = stack_ptr();
   current_thunk = initial_thunk;
 

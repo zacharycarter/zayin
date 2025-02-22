@@ -100,12 +100,10 @@ tC expr c = do
 
         BE.Set n e -> do
             trace ("tC: Processing Set: " ++ show n ++ " = " ++ show e) $ do
-                v <- freshName "tmp"
-                trace ("tC: Created fresh name for Set: " ++ show v) $
-                    tK e $ \val -> do
-                        let result = CPS.SetThen n val (CPS.Call1 c (CPS.Lit LNil))
-                        trace ("tC: Set result: " ++ show result) $
-                            return result
+              tK e $ \val -> do
+                let result = CPS.SetThen n val (CPS.Call1 c (CPS.Lit LNil))
+                trace ("tC: Set result: " ++ show result) $
+                  return result
 
         BE.If cond t f -> do
             trace "tC: Processing If expression" $ do

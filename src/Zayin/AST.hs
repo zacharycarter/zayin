@@ -9,6 +9,7 @@ module Zayin.AST
   , ExprBodyExpr(..)
   , freshName
   , toBoundExprM
+  , logDebugM
   ) where
 
 import Control.Monad (foldM)
@@ -207,19 +208,21 @@ toBoundExprInner expr env = do
 
     ESet name val -> do
       logDebugM "converting set" (name, val)
-      val' <- toBoundExprInner val env
+      -- Use the bound name from the environment if it exists, otherwise generate fresh
       let boundName = Map.findWithDefault name name env
+      val' <- toBoundExprInner val env
       let result = BE.Set boundName val'
       logDebugM "set conversion result" result
       return result
 
     ELam params body -> do
-      let processParams [] body' env' = return body'
-          processParams (p:ps) body' env' = do
-            fresh <- freshName p
-            let newEnv = Map.insert p fresh env'
-            body'' <- processParams ps body' newEnv
-            return $ BE.Lam fresh body''
+      -- First generate fresh names for all parameters
+      freshParams <- mapM (\p -> do
+                           fresh <- freshName p
+                           return (p, fresh)) params
+
+      -- Create new environment with all fresh parameter names
+      let paramEnv = foldr (\(p, fresh) e -> Map.insert p fresh e) env freshParams
 
       -- Process the body expressions
       result <- case (bodyExprs body, params) of
@@ -228,15 +231,24 @@ toBoundExprInner expr env = do
           body' <- toBoundExprInner (finalExpr body) env
           return $ BE.Lam unused body'
         (exprs, _) -> do
-          let processExprs [] final = toBoundExprInner final env
+          let processExprs [] final = toBoundExprInner final paramEnv
               processExprs (Expr e:rest) final = do
                 unused <- freshName "_unused"
-                e' <- toBoundExprInner e env
+                e' <- toBoundExprInner e paramEnv
                 final' <- processExprs rest final
                 return $ BE.App (BE.Lam unused final') e'
+              processExprs (Def n e:rest) final = do
+                -- Use the bound name from paramEnv if it exists
+                let boundName = Map.findWithDefault n n paramEnv
+                e' <- toBoundExprInner e paramEnv
+                final' <- processExprs rest final
+                return $ BE.App (BE.Lam boundName final') e'
 
           body' <- processExprs (bodyExprs body) (finalExpr body)
-          processParams params body' env
+          -- Use the fresh names we generated earlier
+          return $ foldr (\(_, fresh) acc -> BE.Lam fresh acc)
+                        body'
+                        freshParams
       return result
 
     EApp f [] -> do
