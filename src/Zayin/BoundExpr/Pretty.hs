@@ -1,17 +1,18 @@
 {-# LANGUAGE OverloadedStrings #-}
+
 module Zayin.BoundExpr.Pretty (renderBExpr) where
 
-import Zayin.BoundExpr
-import Zayin.Literals (Literal(..))
 import Data.Text (Text)
 import Prettyprinter
 import Prettyprinter.Render.String (renderString)
+import Zayin.BoundExpr
+import Zayin.Literals (Literal (..))
 
 instance Pretty Literal where
   pretty lit = case lit of
-    LInt i     -> pretty i
-    LString s  -> dquotes (pretty s)
-    LNil       -> "nil"
+    LInt i -> pretty i
+    LString s -> dquotes (pretty s)
+    LNil -> "nil"
 
 instance Pretty BExpr where
   pretty expr = case expr of

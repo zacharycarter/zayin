@@ -118,6 +118,17 @@ _Bool obj_is_truthy(struct obj *obj) {
   }
 }
 
+struct int_obj object_int_obj_not(struct obj *v) {
+  // If you want to only allow certain types, do an explicit check:
+  if (v->tag != OBJ_INT && v->tag != OBJ_STR && v->tag) {
+    RUNTIME_ERROR("'not' expects an int, string; received tag %d", v->tag);
+  }
+  _Bool result = !obj_is_truthy(v);
+  return object_int_obj_new(result);
+}
+
+MAKE_ONE_ARG_FROM_BUILTIN(not, object_int_obj_not, struct int_obj);
+
 void car_k(struct obj *cons, struct obj *k, struct env_obj *env) {
   struct obj *car = ((struct cons_obj *)cons)->car;
 

@@ -1,7 +1,7 @@
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StandaloneDeriving #-}
 
 module Zayin.LiftedExpr (LExpr (..), LiftedLambda (..)) where
 
@@ -9,7 +9,7 @@ import Data.Data (Data, Typeable)
 import Data.HashMap.Strict (HashMap)
 import Data.Set (Set)
 import qualified Data.Text as T
-import Zayin.Literals (Literal(..))
+import Zayin.Literals (Literal (..))
 
 deriving instance Data Literal
 

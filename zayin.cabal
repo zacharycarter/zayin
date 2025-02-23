@@ -37,6 +37,7 @@ library
       Zayin.LiftedExpr
       Zayin.LiftedExpr.Pretty
       Zayin.Literals
+      Zayin.Macros
       Zayin.Parser
       Zayin.Transforms
   other-modules:

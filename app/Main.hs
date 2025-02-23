@@ -3,8 +3,10 @@
 
 module Main where
 
-import Control.Exception (catch, SomeException)
-import Control.Monad (when)
+import Control.Exception (SomeException, catch)
+import Control.Monad (unless, when)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Logger (LoggingT, logDebugN, logErrorN, logInfoN, runStderrLoggingT)
 import Control.Monad.State
 import qualified Data.ByteString as BS
 import Data.FileEmbed (embedFile, makeRelativeToProject)
@@ -20,7 +22,6 @@ import System.FilePath ((</>))
 import System.IO.Temp (createTempDirectory)
 import System.Process (ProcessHandle, StdStream (..), callProcess, createProcess, cwd, proc, std_err, std_out, waitForProcess)
 import Text.Parsec (parse)
-
 -- Import your own modules (make sure these are available in your project)
 import Zayin.AST
 import Zayin.AST.Pretty
@@ -30,56 +31,74 @@ import qualified Zayin.CPS as CPS
 import Zayin.Codegen (codegen)
 import Zayin.FlatExpr (liftLambdas)
 import Zayin.FlatExpr.Pretty (renderFExpr)
-import Zayin.Literals
 import Zayin.LiftedExpr.Pretty (renderLExpr, renderLiftedLambda)
+import Zayin.Literals
+import Zayin.Macros (expandMacros)
+import Zayin.Parser (parseProgram) -- your top-level parser
 import Zayin.Transforms (toFExprM)
-import Zayin.Parser (parseProgram)  -- your top-level parser
 
 --------------------------------------------------------------------------------
 -- Command-line Options
 --------------------------------------------------------------------------------
 
 -- Your original command type remains (Run vs Compile with an output file)
-data Cmd = Run | Compile { output :: FilePath }
+data Cmd = Run | Compile {output :: FilePath}
   deriving (Show)
 
 -- Extend Options to include a required positional argument for the source file.
 data Options = Options
-  { cmd        :: Cmd
-  , sourceFile :: FilePath   -- new: path to the .zai source file
-  , debug      :: Bool
-  , keepTmpdir :: Bool
+  { cmd :: Cmd,
+    sourceFile :: FilePath, -- new: path to the .zai source file
+    debug :: Bool,
+    keepTmpdir :: Bool
   }
   deriving (Show)
 
 cmdParser :: Parser Cmd
-cmdParser = subparser
-  ( command "run" (info (pure Run)
-       ( progDesc "Run the program" ))
- <> command "compile" (info (Compile <$> strOption
-       ( long "output"
-      <> short 'o'
-      <> metavar "OUTPUT"
-      <> value "a.out"
-      <> help "Output binary file" ))
-       ( progDesc "Compile the program" ))
-  )
+cmdParser =
+  subparser
+    ( command
+        "run"
+        ( info
+            (pure Run)
+            (progDesc "Run the program")
+        )
+        <> command
+          "compile"
+          ( info
+              ( Compile
+                  <$> strOption
+                    ( long "output"
+                        <> short 'o'
+                        <> metavar "OUTPUT"
+                        <> value "a.out"
+                        <> help "Output binary file"
+                    )
+              )
+              (progDesc "Compile the program")
+          )
+    )
 
 optionsParser :: Parser Options
-optionsParser = Options
-  <$> cmdParser
-  <*> argument str
-        ( metavar "SOURCE"
-       <> help "Input source file (.zai)" )
-  <*> switch ( long "debug" <> help "Enable debug output" )
-  <*> switch ( long "keep-tmpdir" <> help "Keep temporary build directory" )
+optionsParser =
+  Options
+    <$> cmdParser
+    <*> argument
+      str
+      ( metavar "SOURCE"
+          <> help "Input source file (.zai)"
+      )
+    <*> switch (long "debug" <> help "Enable debug output")
+    <*> switch (long "keep-tmpdir" <> help "Keep temporary build directory")
 
 optsInfo :: ParserInfo Options
-optsInfo = info (optionsParser <**> helper)
-  ( fullDesc
- <> progDesc "Compile or run the Zayin program"
- <> header "zayin - A Zayin compiler" )
-
+optsInfo =
+  info
+    (optionsParser <**> helper)
+    ( fullDesc
+        <> progDesc "Compile or run the Zayin program"
+        <> header "zayin - A Zayin compiler"
+    )
 
 -- | Runtime files embedded at compile time
 runtimeFiles :: [(FilePath, BS.ByteString)]
@@ -163,18 +182,18 @@ generateProgramSource src =
         ],
       src,
       T.unlines
-        [ "int main(void) {"
-        , "    mi_version();"
-        , "    struct closure_obj initial_closure = object_closure_one_new(main_lambda, NULL);"
-        , "    struct thunk initial_thunk = {"
-        , "        .closr = &initial_closure,"
-        , "        .one = {NULL},"
-        , "    };"
-        , ""
-        , "    struct thunk *thnk_heap = mi_malloc(sizeof(struct thunk));"
-        , "    memcpy(thnk_heap, &initial_thunk, sizeof(struct thunk));"
-        , "    zayin_start(thnk_heap);"
-        , "}"
+        [ "int main(void) {",
+          "    mi_version();",
+          "    struct closure_obj initial_closure = object_closure_one_new(main_lambda, NULL);",
+          "    struct thunk initial_thunk = {",
+          "        .closr = &initial_closure,",
+          "        .one = {NULL},",
+          "    };",
+          "",
+          "    struct thunk *thnk_heap = mi_malloc(sizeof(struct thunk));",
+          "    memcpy(thnk_heap, &initial_thunk, sizeof(struct thunk));",
+          "    zayin_start(thnk_heap);",
+          "}"
         ]
     ]
 
@@ -182,93 +201,137 @@ generateProgramSource src =
 -- Main Compilation/Execution Pipeline
 --------------------------------------------------------------------------------
 
+type CompilationM = LoggingT IO
+
+runCompilation :: CompilationM a -> IO a
+runCompilation = runStderrLoggingT
+
 main :: IO ()
-main = do
-  opts <- execParser optsInfo
-  putStrLn "Starting compilation process..."
+main = runCompilation $ do
+  opts <- liftIO $ execParser optsInfo
+  logInfoN "Starting compilation process..."
 
-  -- Read the source file provided on the command line
-  src <- TIO.readFile (sourceFile opts)
+  -- Read source file
+  src <- liftIO $ TIO.readFile (sourceFile opts)
+  logInfoN "\nSource being compiled:"
+  logDebugN src
 
-  putStrLn("\nSource being compiled:\n" ++ T.unpack src)
+  -- let
+  --   wrappedExpr =
+  --     EApp
+  --       (ELam [] (ExprBody
+  --         { bodyExprs = [ Def "addOne" (ELam ["x"] (ExprBody [] (EApp (EBuiltinIdent "+") [EVar "x", ELit (LInt 1)]))) ]
+  --         , finalExpr = EApp (EVar "addOne") [ELit (LInt 1)]
+  --         }))
+  --       []
 
-  -- Parse the file using your top-level parser.
-  -- case parse parseProgram "" src of
-  --   Left err -> do
-  --     putStrLn ("Parse error:\n" ++ show err)
-  --     exitFailure
-  --   Right expr -> do
-  --     putStrLn "High-level AST:"
-  --     print expr
+  -- Example AST with macro demonstration
+  let macroExample =
+        EApp
+          ( ELam
+              []
+              ( ExprBody
+                  { bodyExprs =
+                      [ -- Macro definition
+                        Def "macro" $
+                          ELam
+                            ["unless"]
+                            ( ExprBody [] $
+                                ELam
+                                  ["$1", "$2"]
+                                  ( ExprBody [] $
+                                      EIf
+                                        (EApp (EBuiltinIdent "not") [EVar "$1"])
+                                        (EVar "$2")
+                                        (ELit LNil)
+                                  )
+                            )
+                      ],
+                    finalExpr = EApp (EVar "unless") [ELit (LInt 1), ELit (LInt 2)]
+                  }
+              )
+          )
+          [] -- Empty argument list for CPS wrapper
+  logInfoN "\nOriginal AST with macro:"
+  logDebugN $ T.pack (renderExpr macroExample)
 
-  let
-    wrappedExpr =
-      EApp
-        (ELam [] (ExprBody
-          { bodyExprs = [ Def "addOne" (ELam ["x"] (ExprBody [] (EApp (EBuiltinIdent "+") [EVar "x", ELit (LInt 1)]))) ]
-          , finalExpr = EApp (EVar "addOne") [ELit (LInt 1)]
-          }))
-        []
+  -- Macro expansion
+  expandedExpr <- case expandMacros macroExample of
+    Right e -> do
+      logInfoN "\nExpanded AST after macro processing:"
+      logDebugN $ T.pack (renderExpr e)
+      return e
+    Left err -> do
+      logErrorN $ "Macro expansion failed: " <> T.pack err
+      liftIO exitFailure
 
-      -- EApp (ELam [] (ExprBody [] expr)) []  -- wrapping the AST
-  putStrLn "Wrapped AST:"
-  putStrLn (renderExpr wrappedExpr)
+  -- Wrap the expanded expression
+  let wrappedExpr = EApp (ELam [] (ExprBody [] expandedExpr)) []
 
-  -- Original processing of the AST:
+  logInfoN "\nWrapped AST:"
+  logDebugN $ T.pack (renderExpr wrappedExpr)
+
+  -- Rest of the processing pipeline
   let initial = Gen id
       (boundExpr, state1) = runState (toBoundExprM wrappedExpr) initial
-  putStrLn ("\nBound Expression: " ++ (renderBExpr boundExpr))
+  logInfoN "\nBound Expression: "
+  logDebugN $ T.pack (renderBExpr boundExpr)
 
   let k = CPS.BuiltinIdent "exit"
       (fExpr, _) = runState (toFExprM boundExpr k) state1
-  putStrLn ("\nAfter conversion: " ++ (renderFExpr fExpr))
+  logInfoN "\nAfter CPS conversion:"
+  logDebugN $ T.pack (renderFExpr fExpr)
 
   let (e, lambdas) = liftLambdas fExpr
-  putStrLn ("\nFinal expr before codegen: " ++ (renderLExpr e))
-  traverse_ (\(k', v) -> putStrLn $ "Lambda " ++ show k' ++ ":\n" ++ (renderLiftedLambda v)) (toList lambdas)
+  logInfoN "\nFinal expr before codegen:"
+  logDebugN $ T.pack (renderLExpr e)
+  traverse_
+    ( \(k', v) -> do
+        logInfoN $ "Lambda " <> T.pack (show k') <> ":"
+        logDebugN $ T.pack (renderLiftedLambda v)
+    )
+    (toList lambdas)
 
-  (rootStmts, protos, decls) <- codegen e lambdas
-  putStrLn "\nCodegen Context:"
-  traverse_ (\s -> putStrLn $ "Root statement: " ++ show s) rootStmts
-  traverse_ (\p -> putStrLn $ "Proto: " ++ show p) protos
-  traverse_ (\d -> putStrLn $ "Decl: " ++ show d) decls
+  (rootStmts, protos, decls) <- liftIO $ codegen e lambdas
+  logInfoN "\nCodegen Context:"
+  traverse_ (\s -> logDebugN $ "Root statement: " <> T.pack (show s)) rootStmts
+  traverse_ (\p -> logDebugN $ "Proto: " <> T.pack (show p)) protos
+  traverse_ (\d -> logDebugN $ "Decl: " <> T.pack (show d)) decls
 
-  -- Generate the build directory and write the generated C code:
-  buildDir <- generateBuildDir
+  -- Generate build directory
+  buildDir <- liftIO generateBuildDir
   let cCode = generateC rootStmts protos decls
       fullSource = generateProgramSource cCode
-  putStrLn "\nGenerated C Code:"
-  TIO.putStrLn fullSource
-  insertSourceIntoBuildDir buildDir fullSource
 
-  -- Invoke make to build the C code:
-  makeResult <- invokeMake buildDir
+  logInfoN "\nGenerated C Code:"
+  logDebugN fullSource
+
+  -- Write and compile C code
+  liftIO $ insertSourceIntoBuildDir buildDir fullSource
+  makeResult <- liftIO $ invokeMake buildDir
+
   case makeResult of
     Left errMsg -> do
-      putStrLn $ "\nFailed compiling generated C code: " ++ errMsg
-      exitFailure
+      logErrorN $ "\nFailed compiling generated C code: " <> T.pack errMsg
+      liftIO exitFailure
     Right stdoutStr -> do
-      putStrLn "\nCompilation result:"
-      putStrLn stdoutStr
-      when (debug opts) $ putStrLn stdoutStr
+      logInfoN "\nCompilation result:"
+      when (debug opts) $ logDebugN (T.pack stdoutStr)
 
-  -- Depending on the command, either copy the binary or run it:
+  -- Handle output
   case cmd opts of
-    Compile { output = out } -> do
-      copyBinary buildDir out `catch` handlerCopy
-      putStrLn $ "Compiled binary copied to " ++ out
+    Compile {output = out} -> do
+      liftIO $ copyBinary buildDir out `catch` handlerCopy
+      logInfoN $ "Compiled binary copied to " <> T.pack out
     Run -> do
       let exePath = buildDir </> "compiled_result"
-      putStrLn $ "Running " ++ exePath
-      callProcess exePath []
+      logInfoN $ "Running " <> T.pack exePath
+      liftIO $ callProcess exePath []
 
-  -- Clean up the temporary build directory unless requested otherwise:
-  if not (keepTmpdir opts)
-    then do
-      removeDirectoryRecursive buildDir
-      putStrLn "Temporary build directory removed."
-    else putStrLn $ "Temporary build directory kept: " ++ buildDir
-
+  -- Cleanup
+  unless (keepTmpdir opts) $ do
+    liftIO $ removeDirectoryRecursive buildDir
+    logInfoN "Temporary build directory removed."
   where
     handlerCopy :: SomeException -> IO ()
     handlerCopy _ = error "failed copying compiled binary"

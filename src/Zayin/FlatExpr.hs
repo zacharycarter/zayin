@@ -1,5 +1,5 @@
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Zayin.FlatExpr (FExpr (..), liftLambdas) where
 
@@ -9,8 +9,6 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import Debug.Trace (trace)
-
-
 import qualified Zayin.LiftedExpr as L
 import Zayin.Literals (Literal)
 
@@ -59,121 +57,213 @@ freeVarsLExpr = \case
   L.BuiltinIdent _ -> Set.empty
   L.SetThen v e1 e2 -> Set.insert v (freeVarsLExpr e1 `Set.union` freeVarsLExpr e2)
   L.If c t f -> freeVarsLExpr c `Set.union` freeVarsLExpr t `Set.union` freeVarsLExpr f
-  L.Lifted _ -> Set.empty  -- Key change: Lifted nodes have no free variables
+  L.Lifted _ -> Set.empty -- Key change: Lifted nodes have no free variables
   L.CallOne f x -> freeVarsLExpr f `Set.union` freeVarsLExpr x
   L.CallTwo f x y -> freeVarsLExpr f `Set.union` freeVarsLExpr x `Set.union` freeVarsLExpr y
 
 liftLambdasM :: FExpr -> LiftingContext -> (L.LExpr, LiftingContext)
 liftLambdasM expr ctx =
-  trace ("\n=== Lambda Lifting: Processing expression ===\n" ++
-         "Expression: " ++ show expr ++ "\n" ++
-         "Current context ID: " ++ show (nextId ctx)) $
-  case expr of
-    LamOne param body ->
-      let (body', ctx1) = liftLambdasM body ctx
-          free = freeVarsLExpr body'  -- Compute free vars AFTER lifting nested lambdas
-          (id, ctx2) = getFreshId ctx1
-          lambda = L.LiftedLambda id [param] free body'
-          ctx3 = addLambda lambda ctx2
-          result = (L.Lifted id, ctx3)
-      in trace ("\nLifting LamOne: param=" ++ show param ++ "\n" ++
-                "Free variables: " ++ show free ++ "\n" ++
-                "Assigned lambda ID: " ++ show id ++ "\n" ++
-                "Processed body: " ++ show body' ++ "\n" ++
-                "Created lambda: " ++ show lambda)
-         result
-
-    LamTwo p1 p2 body ->
-      let (body', ctx1) = liftLambdasM body ctx
-          free = freeVarsLExpr body'  -- Compute free vars AFTER lifting nested lambdas
-          (id, ctx2) = getFreshId ctx1
-          lambda = L.LiftedLambda id [p1, p2] free body'
-          ctx3 = addLambda lambda ctx2
-          result = (L.Lifted id, ctx3)
-      in trace ("\nLifting LamTwo: params=" ++ show [p1, p2] ++ "\n" ++
-                "Free variables: " ++ show free ++ "\n" ++
-                "Assigned lambda ID: " ++ show id ++ "\n" ++
-                "Processed body: " ++ show body' ++ "\n" ++
-                "Created lambda: " ++ show lambda)
-         result
-
-       
-    If c t f ->
-      let (c', ctx1) = liftLambdasM c ctx
-          (t', ctx2) = liftLambdasM t ctx1
-          (f', ctx3) = liftLambdasM f ctx2
-          result = (L.If c' t' f', ctx3)
-      in trace ("\nProcessing If expression\n" ++
-                "Processed condition: " ++ show c' ++ "\n" ++
-                "Processed then branch: " ++ show t' ++ "\n" ++
-                "Processed else branch: " ++ show f' ++ "\n" ++
-                "Final If expression: If " ++ show c' ++ " " ++ show t' ++ " " ++ show f')
-         result
-
-    SetThen v e1 e2 ->
-      let (e1', ctx1) = liftLambdasM e1 ctx
-          (e2', ctx2) = liftLambdasM e2 ctx1
-          result = (L.SetThen v e1' e2', ctx2)
-      in trace ("\nProcessing SetThen: var=" ++ show v ++ "\n" ++
-                "Processed value expression: " ++ show e1' ++ "\n" ++
-                "Processed continuation: " ++ show e2' ++ "\n" ++
-                "Final SetThen: " ++ show v ++ " " ++ show e1' ++ " " ++ show e2')
-         result
-
-    CallOne f x -> case f of
+  trace
+    ( "\n=== Lambda Lifting: Processing expression ===\n"
+        ++ "Expression: "
+        ++ show expr
+        ++ "\n"
+        ++ "Current context ID: "
+        ++ show (nextId ctx)
+    )
+    $ case expr of
+      LamOne param body ->
+        let (body', ctx1) = liftLambdasM body ctx
+            free = freeVarsLExpr body' -- Compute free vars AFTER lifting nested lambdas
+            (id, ctx2) = getFreshId ctx1
+            lambda = L.LiftedLambda id [param] free body'
+            ctx3 = addLambda lambda ctx2
+            result = (L.Lifted id, ctx3)
+         in trace
+              ( "\nLifting LamOne: param="
+                  ++ show param
+                  ++ "\n"
+                  ++ "Free variables: "
+                  ++ show free
+                  ++ "\n"
+                  ++ "Assigned lambda ID: "
+                  ++ show id
+                  ++ "\n"
+                  ++ "Processed body: "
+                  ++ show body'
+                  ++ "\n"
+                  ++ "Created lambda: "
+                  ++ show lambda
+              )
+              result
+      LamTwo p1 p2 body ->
+        let (body', ctx1) = liftLambdasM body ctx
+            free = freeVarsLExpr body' -- Compute free vars AFTER lifting nested lambdas
+            (id, ctx2) = getFreshId ctx1
+            lambda = L.LiftedLambda id [p1, p2] free body'
+            ctx3 = addLambda lambda ctx2
+            result = (L.Lifted id, ctx3)
+         in trace
+              ( "\nLifting LamTwo: params="
+                  ++ show [p1, p2]
+                  ++ "\n"
+                  ++ "Free variables: "
+                  ++ show free
+                  ++ "\n"
+                  ++ "Assigned lambda ID: "
+                  ++ show id
+                  ++ "\n"
+                  ++ "Processed body: "
+                  ++ show body'
+                  ++ "\n"
+                  ++ "Created lambda: "
+                  ++ show lambda
+              )
+              result
+      If c t f ->
+        let (c', ctx1) = liftLambdasM c ctx
+            (t', ctx2) = liftLambdasM t ctx1
+            (f', ctx3) = liftLambdasM f ctx2
+            result = (L.If c' t' f', ctx3)
+         in trace
+              ( "\nProcessing If expression\n"
+                  ++ "Processed condition: "
+                  ++ show c'
+                  ++ "\n"
+                  ++ "Processed then branch: "
+                  ++ show t'
+                  ++ "\n"
+                  ++ "Processed else branch: "
+                  ++ show f'
+                  ++ "\n"
+                  ++ "Final If expression: If "
+                  ++ show c'
+                  ++ " "
+                  ++ show t'
+                  ++ " "
+                  ++ show f'
+              )
+              result
+      SetThen v e1 e2 ->
+        let (e1', ctx1) = liftLambdasM e1 ctx
+            (e2', ctx2) = liftLambdasM e2 ctx1
+            result = (L.SetThen v e1' e2', ctx2)
+         in trace
+              ( "\nProcessing SetThen: var="
+                  ++ show v
+                  ++ "\n"
+                  ++ "Processed value expression: "
+                  ++ show e1'
+                  ++ "\n"
+                  ++ "Processed continuation: "
+                  ++ show e2'
+                  ++ "\n"
+                  ++ "Final SetThen: "
+                  ++ show v
+                  ++ " "
+                  ++ show e1'
+                  ++ " "
+                  ++ show e2'
+              )
+              result
+      CallOne f x -> case f of
+        BuiltinIdent i ->
+          let (x', ctx1) = liftLambdasM x ctx
+              result = (L.CallOne (L.BuiltinIdent i) x', ctx1)
+           in trace
+                ( "\nProcessing CallOne (Builtin)\n"
+                    ++ "Direct builtin: "
+                    ++ show i
+                    ++ "\n"
+                    ++ "Processed argument: "
+                    ++ show x'
+                    ++ "\n"
+                    ++ "Final CallOne: BuiltinIdent "
+                    ++ show i
+                    ++ " "
+                    ++ show x'
+                )
+                result
+        _ ->
+          let (f', ctx1) = liftLambdasM f ctx
+              (x', ctx2) = liftLambdasM x ctx1
+              result = (L.CallOne f' x', ctx2)
+           in trace
+                ( "\nProcessing CallOne\n"
+                    ++ "Processed function: "
+                    ++ show f'
+                    ++ "\n"
+                    ++ "Processed argument: "
+                    ++ show x'
+                    ++ "\n"
+                    ++ "Final CallOne: "
+                    ++ show f'
+                    ++ " "
+                    ++ show x'
+                )
+                result
+      CallTwo f x y -> case f of
+        BuiltinIdent i ->
+          let (x', ctx1) = liftLambdasM x ctx
+              (y', ctx2) = liftLambdasM y ctx1
+              result = (L.CallTwo (L.BuiltinIdent i) x' y', ctx2)
+           in trace
+                ( "\nProcessing CallTwo (Builtin)\n"
+                    ++ "Direct builtin: "
+                    ++ show i
+                    ++ "\n"
+                    ++ "Processed first argument: "
+                    ++ show x'
+                    ++ "\n"
+                    ++ "Processed second argument: "
+                    ++ show y'
+                    ++ "\n"
+                    ++ "Final CallTwo: BuiltinIdent "
+                    ++ show i
+                    ++ " "
+                    ++ show x'
+                    ++ " "
+                    ++ show y'
+                    ++ "\n"
+                )
+                result
+        _ ->
+          let (f', ctx1) = liftLambdasM f ctx
+              (x', ctx2) = liftLambdasM x ctx1
+              (y', ctx3) = liftLambdasM y ctx2
+              result = (L.CallTwo f' x' y', ctx3)
+           in trace
+                ( "\nProcessing CallTwo\n"
+                    ++ "Processed function: "
+                    ++ show f'
+                    ++ "\n"
+                    ++ "Processed first argument: "
+                    ++ show x'
+                    ++ "\n"
+                    ++ "Processed second argument: "
+                    ++ show y'
+                    ++ "\n"
+                    ++ "Final CallTwo: "
+                    ++ show f'
+                    ++ " "
+                    ++ show x'
+                    ++ " "
+                    ++ show y'
+                    ++ "\n"
+                )
+                result
+      Var v ->
+        trace
+          ("\nProcessing Var: " ++ show v)
+          (L.Var v, ctx)
+      Lit l ->
+        trace
+          ("\nProcessing Lit: " ++ show l)
+          (L.Lit l, ctx)
       BuiltinIdent i ->
-        let (x', ctx1) = liftLambdasM x ctx
-            result = (L.CallOne (L.BuiltinIdent i) x', ctx1)
-        in trace ("\nProcessing CallOne (Builtin)\n" ++
-                  "Direct builtin: " ++ show i ++ "\n" ++
-                  "Processed argument: " ++ show x' ++ "\n" ++
-                  "Final CallOne: BuiltinIdent " ++ show i ++ " " ++ show x')
-           result
-      _ ->
-        let (f', ctx1) = liftLambdasM f ctx
-            (x', ctx2) = liftLambdasM x ctx1
-            result = (L.CallOne f' x', ctx2)
-        in trace ("\nProcessing CallOne\n" ++
-                  "Processed function: " ++ show f' ++ "\n" ++
-                  "Processed argument: " ++ show x' ++ "\n" ++
-                  "Final CallOne: " ++ show f' ++ " " ++ show x')
-           result
-
-    CallTwo f x y -> case f of
-      BuiltinIdent i ->
-        let (x', ctx1) = liftLambdasM x ctx
-            (y', ctx2) = liftLambdasM y ctx1
-            result = (L.CallTwo (L.BuiltinIdent i) x' y', ctx2)
-        in trace ("\nProcessing CallTwo (Builtin)\n" ++
-                  "Direct builtin: " ++ show i ++ "\n" ++
-                  "Processed first argument: " ++ show x' ++ "\n" ++
-                  "Processed second argument: " ++ show y' ++ "\n" ++
-                  "Final CallTwo: BuiltinIdent " ++ show i ++ " " ++ show x' ++ " " ++ show y' ++ "\n")
-           result
-      _ ->
-        let (f', ctx1) = liftLambdasM f ctx
-            (x', ctx2) = liftLambdasM x ctx1
-            (y', ctx3) = liftLambdasM y ctx2
-            result = (L.CallTwo f' x' y', ctx3)
-        in trace ("\nProcessing CallTwo\n" ++
-                  "Processed function: " ++ show f' ++ "\n" ++
-                  "Processed first argument: " ++ show x' ++ "\n" ++
-                  "Processed second argument: " ++ show y' ++ "\n" ++
-                  "Final CallTwo: " ++ show f' ++ " " ++ show x' ++ " " ++ show y' ++ "\n")
-           result
-
-    Var v ->
-      trace ("\nProcessing Var: " ++ show v)
-      (L.Var v, ctx)
-
-    Lit l ->
-      trace ("\nProcessing Lit: " ++ show l)
-      (L.Lit l, ctx)
-
-    BuiltinIdent i ->
-      trace ("\nProcessing BuiltinIdent: " ++ show i)
-      (L.BuiltinIdent i, ctx)
-
+        trace
+          ("\nProcessing BuiltinIdent: " ++ show i)
+          (L.BuiltinIdent i, ctx)
 
 liftLambdas :: FExpr -> (L.LExpr, HashMap Int L.LiftedLambda)
 liftLambdas expr =

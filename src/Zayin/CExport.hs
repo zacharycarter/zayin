@@ -85,17 +85,20 @@ filterMainLambdaAssignments = filter (not . isInputEnvCopy)
 
 generateC :: [CStmt] -> [CDecl] -> [CDecl] -> T.Text
 generateC rootStmts protos decls =
-  T.concat [ T.unlines (map toC protos)
-           , T.unlines (map toC decls)
-           , toC mainLambda
-           ]
+  T.concat
+    [ T.unlines (map toC protos),
+      T.unlines (map toC decls),
+      toC mainLambda
+    ]
   where
-    finalStmts = rootStmts ++ [ SExpr (EMacroCall "__builtin_unreachable" []) ]
+    finalStmts = rootStmts ++ [SExpr (EMacroCall "__builtin_unreachable" [])]
     mainLambda =
-      DFun { dName    = "main_lambda"
-           , dRetType = TVoid
-           , dParams  = [ ("input_obj", TPtr (TStruct "obj"))
-                        , ("env", TPtr (TStruct "env_obj"))
-                        ]
-           , dBody    = filterMainLambdaAssignments finalStmts
-           }
+      DFun
+        { dName = "main_lambda",
+          dRetType = TVoid,
+          dParams =
+            [ ("input_obj", TPtr (TStruct "obj")),
+              ("env", TPtr (TStruct "env_obj"))
+            ],
+          dBody = filterMainLambdaAssignments finalStmts
+        }

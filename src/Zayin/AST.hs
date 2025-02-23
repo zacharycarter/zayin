@@ -2,15 +2,16 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Zayin.AST
-  ( Expr(..)
-  , Fresh
-  , Gen(..)
-  , ExprBody(..)
-  , ExprBodyExpr(..)
-  , freshName
-  , toBoundExprM
-  , logDebugM
-  ) where
+  ( Expr (..),
+    Fresh,
+    Gen (..),
+    ExprBody (..),
+    ExprBodyExpr (..),
+    freshName,
+    toBoundExprM,
+    logDebugM,
+  )
+where
 
 import Control.Monad (foldM)
 import Control.Monad.State
@@ -18,7 +19,7 @@ import qualified Data.Map as Map
 import qualified Data.Text as T
 import qualified Debug.Trace as Debug
 import qualified Zayin.BoundExpr as BE
-import Zayin.Literals (Literal(..))
+import Zayin.Literals (Literal (..))
 
 -- Core data types
 data Expr
@@ -38,15 +39,16 @@ data ExprBodyExpr
   deriving (Show, Eq)
 
 data ExprBody = ExprBody
-  { bodyExprs :: [ExprBodyExpr]
-  , finalExpr :: Expr
+  { bodyExprs :: [ExprBodyExpr],
+    finalExpr :: Expr
   }
   deriving (Show, Eq)
 
 data Gen = Gen (Int -> Int)
+
 type Fresh a = State Gen a
 
-logDebugM :: Show a => String -> a -> Fresh a
+logDebugM :: (Show a) => String -> a -> Fresh a
 logDebugM prefix x = do
   Debug.traceM (prefix ++ ": " ++ show x)
   return x
@@ -87,9 +89,13 @@ rewrite f expr = do
       return result
     ELet bs body -> do
       logDebugM "rewriting let bindings" bs
-      bs' <- mapM (\(n,e) -> do
-        e' <- rewrite f e
-        return (n, e')) bs
+      bs' <-
+        mapM
+          ( \(n, e) -> do
+              e' <- rewrite f e
+              return (n, e')
+          )
+          bs
       body' <- rewriteBody f body
       return $ ELet bs' body'
     ELam ps body -> do
@@ -108,15 +114,19 @@ rewrite f expr = do
 rewriteBody :: (Expr -> Fresh Expr) -> ExprBody -> Fresh ExprBody
 rewriteBody f (ExprBody exprs final) = do
   logDebugM "rewriting body exprs" exprs
-  exprs' <- mapM (\case
-    Def n e -> do
-      logDebugM "rewriting define" (n, e)
-      e' <- rewrite f e
-      return $ Def n e'
-    Expr e -> do
-      logDebugM "rewriting body expr" e
-      e' <- rewrite f e
-      return $ Expr e') exprs
+  exprs' <-
+    mapM
+      ( \case
+          Def n e -> do
+            logDebugM "rewriting define" (n, e)
+            e' <- rewrite f e
+            return $ Def n e'
+          Expr e -> do
+            logDebugM "rewriting body expr" e
+            e' <- rewrite f e
+            return $ Expr e'
+      )
+      exprs
   final' <- rewrite f final
   let result = ExprBody exprs' final'
   logDebugM "rewriteBody result" result
@@ -127,14 +137,19 @@ pullDefines (ExprBody exprs final) = do
   logDebugM "pullDefines input" exprs
 
   -- Transform defines into sets and collect names
-  let (defines, bodyExprs) = foldr (\expr (defs, body) ->
-        case expr of
-          Def name e ->
-            let setExpr = Expr (ESet name e)
-            in Debug.trace ("converting define to set: " ++ show (name, e, setExpr))
-               (name:defs, setExpr:body)
-          other -> (defs, other:body)
-        ) ([], []) exprs
+  let (defines, bodyExprs) =
+        foldr
+          ( \expr (defs, body) ->
+              case expr of
+                Def name e ->
+                  let setExpr = Expr (ESet name e)
+                   in Debug.trace
+                        ("converting define to set: " ++ show (name, e, setExpr))
+                        (name : defs, setExpr : body)
+                other -> (defs, other : body)
+          )
+          ([], [])
+          exprs
 
   logDebugM "Defines found" defines
   logDebugM "Body with sets" bodyExprs
@@ -150,30 +165,38 @@ pullDefines (ExprBody exprs final) = do
 liftDefines :: Expr -> Fresh Expr
 liftDefines expr = do
   Debug.traceM "=== Starting liftDefines ==="
-  result <- rewrite (\case
-    ELet bindings body -> do
-      logDebugM "lifting defines in let" body
-      body' <- pullDefines body
-      return $ ELet bindings body'
-    ELam params body -> do
-      logDebugM "lifting defines in lambda" body
-      body' <- pullDefines body
-      return $ ELam params body'
-    e -> return e) expr
+  result <-
+    rewrite
+      ( \case
+          ELet bindings body -> do
+            logDebugM "lifting defines in let" body
+            body' <- pullDefines body
+            return $ ELet bindings body'
+          ELam params body -> do
+            logDebugM "lifting defines in lambda" body
+            body' <- pullDefines body
+            return $ ELam params body'
+          e -> return e
+      )
+      expr
   Debug.traceM "=== Completed liftDefines ==="
   return result
 
 removeLet :: Expr -> Fresh Expr
 removeLet expr = do
   Debug.traceM "=== Starting removeLet ==="
-  result <- rewrite (\case
-    ELet bindings body -> do
-      logDebugM "removing let" (bindings, body)
-      let (names, exprs) = unzip bindings
-      let result = EApp (ELam names body) exprs
-      logDebugM "let removal result" result
-      return result
-    e -> return e) expr
+  result <-
+    rewrite
+      ( \case
+          ELet bindings body -> do
+            logDebugM "removing let" (bindings, body)
+            let (names, exprs) = unzip bindings
+            let result = EApp (ELam names body) exprs
+            logDebugM "let removal result" result
+            return result
+          e -> return e
+      )
+      expr
   Debug.traceM "=== Completed removeLet ==="
   return result
 
@@ -193,19 +216,15 @@ toBoundExprInner expr env = do
     EVar name -> do
       let boundName = Map.findWithDefault name name env
       return $ BE.Var boundName
-
     ELit lit ->
       return $ BE.Lit lit
-
     EBuiltinIdent name ->
       return $ BE.BuiltinIdent name
-
     EIf cond t f -> do
       c' <- toBoundExprInner cond env
       t' <- toBoundExprInner t env
       f' <- toBoundExprInner f env
       return $ BE.If c' t' f'
-
     ESet name val -> do
       logDebugM "converting set" (name, val)
       -- Use the bound name from the environment if it exists, otherwise generate fresh
@@ -214,12 +233,15 @@ toBoundExprInner expr env = do
       let result = BE.Set boundName val'
       logDebugM "set conversion result" result
       return result
-
     ELam params body -> do
       -- First generate fresh names for all parameters
-      freshParams <- mapM (\p -> do
-                           fresh <- freshName p
-                           return (p, fresh)) params
+      freshParams <-
+        mapM
+          ( \p -> do
+              fresh <- freshName p
+              return (p, fresh)
+          )
+          params
 
       -- Create new environment with all fresh parameter names
       let paramEnv = foldr (\(p, fresh) e -> Map.insert p fresh e) env freshParams
@@ -232,12 +254,12 @@ toBoundExprInner expr env = do
           return $ BE.Lam unused body'
         (exprs, _) -> do
           let processExprs [] final = toBoundExprInner final paramEnv
-              processExprs (Expr e:rest) final = do
+              processExprs (Expr e : rest) final = do
                 unused <- freshName "_unused"
                 e' <- toBoundExprInner e paramEnv
                 final' <- processExprs rest final
                 return $ BE.App (BE.Lam unused final') e'
-              processExprs (Def n e:rest) final = do
+              processExprs (Def n e : rest) final = do
                 -- Use the bound name from paramEnv if it exists
                 let boundName = Map.findWithDefault n n paramEnv
                 e' <- toBoundExprInner e paramEnv
@@ -246,19 +268,18 @@ toBoundExprInner expr env = do
 
           body' <- processExprs (bodyExprs body) (finalExpr body)
           -- Use the fresh names we generated earlier
-          return $ foldr (\(_, fresh) acc -> BE.Lam fresh acc)
-                        body'
-                        freshParams
+          return $
+            foldr
+              (\(_, fresh) acc -> BE.Lam fresh acc)
+              body'
+              freshParams
       return result
-
     EApp f [] -> do
       f' <- toBoundExprInner f env
       return $ BE.App f' (BE.Lit LNil)
-
-    EApp f (a:as) -> do
+    EApp f (a : as) -> do
       f' <- toBoundExprInner f env
       a' <- toBoundExprInner a env
       foldM (\acc e -> BE.App acc <$> toBoundExprInner e env) (BE.App f' a') as
-
     ELet _ _ ->
       error "Let expressions should have been removed"

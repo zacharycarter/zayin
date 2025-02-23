@@ -9,9 +9,8 @@ import Control.Monad.Identity (Identity)
 import qualified Data.Text as T
 import Text.Parsec
 import Text.Parsec.Expr
-import Text.Parsec.Language (LanguageDef(..))
+import Text.Parsec.Language (LanguageDef (..))
 import qualified Text.Parsec.Token as Tok
-
 import Zayin.AST
 import Zayin.Literals
 
@@ -19,19 +18,20 @@ type Parser = ParsecT T.Text () Identity
 
 -- Update langDef to use T.Text and include "print" in reservedNames
 langDef :: Tok.GenLanguageDef T.Text () Identity
-langDef = Tok.LanguageDef
-  { Tok.commentStart    = "{-"
-  , Tok.commentEnd      = "-}"
-  , Tok.commentLine     = "--"
-  , Tok.nestedComments  = True
-  , Tok.identStart      = letter <|> char '_'
-  , Tok.identLetter     = alphaNum <|> char '_'
-  , Tok.opStart         = oneOf ":!#$%&*+./<=>?@\\^|-~"
-  , Tok.opLetter        = oneOf ":!#$%&*+./<=>?@\\^|-~"
-  , Tok.reservedNames   = map T.unpack ["let", "in", "if", "then", "else", "print"]
-  , Tok.reservedOpNames = map T.unpack ["+", "-", "*", "/", "="]
-  , Tok.caseSensitive   = True
-  }
+langDef =
+  Tok.LanguageDef
+    { Tok.commentStart = "{-",
+      Tok.commentEnd = "-}",
+      Tok.commentLine = "--",
+      Tok.nestedComments = True,
+      Tok.identStart = letter <|> char '_',
+      Tok.identLetter = alphaNum <|> char '_',
+      Tok.opStart = oneOf ":!#$%&*+./<=>?@\\^|-~",
+      Tok.opLetter = oneOf ":!#$%&*+./<=>?@\\^|-~",
+      Tok.reservedNames = map T.unpack ["let", "in", "if", "then", "else", "print"],
+      Tok.reservedOpNames = map T.unpack ["+", "-", "*", "/", "="],
+      Tok.caseSensitive = True
+    }
 
 lexer :: Tok.GenTokenParser T.Text () Identity
 lexer = Tok.makeTokenParser langDef
@@ -70,44 +70,52 @@ parseExpr = buildExpressionParser operators parseTerm
 
 operators :: [[Operator T.Text () Identity Expr]]
 operators =
-  [ [binary "*" AssocLeft, binary "/" AssocLeft, binary "%" AssocLeft]
-  , [binary "+" AssocLeft, binary "-" AssocLeft]
-  , [binary "==" AssocNone, binary "<" AssocNone, binary ">" AssocNone]
+  [ [binary "*" AssocLeft, binary "/" AssocLeft, binary "%" AssocLeft],
+    [binary "+" AssocLeft, binary "-" AssocLeft],
+    [binary "==" AssocNone, binary "<" AssocNone, binary ">" AssocNone]
   ]
   where
-    binary name assoc = Infix (do
-      reservedOp name
-      pure $ \x y -> EApp (EBuiltinIdent name) [x, y]) assoc
+    binary name assoc =
+      Infix
+        ( do
+            reservedOp name
+            pure $ \x y -> EApp (EBuiltinIdent name) [x, y]
+        )
+        assoc
 
 parseTerm :: Parser Expr
-parseTerm = choice
-  [ parseIf
-  , parseLet
-  , parseLambda
-  , parseLiteral
-  , parseBuiltin  -- see below
-  , parseVar
-  , parens parseExpr
-  ]
+parseTerm =
+  choice
+    [ parseIf,
+      parseLet,
+      parseLambda,
+      parseLiteral,
+      parseBuiltin, -- see below
+      parseVar,
+      parens parseExpr
+    ]
 
 parseLiteral :: Parser Expr
-parseLiteral = ELit <$> choice
-  [ LInt . fromInteger <$> integer
-  , LString . T.pack <$> Tok.stringLiteral lexer
-  , LNil <$ reserved "nil"
-  ]
+parseLiteral =
+  ELit
+    <$> choice
+      [ LInt . fromInteger <$> integer,
+        LString . T.pack <$> Tok.stringLiteral lexer,
+        LNil <$ reserved "nil"
+      ]
 
 -- parseBuiltin now tries first to parse a builtin with an argument list
 parseBuiltin :: Parser Expr
 parseBuiltin = try parseBuiltinWithArg <|> parseBuiltinNoArg
   where
-    parseBuiltinNoArg = choice
-      [ EBuiltinIdent <$> (reserved "isInt"  >> return "isInt")
-      , EBuiltinIdent <$> (reserved "isZero" >> return "isZero")
-      , EBuiltinIdent <$> (reserved "isNil"  >> return "isNil")
-      , EBuiltinIdent <$> (reserved "isBool" >> return "isBool")
-      , EBuiltinIdent <$> (reserved "print"  >> return "display")
-      ]
+    parseBuiltinNoArg =
+      choice
+        [ EBuiltinIdent <$> (reserved "isInt" >> return "isInt"),
+          EBuiltinIdent <$> (reserved "isZero" >> return "isZero"),
+          EBuiltinIdent <$> (reserved "isNil" >> return "isNil"),
+          EBuiltinIdent <$> (reserved "isBool" >> return "isBool"),
+          EBuiltinIdent <$> (reserved "print" >> return "display")
+        ]
     parseBuiltinWithArg = do
       reserved "print"
       args <- parens (sepBy parseExpr (reservedOp ","))
