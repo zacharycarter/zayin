@@ -1,310 +1,321 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-
 module Zayin.Parser (parseProgram) where
 
-import Control.Monad.Logger (MonadLogger(..), LoggingT, logDebugN, runStderrLoggingT)
-import Control.Monad.IO.Class (MonadIO(liftIO))
+import Control.Monad.Logger (logDebugN, runStderrLoggingT, LoggingT)
+import Control.Monad.IO.Class (liftIO)
 import Data.Char (isSpace, isDigit, isAlpha, isAlphaNum)
-import qualified Data.Text as T
 import Data.Text (Text)
+import qualified Data.Text as T
+
 import Zayin.AST
-import Zayin.Literals
+import Zayin.Literals (Literal(..))
 
--- List of built-in function names.
-builtinNames :: [T.Text]
-builtinNames =
-  [ "tostring", "display", "exit", "+", "-", "*", "/", "%", "^"
-  , "<", "<=", ">", ">=", "not", "cons", "cons?", "null?", "car"
-  , "cdr", "string-concat", "string-chars", "ht-new", "ht-set!"
-  , "ht-get", "ht-del!", "ht-keys", "eq?" ]
+--------------------------------------------------------------------------------
+-- Token Definitions and Lexer with Layout Insertion
+--------------------------------------------------------------------------------
 
-isBuiltin :: T.Text -> Bool
-isBuiltin ident = ident `elem` builtinNames
+data Token
+  = TIdent Text
+  | TNumber Integer
+  | TKeyword Text
+  | TSymbol Text
+  | TNewline
+  | TIndent
+  | TDedent
+  | TEOF
+  deriving (Show, Eq)
 
--- Each input line annotated with its indentation level.
-data Line = Line { indent :: Int, content :: T.Text }
-  deriving (Show)
+lexZayin :: Text -> IO [Token]
+lexZayin input = runStderrLoggingT $ do
+  logDebugN "Lexing input with layout processing"
+  let rawLines = T.lines input
+  toks <- lexLines rawLines [] 0
+  return (toks ++ [TEOF])
+  where
+    lexLines :: [Text] -> [Int] -> Int -> LoggingT IO [Token]
+    lexLines [] indentStack _ = return (dedentAll indentStack)
+    lexLines (l:ls) indentStack _ = do
+      let currentIndent = T.length (T.takeWhile isSpace l)
+          lineContent   = T.strip l
+      logDebugN $ "Lexing line: " <> l <> " (indent " <> T.pack (show currentIndent) <> ")"
+      let (indentToks, newStack) = computeIndentTokens currentIndent indentStack
+      toksLine <- lexLineTokens lineContent
+      restToks <- lexLines ls newStack currentIndent
+      return (indentToks ++ toksLine ++ [TNewline] ++ restToks)
 
-tokenizeLines :: T.Text -> [Line]
-tokenizeLines txt =
-  let ls = T.lines txt
-  in map (\l -> let i = T.length (T.takeWhile isSpace l)
-                    c = T.stripStart l
-                in Line i c) ls
+    dedentAll :: [Int] -> [Token]
+    dedentAll []     = []
+    dedentAll (_:xs) = TDedent : dedentAll xs
 
--- Our parser type now runs in a LoggingT IO monad.
-newtype Parser a = Parser { runParser :: [Line] -> LoggingT IO (Either String (a, [Line])) }
+    computeIndentTokens :: Int -> [Int] -> ([Token], [Int])
+    computeIndentTokens cur [] = ([TIndent], [cur])
+    computeIndentTokens cur stack@(s:rest)
+      | cur > s   = ([TIndent], cur : stack)
+      | cur == s  = ([], stack)
+      | cur < s   = let (deds, newStack) = popUntil cur stack
+                    in (deds, newStack)
+    popUntil :: Int -> [Int] -> ([Token], [Int])
+    popUntil cur [] = ([], [])
+    popUntil cur (s:ss)
+      | cur == s  = ([], s:ss)
+      | cur < s   = let (d, ns) = popUntil cur ss in (TDedent : d, ns)
+      | otherwise = ([], s:ss)
+
+    lexLineTokens :: Text -> LoggingT IO [Token]
+    lexLineTokens txt = do
+      let toks = tokenizeLine txt
+      logDebugN $ "Tokenizing line: " <> txt <> " -> " <> T.pack (show toks)
+      return toks
+
+tokenizeLine :: Text -> [Token]
+tokenizeLine t =
+  let t' = T.stripStart t
+  in if T.null t' then [] else nextToken t'
+
+nextToken :: Text -> [Token]
+nextToken t
+  | T.null t = []
+  | otherwise =
+      let t' = T.stripStart t
+      in if T.null t' then [] else
+         case T.uncons t' of
+           Nothing -> []
+           Just (c, rest)
+             | isDigit c ->
+                 let (num, rest') = T.span isDigit t'
+                     token = TNumber (read (T.unpack num))
+                 in token : nextToken rest'
+             | isAlpha c ->
+                 let (word, rest') = T.span isAlphaNum t'
+                     token = if isKeyword word then TKeyword word else TIdent word
+                 in token : nextToken rest'
+             | isPunctuation c ->
+                 TSymbol (T.singleton c) : nextToken rest
+             | otherwise -> nextToken rest
+
+isPunctuation :: Char -> Bool
+isPunctuation c = c `elem` ("()+-*/=,:;" :: String)
+
+isKeyword :: Text -> Bool
+isKeyword w = w `elem` ["if", "then", "else", "fn", "where", "do"]
+
+isBuiltin :: Text -> Bool
+isBuiltin w = w `elem` ["display"]
+
+--------------------------------------------------------------------------------
+-- Parser Combinators using LoggingT IO (with layout skipping)
+--------------------------------------------------------------------------------
+
+newtype Parser a = Parser { runParser :: [Token] -> LoggingT IO (Either String (a, [Token])) }
 
 instance Functor Parser where
-  fmap f p = Parser $ \s -> do
-    res <- runParser p s
-    return (fmap (\(a, s') -> (f a, s')) res)
+  fmap f p = Parser $ \ts -> do
+    res <- runParser p ts
+    return $ fmap (\(a, ts') -> (f a, ts')) res
 
 instance Applicative Parser where
-  pure a = Parser $ \s -> return (Right (a, s))
-  pf <*> pa = Parser $ \s -> do
-    r1 <- runParser pf s
-    case r1 of
-      Left err       -> return (Left err)
-      Right (f, s')  -> do
-        r2 <- runParser pa s'
-        case r2 of
-          Left err       -> return (Left err)
-          Right (a, s'') -> return (Right (f a, s''))
+  pure a = Parser $ \ts -> return (Right (a, ts))
+  pf <*> pa = Parser $ \ts -> do
+    resF <- runParser pf ts
+    case resF of
+      Left err -> return (Left err)
+      Right (f, ts') -> do
+         resA <- runParser pa ts'
+         case resA of
+           Left err -> return (Left err)
+           Right (a, ts'') -> return (Right (f a, ts''))
 
 instance Monad Parser where
   return = pure
-  p >>= f = Parser $ \s -> do
-    r1 <- runParser p s
-    case r1 of
-      Left err      -> return (Left err)
-      Right (a, s') -> runParser (f a) s'
+  p >>= f = Parser $ \ts -> do
+    res <- runParser p ts
+    case res of
+      Left err -> return (Left err)
+      Right (a, ts') -> runParser (f a) ts'
 
-instance MonadIO Parser where
-  liftIO io = Parser $ \s -> do
-    a <- liftIO io
-    return (Right (a, s))
+infixr 3 <|>
+(<|>) :: Parser a -> Parser a -> Parser a
+p <|> q = Parser $ \ts -> do
+  res <- runParser p ts
+  case res of
+    Right _ -> return res
+    Left _  -> runParser q ts
 
--- Manually define a MonadLogger instance so we can call logDebugN, etc.
-instance MonadLogger Parser where
-  monadLoggerLog loc src lvl msg = Parser $ \s -> do
-    monadLoggerLog loc src lvl msg
-    return (Right ((), s))
+-- Consume a token (skipping layout tokens).
+consume :: (Token -> Bool) -> Parser Token
+consume pred = Parser $ \ts ->
+  let ts' = dropWhile isLayout ts
+  in case ts' of
+       (t:rest) | pred t -> do
+           logDebugN $ "Consumed token: " <> T.pack (show t)
+           return (Right (t, rest))
+       _ -> return (Left "Unexpected token")
+  where
+    isLayout t = case t of
+      TIndent  -> True
+      TDedent  -> True
+      TNewline -> True
+      _        -> False
 
--- | Log a message and then fail.
-failParser :: String -> Parser a
-failParser msg = Parser $ \_ -> do
-  logDebugN ("failParser: " <> T.pack msg)
-  return (Left msg)
+-- Parse many occurrences.
+many :: Parser a -> Parser [a]
+many p = (do
+  x <- p
+  xs <- many p
+  return (x:xs)) <|> return []
 
--- | Consume a line if it satisfies the predicate.
-satisfyLine :: (Line -> Bool) -> Parser Line
-satisfyLine p = Parser $ \s -> case s of
-  [] -> do
-    logDebugN "satisfyLine: Unexpected end of input"
-    return (Left "Unexpected end of input")
-  (l:ls) ->
-    if p l
-      then do
-        logDebugN ("satisfyLine: Consuming line: " <> content l)
-        return (Right (l, ls))
-      else do
-        logDebugN ("satisfyLine: Unexpected line: " <> content l)
-        return (Left ("Unexpected line: " ++ T.unpack (content l)))
+--------------------------------------------------------------------------------
+-- Top-Level Statement Parsers Producing ExprBodyExpr
+--------------------------------------------------------------------------------
 
--- | Peek at the next line without consuming it.
-peekLine :: Parser (Maybe Line)
-peekLine = Parser $ \s -> do
-  logDebugN "peekLine: Peeking at next line"
-  return (Right (case s of [] -> Nothing; (l:_) -> Just l, s))
+-- A top-level statement is either a function definition or a plain expression.
+parseTopStmt :: Parser ExprBodyExpr
+parseTopStmt = parseFnDef <|> (do
+  e <- parseExpr
+  return (Expr e))
 
--- | Consume the next line and return its content.
-consumeLine :: Parser T.Text
-consumeLine = do
-  l <- satisfyLine (const True)
-  logDebugN ("consumeLine: " <> content l)
-  return (content l)
-
--- | Parse an identifier from text.
-parseIdentifier :: T.Text -> (T.Text, T.Text)
-parseIdentifier txt =
-  let (ident, rest) = T.span isAlphaNum txt
-  in (ident, rest)
-
--- | Parse a number literal.
-parseNumber :: T.Text -> (Literal, T.Text)
-parseNumber txt =
-  let (numTxt, rest) = T.span isDigit txt
-      num = read (T.unpack numTxt) :: Integer
-  in (LInt num, rest)
-
--- | Parse a “term” from a single line.
-parseTerm :: Parser Expr
-parseTerm = do
-  logDebugN "parseTerm: Start"
-  txt <- consumeLine
-  let txt' = T.strip txt
-  logDebugN ("parseTerm: Processing text: " <> txt')
-  if T.null txt'
-    then do
-      logDebugN "parseTerm: Empty term encountered"
-      failParser "Empty term"
-    else case T.head txt' of
-      '(' -> do
-         logDebugN ("parseTerm: Found parenthesized expression: " <> txt')
-         case T.unsnoc (T.tail txt') of
-           Just (inside, ')') -> do
-              logDebugN ("parseTerm: Inside parenthesis: " <> inside)
-              return (parseExprText inside)
-           _ -> failParser "Unmatched parenthesis"
-      c | isDigit c -> do
-            logDebugN ("parseTerm: Found digit literal: " <> txt')
-            let (lit, _) = parseNumber txt'
-            return (ELit lit)
-        | isAlpha c -> do
-            logDebugN ("parseTerm: Found identifier: " <> txt')
-            let (ident, rest) = parseIdentifier txt'
-            if isBuiltin ident
-                 then if T.null rest
-                        then do
-                          logDebugN ("parseTerm: Built-in identifier (no args): " <> ident)
-                          return (EBuiltinIdent ident)
-                        else if T.head rest == '('
-                               then do
-                                  let argsTxt = T.init (T.tail rest)
-                                  logDebugN ("parseTerm: Built-in function application: " <> ident <> " with args: " <> argsTxt)
-                                  let argExpr = parseExprText argsTxt
-                                  return (EApp (EBuiltinIdent ident) [argExpr])
-                               else do
-                                  logDebugN ("parseTerm: Built-in identifier with trailing text: " <> rest)
-                                  return (EBuiltinIdent ident)
-                 else if T.null rest
-                        then do
-                          logDebugN ("parseTerm: Variable: " <> ident)
-                          return (EVar ident)
-                        else if T.head rest == '('
-                                then do
-                                  let argsTxt = T.init (T.tail rest)
-                                  logDebugN ("parseTerm: Variable function application: " <> ident <> " with args: " <> argsTxt)
-                                  return (EApp (EVar ident) [parseExprText argsTxt])
-                                else do
-                                  logDebugN ("parseTerm: Variable with trailing text: " <> rest)
-                                  return (EVar ident)
-      _ -> do
-            logDebugN ("parseTerm: Cannot parse term: " <> txt')
-            failParser ("Cannot parse term: " ++ T.unpack txt')
-
--- | A helper to parse an expression from text.
-parseExprText :: T.Text -> Expr
-parseExprText txt =
-  if T.any isSpace txt
-     then let parts = T.words txt
-              left = if T.all isDigit (head parts)
-                        then ELit (LInt (read (T.unpack (head parts)) :: Integer))
-                        else EVar (head parts)
-              right = case parts of
-                        (_:_:n:_) -> ELit (LInt (read (T.unpack n) :: Integer))
-                        _         -> ELit (LInt 0)
-          in EApp (EBuiltinIdent "+") [left, right]
-     else EVar txt
-
--- | Parse a statement within a block.
-parseStmt :: Int -> Parser ExprBodyExpr
-parseStmt baseIndent = do
-  logDebugN ("parseStmt: baseIndent = " <> T.pack (show baseIndent))
-  ml <- peekLine
-  case ml of
-    Nothing -> failParser "Unexpected end of input in block"
-    Just l ->
-      if indent l < baseIndent
-         then do
-           logDebugN ("parseStmt: Dedent encountered at line: " <> content l)
-           failParser "Dedent encountered"
-         else if "fn " `T.isPrefixOf` content l
-                 then parseFnDef
-                 else do
-                   logDebugN ("parseStmt: Parsing expression at line: " <> content l)
-                   expr <- parseExpr
-                   return (Expr expr)
-
--- | Parse an expression (currently just a term).
-parseExpr :: Parser Expr
-parseExpr = parseTerm
-
--- | Parse a block (one or more statements at a given indent).
-parseBlock :: Int -> Parser Expr
-parseBlock baseIndent = do
-  logDebugN ("parseBlock: baseIndent = " <> T.pack (show baseIndent))
-  stmts <- many (parseStmt baseIndent)
-  if null stmts
-     then do
-       logDebugN "parseBlock: Empty block encountered"
-       failParser "Empty block"
-     else do
-       logDebugN ("parseBlock: Combining " <> T.pack (show (length stmts)) <> " statements")
-       return (combineStmts stmts)
-
--- | Parse a function definition, yielding a Def node.
+-- | Parse a function definition of the form:
+--    fn <name>(<args>): <body>
 parseFnDef :: Parser ExprBodyExpr
 parseFnDef = do
-  logDebugN "parseFnDef: Parsing function definition"
-  line <- satisfyLine (\l -> "fn " `T.isPrefixOf` content l)
-  let rest    = T.strip $ T.drop 3 (content line)
-      (fname, rest1) = parseIdentifier rest
-      rest2   = T.strip rest1
-  logDebugN ("parseFnDef: Function name parsed: " <> fname)
-  if T.null rest2 || T.head rest2 /= '('
-     then failParser "Expected '(' after function name"
-     else do
-       let rest3 = T.tail rest2  -- drop '('
-           (paramsTxt, rest4) = T.breakOn ")" rest3
-           params = if T.null paramsTxt
-                      then []
-                      else map T.strip (T.splitOn "," paramsTxt)
-       logDebugN ("parseFnDef: Parameters: " <> T.intercalate ", " params)
-       let afterParams = T.strip (T.drop 1 rest4)  -- drop ')'
-       if not (":" `T.isPrefixOf` afterParams)
-         then failParser "Expected ':' after function parameters"
-         else do
-           ml2 <- peekLine
-           case ml2 of
-             Nothing -> failParser "Expected block after function definition"
-             Just l2 ->
-               if indent l2 <= indent line
-                  then failParser "Expected indented block after function definition"
-                  else do
-                    logDebugN "parseFnDef: Parsing function body"
-                    body <- parseBlock (indent l2)
-                    let exprBody = ExprBody [] body
-                        lam      = ELam params exprBody
-                    logDebugN ("parseFnDef: Function definition complete for " <> fname)
-                    return (Def fname lam)
+  _ <- consume (== TKeyword "fn")
+  nameToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+  let name = case nameToken of TIdent n -> n; _ -> ""
+  _ <- consume (== TSymbol "(")
+  args <- parseArgs
+  _ <- consume (== TSymbol ")")
+  _ <- consume (== TSymbol ":")
+  bodyExpr <- parseExpr
+  -- Wrap the function body in a lambda with no definitions.
+  return (Def name (ELam args (ExprBody [] bodyExpr)))
 
--- | Helper: parse zero or more occurrences.
-many :: Parser a -> Parser [a]
-many p = Parser $ \s -> do
-  res <- runParser p s
-  case res of
-    Right (a, s') -> do
-      resRest <- runParser (many p) s'
-      case resRest of
-        Right (as, s'') -> return (Right (a : as, s''))
-        Left _          -> return (Right ([a], s'))
-    Left _ -> return (Right ([], s))
+-- | Parse a comma-separated list of arguments (identifiers).
+parseArgs :: Parser [Text]
+parseArgs = (do
+  argToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+  let arg = case argToken of TIdent a -> a; _ -> ""
+  rest <- many (do
+    _ <- consume (== TSymbol ",")
+    tok <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+    return (case tok of TIdent a -> a; _ -> ""))
+  return (arg:rest)) <|> return []
 
--- | Partition a list of ExprBodyExpr into definitions and non-definition expressions.
+-- | Parse a sequence of top-level statements.
+parseProgramExprs :: Parser [ExprBodyExpr]
+parseProgramExprs = many parseTopStmt
+
+--------------------------------------------------------------------------------
+-- Expression Parsers Producing Our Actual AST
+--------------------------------------------------------------------------------
+
+-- Expressions include if-expressions, addition, function calls, and primaries.
+parseExpr :: Parser Expr
+parseExpr = parseIf <|> parseAdd
+
+parseIf :: Parser Expr
+parseIf = do
+  _     <- consume (== TKeyword "if")
+  cond  <- parseExpr
+  _     <- consume (== TKeyword "then")
+  thenE <- parseExpr
+  _     <- consume (== TKeyword "else")
+  elseE <- parseExpr
+  return (EIf cond thenE elseE)
+
+-- Parse left-associative addition.
+parseAdd :: Parser Expr
+parseAdd = do
+  lhs <- parseCall
+  moreAdd lhs
+  where
+    moreAdd lhs = (do
+      _ <- consume (== TSymbol "+")
+      rhs <- parseCall
+      let addExpr = EApp (EBuiltinIdent "+") [lhs, rhs]
+      moreAdd addExpr) <|> return lhs
+
+-- Parse function application.
+parseCall :: Parser Expr
+parseCall = do
+  primary <- parsePrimary
+  parseCall' primary
+  where
+    parseCall' fun = (do
+      _ <- consume (== TSymbol "(")
+      arg <- parseExpr
+      _ <- consume (== TSymbol ")")
+      let callExpr = EApp fun [arg]
+      parseCall' callExpr) <|> return fun
+
+-- Parse a primary expression.
+parsePrimary :: Parser Expr
+parsePrimary = (do
+  _ <- consume (== TSymbol "(")
+  e <- parseExpr
+  _ <- consume (== TSymbol ")")
+  return e) <|> parseTermSimple
+
+-- Parse a simple term: identifier or number.
+parseTermSimple :: Parser Expr
+parseTermSimple = do
+  t <- consume isTerm
+  case t of
+    TIdent name -> if (isBuiltin name) then return (EBuiltinIdent name) else return (EVar name)
+    TNumber n   -> return (ELit (LInt n))
+    _           -> Parser $ \_ -> return (Left "Expected a term")
+  where
+    isTerm tok = case tok of
+      TIdent _  -> True
+      TNumber _ -> True
+      _         -> False
+
+--------------------------------------------------------------------------------
+-- Helpers to Combine Top-Level Statements
+--------------------------------------------------------------------------------
+
+-- Partition a list of top-level statements into definitions and expressions.
 partitionDefs :: [ExprBodyExpr] -> ([ExprBodyExpr], [Expr])
 partitionDefs = foldr f ([], [])
   where
-    f e (defs, exprs) = case e of
-      Def name expr -> (Def name expr : defs, exprs)
-      Expr expr   -> (defs, expr : exprs)
+    f (Def n e) (defs, exprs) = (Def n e : defs, exprs)
+    f (Expr e) (defs, exprs)  = (defs, e : exprs)
 
--- | Combine a list of ExprBodyExpr into a single Expr.
+-- Combine a list of top-level statements into a single AST.
 combineStmts :: [ExprBodyExpr] -> Expr
 combineStmts stmts =
   let (defs, exprs) = partitionDefs stmts
   in case exprs of
-       []  -> error "No final expression in block"
+       []  -> error "No final expression in program"
        [e] -> EApp (ELam [] (ExprBody defs e)) []
        _   -> let finalExpr = last exprs
                   preceding   = init exprs
               in EApp (ELam [] (ExprBody (defs ++ map Expr preceding) finalExpr)) []
 
--- | Top-level: parse an entire program.
-parseProgram :: T.Text -> IO (Either String Expr)
-parseProgram txt = runStderrLoggingT $ do
-  let ls = tokenizeLines txt
-  logDebugN "parseProgram: Starting parsing of program"
-  result <- runParser (many (parseStmt 0)) ls
-  case result of
-       Right (stmts, []) -> do
-         logDebugN "parseProgram: Parsing complete"
-         return (Right (combineStmts stmts))
-       Right (_, remaining) -> do
-         logDebugN ("parseProgram: Unconsumed input: " <> T.pack (show remaining))
-         return (Left ("Unconsumed input: " ++ show remaining))
-       Left err -> do
-         logDebugN ("parseProgram: Error: " <> T.pack err)
-         return (Left err)
+--------------------------------------------------------------------------------
+-- Top-Level parseProgram Function
+--------------------------------------------------------------------------------
+
+dropLayout :: [Token] -> [Token]
+dropLayout = dropWhile (\t -> case t of
+                                TIndent  -> True
+                                TDedent  -> True
+                                TNewline -> True
+                                _        -> False)
+
+parseProgram :: Text -> IO (Either String Expr)
+parseProgram input = do
+  toks <- lexZayin input
+  runStderrLoggingT $ do
+    logDebugN $ "Tokens after layout: " <> T.pack (show toks)
+    res <- runParser parseProgramExprs toks
+    case res of
+      Right (stmts, remaining) ->
+         if dropLayout remaining == [TEOF]
+            then do
+              let progAst = combineStmts stmts
+              logDebugN $ "Parsing complete: " <> T.pack (show progAst)
+              return (Right progAst)
+            else do
+              logDebugN $ "Unconsumed tokens: " <> T.pack (show remaining)
+              return (Left ("Parsing error: unconsumed tokens " ++ show remaining))
+      Left err -> return (Left err)
