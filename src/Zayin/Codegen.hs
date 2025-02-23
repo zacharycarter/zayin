@@ -158,6 +158,8 @@ envStruct lambda = do
       <> T.pack (show (lambdaId lambda))
       <> ": freeVars = "
       <> T.pack (show (Set.toList (freeVars lambda)))
+      <> ", params = "
+      <> T.pack (show (params lambda))
       <> ", captured = "
       <> T.pack (show (Set.toList captured))
       <> ", union = "

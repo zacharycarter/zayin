@@ -213,8 +213,17 @@ main = runCompilation $ do
 
   -- Read source file
   src <- liftIO $ TIO.readFile (sourceFile opts)
-  logInfoN "\nSource being compiled:"
-  logDebugN src
+  logInfoN $ "\nSource being compiled:\n" <> src
+
+  -- Hardcoded AST (uncomment to test compilation without parsing involved)
+  -- let
+  --   parsedAST =
+        -- EApp
+        --   (ELam [] (ExprBody
+        --     { bodyExprs = []
+        --     , finalExpr = EApp (EBuiltinIdent "display") [EApp (EBuiltinIdent "+") [ELit (LInt 1), ELit(LInt 1)]]
+        --     }))
+        --   []
 
   -- let
   --   wrappedExpr =
@@ -226,65 +235,65 @@ main = runCompilation $ do
   --       []
 
   -- Example AST with macro demonstration
-  let macroExample =
-        EApp
-          ( ELam
-              []
-              ( ExprBody
-                  { bodyExprs =
-                      [ -- Macro definition
-                        Def "macro" $
-                          ELam
-                            ["unless"]
-                            ( ExprBody [] $
-                                ELam
-                                  ["$1", "$2"]
-                                  ( ExprBody [] $
-                                      EIf
-                                        (EApp (EBuiltinIdent "not") [EVar "$1"])
-                                        (EVar "$2")
-                                        (ELit LNil)
-                                  )
-                            )
-                      ],
-                    finalExpr = EApp (EVar "unless") [ELit (LInt 1), ELit (LInt 2)]
-                  }
-              )
-          )
-          [] -- Empty argument list for CPS wrapper
-  logInfoN "\nOriginal AST with macro:"
-  logDebugN $ T.pack (renderExpr macroExample)
+  -- let macroExample =
+  --       EApp
+  --         ( ELam
+  --             []
+  --             ( ExprBody
+  --                 { bodyExprs =
+  --                     [ -- Macro definition
+  --                       Def "macro" $
+  --                         ELam
+  --                           ["unless"]
+  --                           ( ExprBody [] $
+  --                               ELam
+  --                                 ["$1", "$2"]
+  --                                 ( ExprBody [] $
+  --                                     EIf
+  --                                       (EApp (EBuiltinIdent "not") [EVar "$1"])
+  --                                       (EVar "$2")
+  --                                       (ELit LNil)
+  --                                 )
+  --                           )
+  --                     ],
+  --                   finalExpr = EApp (EVar "unless") [ELit (LInt 1), ELit (LInt 2)]
+  --                 }
+  --             )
+  --         )
+  --         [] -- Empty argument list for CPS wrapper
+  -- logInfoN "\nOriginal AST with macro:"
+  -- logDebugN $ T.pack (renderExpr macroExample)
+
+  parsedEither <- liftIO $ parseProgram src
+  parsedAST <- case parsedEither of
+    Right ast -> do
+      logInfoN $ "\nParsed input program into AST:\n" <> T.pack (show ast)
+      logInfoN $ "\nPrettified AST: " <> T.pack (renderExpr ast)
+      return ast
+    Left err -> do
+      logErrorN $ "Program parsing failed: " <> T.pack err
+      liftIO exitFailure
 
   -- Macro expansion
-  expandedExpr <- case expandMacros macroExample of
+  expandedExpr <- case expandMacros parsedAST of
     Right e -> do
-      logInfoN "\nExpanded AST after macro processing:"
-      logDebugN $ T.pack (renderExpr e)
+      logInfoN $ "\nExpanded AST after macro processing:" <> T.pack (renderExpr e)
       return e
     Left err -> do
       logErrorN $ "Macro expansion failed: " <> T.pack err
       liftIO exitFailure
 
-  -- Wrap the expanded expression
-  let wrappedExpr = EApp (ELam [] (ExprBody [] expandedExpr)) []
-
-  logInfoN "\nWrapped AST:"
-  logDebugN $ T.pack (renderExpr wrappedExpr)
-
   -- Rest of the processing pipeline
   let initial = Gen id
-      (boundExpr, state1) = runState (toBoundExprM wrappedExpr) initial
-  logInfoN "\nBound Expression: "
-  logDebugN $ T.pack (renderBExpr boundExpr)
+      (boundExpr, state1) = runState (toBoundExprM expandedExpr) initial
+  logInfoN $ "\nBound Expression: " <> T.pack (renderBExpr boundExpr)
 
   let k = CPS.BuiltinIdent "exit"
       (fExpr, _) = runState (toFExprM boundExpr k) state1
-  logInfoN "\nAfter CPS conversion:"
-  logDebugN $ T.pack (renderFExpr fExpr)
+  logInfoN $ "\nAfter CPS conversion: " <> T.pack (renderFExpr fExpr)
 
   let (e, lambdas) = liftLambdas fExpr
-  logInfoN "\nFinal expr before codegen:"
-  logDebugN $ T.pack (renderLExpr e)
+  logInfoN $ "\nFinal expr before codegen:" <> T.pack (renderLExpr e)
   traverse_
     ( \(k', v) -> do
         logInfoN $ "Lambda " <> T.pack (show k') <> ":"
@@ -293,18 +302,17 @@ main = runCompilation $ do
     (toList lambdas)
 
   (rootStmts, protos, decls) <- liftIO $ codegen e lambdas
-  logInfoN "\nCodegen Context:"
-  traverse_ (\s -> logDebugN $ "Root statement: " <> T.pack (show s)) rootStmts
-  traverse_ (\p -> logDebugN $ "Proto: " <> T.pack (show p)) protos
-  traverse_ (\d -> logDebugN $ "Decl: " <> T.pack (show d)) decls
+  logInfoN $ "\nCodegen Context:"
+  traverse_ (\s -> logInfoN $ "\nRoot statement: " <> T.pack (show s)) rootStmts
+  traverse_ (\p -> logInfoN $ "\nProto: " <> T.pack (show p)) protos
+  traverse_ (\d -> logInfoN $ "\nDecl: " <> T.pack (show d)) decls
 
   -- Generate build directory
   buildDir <- liftIO generateBuildDir
   let cCode = generateC rootStmts protos decls
       fullSource = generateProgramSource cCode
 
-  logInfoN "\nGenerated C Code:"
-  logDebugN fullSource
+  logInfoN $ "\nGenerated C Code: " <> fullSource
 
   -- Write and compile C code
   liftIO $ insertSourceIntoBuildDir buildDir fullSource

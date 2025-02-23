@@ -50,16 +50,27 @@ freeVars expr = case expr of
   CallOne f x -> Set.union (freeVars f) (freeVars x)
   CallTwo f x y -> Set.unions [freeVars f, freeVars x, freeVars y]
 
-freeVarsLExpr :: L.LExpr -> Set T.Text
-freeVarsLExpr = \case
+freeVarsLExpr :: HashMap Int L.LiftedLambda -> L.LExpr -> Set T.Text
+freeVarsLExpr lambdaMap expr = case expr of
+  L.If c t f ->
+    freeVarsLExpr lambdaMap c `Set.union`
+    freeVarsLExpr lambdaMap t `Set.union`
+    freeVarsLExpr lambdaMap f
   L.Var v -> Set.singleton v
   L.Lit _ -> Set.empty
   L.BuiltinIdent _ -> Set.empty
-  L.SetThen v e1 e2 -> Set.insert v (freeVarsLExpr e1 `Set.union` freeVarsLExpr e2)
-  L.If c t f -> freeVarsLExpr c `Set.union` freeVarsLExpr t `Set.union` freeVarsLExpr f
-  L.Lifted _ -> Set.empty -- Key change: Lifted nodes have no free variables
-  L.CallOne f x -> freeVarsLExpr f `Set.union` freeVarsLExpr x
-  L.CallTwo f x y -> freeVarsLExpr f `Set.union` freeVarsLExpr x `Set.union` freeVarsLExpr y
+  L.SetThen v e1 e2 ->
+    Set.unions [Set.singleton v, freeVarsLExpr lambdaMap e1, freeVarsLExpr lambdaMap e2]
+  L.CallOne f x ->
+    freeVarsLExpr lambdaMap f `Set.union` freeVarsLExpr lambdaMap x
+  L.CallTwo f x y ->
+    freeVarsLExpr lambdaMap f `Set.union`
+    freeVarsLExpr lambdaMap x `Set.union`
+    freeVarsLExpr lambdaMap y
+  L.Lifted i ->
+    case HashMap.lookup i lambdaMap of
+      Just liftedLambda -> L.freeVars liftedLambda  -- use the field from the lifted lambda record
+      Nothing -> Set.empty
 
 liftLambdasM :: FExpr -> LiftingContext -> (L.LExpr, LiftingContext)
 liftLambdasM expr ctx =
@@ -74,7 +85,7 @@ liftLambdasM expr ctx =
     $ case expr of
       LamOne param body ->
         let (body', ctx1) = liftLambdasM body ctx
-            free = freeVarsLExpr body' -- Compute free vars AFTER lifting nested lambdas
+            free = freeVarsLExpr (lambdas ctx1) body' -- Compute free vars AFTER lifting nested lambdas
             (id, ctx2) = getFreshId ctx1
             lambda = L.LiftedLambda id [param] free body'
             ctx3 = addLambda lambda ctx2
@@ -98,7 +109,7 @@ liftLambdasM expr ctx =
               result
       LamTwo p1 p2 body ->
         let (body', ctx1) = liftLambdasM body ctx
-            free = freeVarsLExpr body' -- Compute free vars AFTER lifting nested lambdas
+            free = freeVarsLExpr (lambdas ctx1) body' -- Compute free vars AFTER lifting nested lambdas
             (id, ctx2) = getFreshId ctx1
             lambda = L.LiftedLambda id [p1, p2] free body'
             ctx3 = addLambda lambda ctx2

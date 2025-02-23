@@ -25,7 +25,7 @@ instance ToC CExpr where
 
 instance ToC CStmt where
   toC stmt = case stmt of
-    SExpr expr -> toC expr <> ";"
+    SExpr expr -> toC expr <> ";\n"
     SDecl decl -> toC decl
     SIf cond ift iff -> "if (" <> toC cond <> ")" <> toC ift <> " else " <> toC iff
     SBlock stmts -> "{\n" <> T.concat (map toC stmts) <> "}\n"
