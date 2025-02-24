@@ -12,6 +12,7 @@ instance Pretty Literal where
   pretty lit = case lit of
     LInt i -> pretty i
     LString s -> dquotes (pretty s)
+    LBool b -> pretty b
     LNil -> "nil"
 
 instance Pretty BExpr where

@@ -68,6 +68,9 @@ char *obj_to_string_internal(struct obj *val) {
   case OBJ_INT:
     ALLOC_SPRINTF(res, "%ld", ((struct int_obj *)val)->val);
     break;
+  case OBJ_BOOL:
+    ALLOC_SPRINTF(res, "%s", ((struct bool_obj *)val)->val ? "true" : "false");
+    break;
   case OBJ_STR:
     ALLOC_SPRINTF(res, "%s", ((struct string_obj *)val)->buf);
     break;
@@ -96,6 +99,8 @@ void to_string_k(struct obj *v, struct obj *k, struct env_obj *env) {
 }
 
 void display_k(struct obj *v, struct obj *k, struct env_obj *env) {
+  printf("inside display!\n");
+
   char *res = obj_to_string_internal(v);
 
   printf("%s\n", res);
@@ -108,11 +113,15 @@ void display_k(struct obj *v, struct obj *k, struct env_obj *env) {
 }
 
 _Bool obj_is_truthy(struct obj *obj) {
+  if (!obj) return false;
+
   switch (obj->tag) {
   case OBJ_INT:
     return ((struct int_obj *)obj)->val != 0;
   case OBJ_STR:
     return ((struct string_obj *)obj)->len != 0;
+  case OBJ_BOOL:
+    return ((struct bool_obj *)obj)->val;
   default:
     return true;
   }
@@ -178,6 +187,9 @@ static char *convert_to_str(struct obj *v) {
   switch (v->tag) {
   case OBJ_INT:
     ALLOC_SPRINTF(res, "%c", (int)((struct int_obj *)v)->val);
+    break;
+  case OBJ_BOOL:
+    ALLOC_SPRINTF(res, "%s", (bool)((struct bool_obj *)v)->val ? "true" : "false");
     break;
   case OBJ_STR:
     ALLOC_SPRINTF(res, "%s", ((struct string_obj *)v)->buf);

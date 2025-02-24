@@ -1,6 +1,6 @@
 # Set the compiler and default flags.
 CC ?= gcc
-CFLAGS ?= -g # -O1
+CFLAGS ?= -g -O1
 
 # Enable verbose output by default
 V ?= 1

@@ -19,6 +19,7 @@ data Token
   | TNumber Integer
   | TKeyword Text
   | TSymbol Text
+  | TString Text
   | TNewline
   | TIndent
   | TDedent
@@ -81,6 +82,13 @@ nextToken t
          case T.uncons t' of
            Nothing -> []
            Just (c, rest)
+             | c == '"' ->  -- Put string handling first
+                 case T.breakOn "\"" rest of
+                   (str, rest')
+                     | T.null rest' -> error "Unterminated string literal"
+                     | otherwise ->
+                         let remaining = T.drop 1 rest'  -- Skip the closing quote
+                         in TString str : nextToken remaining
              | isDigit c ->
                  let (num, rest') = T.span isDigit t'
                      token = TNumber (read (T.unpack num))
@@ -97,7 +105,7 @@ isPunctuation :: Char -> Bool
 isPunctuation c = c `elem` ("()+-*/=,:;" :: String)
 
 isKeyword :: Text -> Bool
-isKeyword w = w `elem` ["if", "then", "else", "fn", "where", "do"]
+isKeyword w = w `elem` ["if", "then", "else", "fn", "where", "do", "true", "false", "nil"]
 
 isBuiltin :: Text -> Bool
 isBuiltin w = w `elem` ["display"]
@@ -212,15 +220,35 @@ parseProgramExprs = many parseTopStmt
 parseExpr :: Parser Expr
 parseExpr = parseIf <|> parseAdd
 
+parseExprList :: Parser Expr
+parseExprList = do
+  exprs <- sepBy parseExpr (consume (== TSymbol ";"))
+  return $ case exprs of
+    [] -> ELit LNil
+    [x] -> x
+    xs -> foldr1 makeSequence xs
+  where
+    makeSequence e1 e2 =
+      -- Create a sequence by applying each expression to display
+      EApp (ELam ["_"] (ExprBody [] e2)) [e1]
+
+-- Parse a list of expressions separated by semicolons
 parseIf :: Parser Expr
 parseIf = do
-  _     <- consume (== TKeyword "if")
-  cond  <- parseExpr
-  _     <- consume (== TKeyword "then")
-  thenE <- parseExpr
-  _     <- consume (== TKeyword "else")
-  elseE <- parseExpr
-  return (EIf cond thenE elseE)
+  _    <- consume (== TKeyword "if")
+  cond <- parseExpr
+  _    <- consume (== TSymbol ":")
+  thenE <- parseExprList
+  return (EIf cond thenE (ELit LNil))
+
+-- Helper for parsing separated lists
+sepBy :: Parser a -> Parser b -> Parser [a]
+sepBy p sep = do
+  first <- p
+  rest <- many (do
+    _ <- sep
+    p)
+  return (first : rest)
 
 -- Parse left-associative addition.
 parseAdd :: Parser Expr
@@ -234,18 +262,29 @@ parseAdd = do
       let addExpr = EApp (EBuiltinIdent "+") [lhs, rhs]
       moreAdd addExpr) <|> return lhs
 
--- Parse function application.
+-- Parse function application with either space or parentheses syntax
 parseCall :: Parser Expr
 parseCall = do
   primary <- parsePrimary
   parseCall' primary
   where
-    parseCall' fun = (do
-      _ <- consume (== TSymbol "(")
-      arg <- parseExpr
-      _ <- consume (== TSymbol ")")
-      let callExpr = EApp fun [arg]
-      parseCall' callExpr) <|> return fun
+    parseCall' fun =
+      -- Try parentheses syntax first
+      (do
+        _ <- consume (== TSymbol "(")
+        arg <- parseExpr
+        _ <- consume (== TSymbol ")")
+        let callExpr = EApp fun [arg]
+        parseCall' callExpr)
+      <|>
+      -- Try space-separated syntax for builtins
+      (case fun of
+        EBuiltinIdent _ -> do
+          arg <- parsePrimary  -- Use parsePrimary to avoid left recursion
+          let callExpr = EApp fun [arg]
+          parseCall' callExpr
+        _ -> return fun)
+      <|> return fun
 
 -- Parse a primary expression.
 parsePrimary :: Parser Expr
@@ -260,13 +299,21 @@ parseTermSimple :: Parser Expr
 parseTermSimple = do
   t <- consume isTerm
   case t of
-    TIdent name -> if (isBuiltin name) then return (EBuiltinIdent name) else return (EVar name)
-    TNumber n   -> return (ELit (LInt n))
-    _           -> Parser $ \_ -> return (Left "Expected a term")
+    TIdent name -> if (isBuiltin name)
+                   then return (EBuiltinIdent name)
+                   else return (EVar name)
+    TNumber n -> return (ELit (LInt n))
+    TString s -> return (ELit (LString s))  -- Handle string literals
+    TKeyword "nil" -> return (ELit LNil)
+    TKeyword "true" -> return (ELit (LBool True))
+    TKeyword "false" -> return (ELit (LBool False))
+    _ -> Parser $ \_ -> return (Left "Expected a term")
   where
     isTerm tok = case tok of
       TIdent _  -> True
       TNumber _ -> True
+      TString _ -> True
+      TKeyword k -> k `elem` ["nil", "true", "false"]
       _         -> False
 
 --------------------------------------------------------------------------------

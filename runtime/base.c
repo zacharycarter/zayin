@@ -171,6 +171,11 @@ struct int_obj object_int_obj_new(int64_t val) {
   return (struct int_obj){.base = object_base_new(OBJ_INT), .val = val};
 }
 
+
+struct bool_obj object_bool_obj_new(bool val) {
+  return (struct bool_obj){.base = object_base_new(OBJ_BOOL), .val = val};
+}
+
 struct cons_obj object_cons_obj_new(struct obj *car, struct obj *cdr) {
   return (struct cons_obj){
       .base = object_base_new(OBJ_CONS), .car = car, .cdr = cdr};
@@ -205,6 +210,8 @@ size_t hash_obj_impl(struct obj *obj) {
   switch (obj->tag) {
   case OBJ_INT:
     return hash_table_default_size_t_hash_fun(((struct int_obj *)obj)->val);
+  case OBJ_BOOL:
+    return hash_table_default_size_t_hash_fun(((struct bool_obj *)obj)->val);
   case OBJ_STR: {
     struct string_obj *str_obj = (struct string_obj *)obj;
     return hash_string(str_obj->buf, str_obj->len);
@@ -246,6 +253,8 @@ bool eq_obj_impl(struct obj *a, struct obj *b) {
   switch (a->tag) {
   case OBJ_INT:
     return ((struct int_obj *)a)->val == ((struct int_obj *)b)->val;
+  case OBJ_BOOL:
+    return ((struct bool_obj *)a)->val == ((struct bool_obj *)b)->val;
   case OBJ_STR: {
     struct string_obj *str_obj_a = (struct string_obj *)a;
     struct string_obj *str_obj_b = (struct string_obj *)b;

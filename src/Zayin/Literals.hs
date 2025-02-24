@@ -6,5 +6,6 @@ data Literal
   = LString T.Text
   | LInt Integer
   | LFloat Float
+  | LBool Bool
   | LNil
   deriving (Show, Eq)

@@ -32,6 +32,16 @@
     (NAME) = (struct obj *)new_obj;                                            \
   } while (0)
 
+#define OBJECT_BOOL_OBJ_NEW(NAME, b)                                           \
+  struct obj *(NAME);                                                          \
+  do {                                                                         \
+    struct bool_obj *new_obj =                                                 \
+        (struct bool_obj*)alloca(sizeof(struct bool_obj));                     \
+    *new_obj = object_bool_obj_new((b));                                       \
+    TOUCH_OBJECT(new_obj, "bool_obj_new");                                     \
+    (NAME) = (struct obj *)new_obj;                                            \
+  } while (0)
+
 #define ENV_STRUCT(T)                                                          \
   struct {                                                                     \
     struct obj base;                                                           \
@@ -109,6 +119,7 @@ enum __attribute__((__packed__)) object_tag {
   OBJ_CONS,
   OBJ_CELL,
   OBJ_HT,
+  OBJ_BOOL,
 };
 
 #define LAST_OBJ_TYPE OBJ_HT
@@ -158,6 +169,11 @@ struct int_obj {
   int64_t val;
 };
 
+struct bool_obj {
+  struct obj base;
+  bool val;
+};
+
 struct string_obj {
   struct obj base;
   size_t len;
@@ -198,6 +214,7 @@ struct closure_obj object_closure_two_new(void (*)(struct obj *, struct obj *,
                                                    struct env_obj *),
                                           struct env_obj *);
 struct int_obj object_int_obj_new(int64_t);
+struct bool_obj object_bool_obj_new(bool);
 struct cons_obj object_cons_obj_new(struct obj *, struct obj *);
 struct ht_obj object_ht_obj_new(void);
 

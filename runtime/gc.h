@@ -67,6 +67,8 @@ void mark_env(struct obj *, struct gc_context *);
 
 struct obj *toheap_int_obj(struct obj *, struct gc_context *);
 
+struct obj *toheap_bool_obj(struct obj *, struct gc_context *);
+
 struct obj *toheap_string_obj(struct obj *, struct gc_context *);
 
 struct obj *toheap_cell(struct obj *, struct gc_context *);

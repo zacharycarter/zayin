@@ -16,6 +16,8 @@ instance ToC CExpr where
     EVar name -> name
     ELitInt n -> T.pack (show n)
     ELitStr s -> "\"" <> s <> "\""
+    ELitBool True -> "1"
+    ELitBool False -> "0"
     EBinOp op left right -> "(" <> toC left <> ")" <> op <> "(" <> toC right <> ")"
     EPreUnOp op ex -> op <> "(" <> toC ex <> ")"
     EArrow expr attr -> "(" <> toC expr <> ")->" <> attr

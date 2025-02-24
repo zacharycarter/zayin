@@ -133,28 +133,32 @@ copyBinary tmpDir outputPath =
 
 invokeMake :: FilePath -> IO (Either String String)
 invokeMake tmpDir = do
-  putStrLn $ "\nExecuting make in: " ++ tmpDir
-  (_, mout, merr, ph) <-
-    createProcess
-      (proc "make" ["SANITIZE=asan"])
-        { cwd = Just tmpDir,
-          std_out = CreatePipe,
-          std_err = CreatePipe
-        }
+  putStrLn $ "\n=== Executing make in: " ++ tmpDir ++ " ==="
+  (_, mout, merr, ph) <- createProcess
+    (proc "make" []) {
+      cwd = Just tmpDir,
+      std_out = CreatePipe,
+      std_err = CreatePipe
+    }
+
+  -- Always log command execution
+  putStrLn "Executing: make SANITIZE=asan"
+
   exitCode <- waitForProcess ph
   stdout <- maybe (return "") TIO.hGetContents mout
   stderr <- maybe (return "") TIO.hGetContents merr
+
+  -- Always log all output
+  putStrLn $ "\nMake stdout:\n" ++ T.unpack stdout
+  putStrLn $ "\nMake stderr:\n" ++ T.unpack stderr
+  putStrLn $ "\nMake exit code: " ++ show exitCode
+
   case exitCode of
     ExitSuccess -> return $ Right $ T.unpack stdout
     ExitFailure code ->
-      return $
-        Left $
-          "Make failed with exit code: "
-            ++ show code
-            ++ "\nstdout: "
-            ++ T.unpack stdout
-            ++ "\nstderr: "
-            ++ T.unpack stderr
+      return $ Left $ "Make failed with exit code: " ++ show code ++
+                     "\nstdout: " ++ T.unpack stdout ++
+                     "\nstderr: " ++ T.unpack stderr
 
 insertSourceIntoBuildDir :: FilePath -> T.Text -> IO ()
 insertSourceIntoBuildDir tmpDir source = do

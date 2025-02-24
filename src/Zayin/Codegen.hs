@@ -35,6 +35,7 @@ data CExpr
   = EVar T.Text
   | ELitInt Integer
   | ELitStr T.Text
+  | ELitBool Bool
   | EBinOp T.Text CExpr CExpr
   | EPreUnOp T.Text CExpr
   | EArrow CExpr T.Text
@@ -447,6 +448,22 @@ doCodegen expr currentEnv = do
                 "OBJECT_INT_OBJ_NEW"
                 [EVar dest, ELitInt i]
           return $ EVar dest
+        LBool True -> do
+          dest <- genVar
+          addStmt $
+            SExpr $
+              EMacroCall
+                "OBJECT_BOOL_OBJ_NEW"
+                [EVar dest, ELitBool True]
+          return $ EVar dest
+        LBool False -> do
+          dest <- genVar
+          addStmt $
+            SExpr $
+              EMacroCall
+                "OBJECT_BOOL_OBJ_NEW"
+                [EVar dest, ELitBool False]
+          return $ EVar dest
         LNil -> return ENull
     BuiltinIdent ident -> builtinIdentCodegen ident
     SetThen var val cont -> do
@@ -479,15 +496,24 @@ doCodegen expr currentEnv = do
         Just lambda -> generateClosure lambda currentEnv
         Nothing -> error $ "Unknown lambda id: " ++ show id
     If cond thenExpr elseExpr -> do
+      logDebugN $ "=== If ==="
+      logDebugN $ "  If cond:  " <> T.pack (show cond)
+      logDebugN $ "  If thenExpr:  " <> T.pack (show thenExpr)
+      logDebugN $ "  If elseExpr:  " <> T.pack (show elseExpr)
+
       condExpr <- doCodegen cond currentEnv
       thenFinal <- doCodegen thenExpr currentEnv
       elseFinal <- doCodegen elseExpr currentEnv
 
       addStmt $
-        SIf
-          (EMacroCall "obj_is_truthy" [condExpr])
-          (SBlock [SExpr thenFinal])
-          (SBlock [SExpr elseFinal])
+          SIf
+              (EMacroCall "obj_is_truthy" [condExpr])
+              (SBlock [SExpr thenFinal])
+              (SBlock [SExpr elseFinal])
+
+      logDebugN $ "  If condFinal:  " <> T.pack (show condExpr)
+      logDebugN $ "  If thenFinal:  " <> T.pack (show thenFinal)
+      logDebugN $ "  If elseFinal:  " <> T.pack (show elseFinal)
 
       return $ ELitInt 0
     CallOne f arg -> do

@@ -39,6 +39,7 @@ static struct gc_funcs gc_func_map[] = {
     [OBJ_INT] = (struct gc_funcs){.toheap = toheap_int_obj,
                                   .mark = gc_mark_noop,
                                   .free = gc_free_noop},
+
     [OBJ_STR] =
         (struct gc_funcs){
             .toheap = toheap_string_obj,
@@ -48,6 +49,9 @@ static struct gc_funcs gc_func_map[] = {
     [OBJ_HT] = (struct gc_funcs){.toheap = toheap_ht,
                                  .mark = mark_ht,
                                  .free = free_ht},
+    [OBJ_BOOL] = (struct gc_funcs){.toheap = toheap_bool_obj,
+                                  .mark = gc_mark_noop,
+                                  .free = gc_free_noop},
 };
 
 // This does nothing, the gc will call free() on the object if it was heap
@@ -261,6 +265,19 @@ struct obj *toheap_int_obj(struct obj *obj, struct gc_context *ctx) {
   }
 
   return (struct obj *)intobj;
+}
+
+struct obj *toheap_bool_obj(struct obj *obj, struct gc_context *ctx) {
+  struct bool_obj *boolobj = (struct bool_obj *)obj;
+
+  if (obj->on_stack) {
+    TOUCH_OBJECT(obj, "toheap_bool");
+    struct bool_obj *heap_boolobj = gc_malloc(sizeof(struct bool_obj));
+    memcpy(heap_boolobj, boolobj, sizeof(struct bool_obj));
+    boolobj = heap_boolobj;
+  }
+
+  return (struct obj *)boolobj;
 }
 
 struct obj *toheap_string_obj(struct obj *obj, struct gc_context *ctx) {
