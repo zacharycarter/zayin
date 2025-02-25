@@ -1,4 +1,1 @@
-macro unless(a, b):
-  if not a: b else: nil
-
-unless(false): display("macro works!")
+fn foo(a): display a

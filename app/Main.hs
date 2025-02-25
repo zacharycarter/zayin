@@ -33,10 +33,11 @@ import qualified Zayin.CPS as CPS
 import Zayin.Codegen (codegen)
 import Zayin.FlatExpr (liftLambdas)
 import Zayin.FlatExpr.Pretty (renderFExpr)
+import Zayin.Interpreter (interpret, valueToString, Value(..))
 import Zayin.LiftedExpr.Pretty (renderLExpr, renderLiftedLambda)
 import Zayin.Literals
 import Zayin.Macros (expandMacros)
-import Zayin.Parser (parseProgram)
+import Zayin.Parser (parseProgram, parseWithDebug)
 import Zayin.Transforms (toFExprM)
 
 --------------------------------------------------------------------------------
@@ -150,9 +151,9 @@ copyBinary tmpDir outputPath =
     handler :: SomeException -> IO ()
     handler e = error "failed copying compiled binary"
 
-invokeMake :: FilePath -> Bool -> IO (Either String String)
-invokeMake tmpDir sanitize = do
-  putStrLn $ "\n=== Executing make in: " ++ tmpDir ++ " ==="
+invokeMake :: FilePath -> Bool -> Bool -> IO (Either String String)
+invokeMake tmpDir sanitize debugMode = do
+  when debugMode $ putStrLn $ "\n=== Executing make in: " ++ tmpDir ++ " ==="
 
   let args = if sanitize then ["SANITIZE=asan"] else []
 
@@ -163,24 +164,29 @@ invokeMake tmpDir sanitize = do
       std_err = CreatePipe
     }
 
-  -- Always log command execution
-  putStrLn $ "Executing: make " ++ unwords args
+  -- Log command execution only in debug mode
+  when debugMode $ putStrLn $ "Executing: make " ++ unwords args
 
   exitCode <- waitForProcess ph
   stdout <- maybe (return "") TIO.hGetContents mout
   stderr <- maybe (return "") TIO.hGetContents merr
 
-  -- Always log all output
-  putStrLn $ "\nMake stdout:\n" ++ T.unpack stdout
-  putStrLn $ "\nMake stderr:\n" ++ T.unpack stderr
-  putStrLn $ "\nMake exit code: " ++ show exitCode
+  -- Log outputs only in debug mode
+  when debugMode $ do
+    putStrLn $ "\nMake stdout:\n" ++ T.unpack stdout
+    putStrLn $ "\nMake stderr:\n" ++ T.unpack stderr
+    putStrLn $ "\nMake exit code: " ++ show exitCode
 
   case exitCode of
-    ExitSuccess -> return $ Right $ T.unpack stdout
+    ExitSuccess ->
+      if debugMode
+        then return $ Right $ T.unpack stdout
+        else return $ Right ""  -- Empty string when not in debug mode, since we don't need the output
     ExitFailure code ->
       return $ Left $ "Make failed with exit code: " ++ show code ++
-                     "\nstdout: " ++ T.unpack stdout ++
-                     "\nstderr: " ++ T.unpack stderr
+                     (if debugMode
+                       then "\nstdout: " ++ T.unpack stdout ++ "\nstderr: " ++ T.unpack stderr
+                       else "")  -- Simplified error message when not in debug mode
 
 insertSourceIntoBuildDir :: FilePath -> T.Text -> IO ()
 insertSourceIntoBuildDir tmpDir source = do
@@ -223,14 +229,6 @@ generateProgramSource src =
         ]
     ]
 
--- Make a REPL-specific wrapper to automatically display the last expression
-wrapForRepl :: T.Text -> T.Text
-wrapForRepl input =
-  -- If the input is a simple expression (not a macro, function, etc.), add 'display' to it
-  if T.all (\c -> c /= '\n') input && not (T.isPrefixOf "macro " $ T.strip input) && not (T.isPrefixOf "fn " $ T.strip input)
-    then "display(" <> input <> ")"
-    else input
-
 --------------------------------------------------------------------------------
 -- Compilation Function
 --------------------------------------------------------------------------------
@@ -242,17 +240,18 @@ runCompilation = runStderrLoggingT
 
 compileSource :: Options -> FilePath -> T.Text -> Bool -> IO (Either String FilePath)
 compileSource opts buildDir src isRepl = runCompilation $ do
-  -- Possibly transform the source for REPL
-  let finalSrc = if isRepl then wrapForRepl src else src
+   -- Possibly transform the source for REPL
+  let debugMode = debug opts
 
-  logInfoN $ "\nSource being compiled:\n" <> finalSrc
+  when debugMode $ logInfoN $ "\nSource being compiled:\n" <> src
 
-  -- Parse the source
-  parsedEither <- liftIO $ parseProgram finalSrc
+  -- Parse the source with debug flag
+  parsedEither <- liftIO $ parseWithDebug debugMode src
   parsedAST <- case parsedEither of
     Right ast -> do
-      logInfoN $ "\nParsed input program into AST:\n" <> T.pack (show ast)
-      logInfoN $ "\nPrettified AST: " <> T.pack (renderExpr ast)
+      when debugMode $ do
+        logInfoN $ "\nParsed input program into AST:\n" <> T.pack (show ast)
+        logInfoN $ "\nPrettified AST: " <> T.pack (renderExpr ast)
       return ast
     Left err -> do
       logErrorN $ "Program parsing failed: " <> T.pack err
@@ -261,53 +260,66 @@ compileSource opts buildDir src isRepl = runCompilation $ do
   -- Macro expansion
   expandedExpr <- case expandMacros parsedAST of
     Right e -> do
-      logInfoN $ "\nExpanded AST after macro processing:" <> T.pack (renderExpr e)
+      when debugMode $
+        logInfoN $ "\nExpanded AST after macro processing:" <> T.pack (renderExpr e)
       return e
     Left err -> do
       logErrorN $ "Macro expansion failed: " <> T.pack err
       liftIO exitFailure
 
-  -- Rest of the processing pipeline
+  -- Rest of the processing pipeline - Updated to use runFresh and pass the debugMode flag
   let initial = Gen id
-      (boundExpr, state1) = runState (toBoundExprM expandedExpr) initial
-  logInfoN $ "\nBound Expression: " <> T.pack (renderBExpr boundExpr)
+
+  -- Use runFresh instead of runState for toBoundExprM with debug flag
+  (boundExpr, state1) <- liftIO $ runFresh (toBoundExprM debugMode expandedExpr) initial
+  when debugMode $
+    logInfoN $ "\nBound Expression: " <> T.pack (renderBExpr boundExpr)
 
   let k = CPS.BuiltinIdent "exit"
-      (fExpr, _) = runState (toFExprM boundExpr k) state1
-  logInfoN $ "\nAfter CPS conversion: " <> T.pack (renderFExpr fExpr)
 
-  let (e, lambdas) = liftLambdas fExpr
-  logInfoN $ "\nFinal expr before codegen:" <> T.pack (renderLExpr e)
-  traverse_
-    ( \(k', v) -> do
-        logInfoN $ "Lambda " <> T.pack (show k') <> ":"
-        logDebugN $ T.pack (renderLiftedLambda v)
-    )
-    (toList lambdas)
+  -- Updated to use runFresh for toFExprM with debug flag
+  (fExpr, _) <- liftIO $ runFresh (toFExprM debugMode boundExpr k) state1
 
-  (rootStmts, protos, decls) <- liftIO $ codegen e lambdas
-  logInfoN $ "\nCodegen Context:"
-  traverse_ (\s -> logInfoN $ "\nRoot statement: " <> T.pack (show s)) rootStmts
-  traverse_ (\p -> logInfoN $ "\nProto: " <> T.pack (show p)) protos
-  traverse_ (\d -> logInfoN $ "\nDecl: " <> T.pack (show d)) decls
+  when debugMode $
+    logInfoN $ "\nAfter CPS conversion: " <> T.pack (renderFExpr fExpr)
+
+  -- Updated to pass debug flag to liftLambdas
+  let (e, lambdas) = liftLambdas debugMode fExpr
+  when debugMode $ do
+    logInfoN $ "\nFinal expr before codegen:" <> T.pack (renderLExpr e)
+    traverse_
+      ( \(k', v) -> do
+          logInfoN $ "Lambda " <> T.pack (show k') <> ":"
+          logDebugN $ T.pack (renderLiftedLambda v)
+      )
+      (toList lambdas)
+
+  -- Updated to pass debug flag to codegen
+  (rootStmts, protos, decls) <- liftIO $ codegen debugMode e lambdas
+  when debugMode $ do
+    logInfoN $ "\nCodegen Context:"
+    traverse_ (\s -> logInfoN $ "\nRoot statement: " <> T.pack (show s)) rootStmts
+    traverse_ (\p -> logInfoN $ "\nProto: " <> T.pack (show p)) protos
+    traverse_ (\d -> logInfoN $ "\nDecl: " <> T.pack (show d)) decls
 
   -- Generate C code
   let cCode = generateC rootStmts protos decls
       fullSource = generateProgramSource cCode
 
-  logInfoN $ "\nGenerated C Code: " <> fullSource
+  when debugMode $
+    logInfoN $ "\nGenerated C Code: " <> fullSource
 
   -- Write C code
   liftIO $ insertSourceIntoBuildDir buildDir fullSource
-  makeResult <- liftIO $ invokeMake buildDir (sanitize opts)
+  makeResult <- liftIO $ invokeMake buildDir (sanitize opts) debugMode  -- Pass debug flag to invokeMake
 
   case makeResult of
     Left errMsg -> do
       logErrorN $ "\nFailed compiling generated C code: " <> T.pack errMsg
       return $ Left $ "Compilation failed: " ++ errMsg
     Right stdoutStr -> do
-      logInfoN "\nCompilation result:"
-      when (debug opts) $ logDebugN (T.pack stdoutStr)
+      when debugMode $ logInfoN "\nCompilation result:"
+      when debugMode $ logDebugN (T.pack stdoutStr)
       return $ Right $ buildDir </> "compiled_result"
 
 --------------------------------------------------------------------------------
@@ -325,6 +337,9 @@ runRepl opts = do
   -- Create persistent build directory for the REPL
   dir <- createReplBuildDir
 
+  let debugMode = debug opts
+  when debugMode $ putStrLn $ "REPL build directory: " ++ dir
+
   -- Set up initial state
   let initialState = ReplState
         { buildDir = dir
@@ -334,12 +349,88 @@ runRepl opts = do
 
   putStrLn "Zayin REPL v0.1"
   putStrLn "Type expressions to evaluate, :help for commands"
+  when debugMode $ putStrLn "[Debug mode enabled]"
 
   -- Run REPL loop using Haskeline for history and editing
   finally (runInputT defaultSettings (replLoop opts initialState)) $ do
     -- Cleanup on exit
-    unless (keepTmpdir opts) $ removeDirectoryRecursive dir
+    unless (keepTmpdir opts) $ do
+      when debugMode $ putStrLn $ "Cleaning up REPL build directory: " ++ dir
+      removeDirectoryRecursive dir
     putStrLn "Goodbye!"
+
+replLoop :: Options -> ReplState -> InputT IO ()
+replLoop opts state = do
+  let debugMode = debug opts
+  minput <- getInputLine "zayin> "
+  case minput of
+    Nothing -> return ()  -- EOF
+    Just ":q" -> return ()  -- Quit
+    Just ":quit" -> return ()  -- Quit
+    Just ":exit" -> return ()  -- Quit
+    Just ":help" -> do
+      outputStrLn "Commands:"
+      outputStrLn "  :q, :quit, :exit - Exit the REPL"
+      outputStrLn "  :help           - Show this help message"
+      outputStrLn "  :reset          - Reset environment (clear all definitions)"
+      outputStrLn "  :history        - Show input history"
+      outputStrLn "  :env            - Show current environment"
+      outputStrLn "  :debug          - Toggle debug mode"
+      replLoop opts state
+    Just ":reset" -> do
+      outputStrLn "Environment reset."
+      replLoop opts state { environment = [] }
+    Just ":history" -> do
+      outputStrLn "Input history:"
+      forM_ (zip [1..] (reverse $ history state)) $ \(i, input) ->
+        outputStrLn $ show (i :: Int) ++ ": " ++ T.unpack input
+      replLoop opts state
+    Just ":env" -> do
+      outputStrLn "Current environment:"
+      forM_ (environment state) $ \def ->
+        outputStrLn $ T.unpack def
+      replLoop opts state
+    Just ":debug" -> do
+      let newOpts = opts { debug = not debugMode }
+      outputStrLn $ "Debug mode " ++ (if debug newOpts then "enabled" else "disabled")
+      replLoop newOpts state
+    Just input
+      | T.null (T.strip (T.pack input)) -> replLoop opts state
+      | otherwise -> do
+          let inputText = T.pack input
+
+          -- Run through your existing pipeline until you get LExpr
+          result <- liftIO $ do
+            parsedEither <- parseWithDebug debugMode inputText
+            case parsedEither of
+              Left err -> return $ Left $ "Parse error: " ++ err
+              Right ast ->
+                case expandMacros ast of
+                  Left err -> return $ Left $ "Macro error: " ++ err
+                  Right expandedAst -> do
+                    -- Create a fresh generator
+                    (boundExpr, state1) <- runFresh (toBoundExprM debugMode expandedAst) (Gen id)
+                    let k = CPS.BuiltinIdent "exit"
+                    -- Get flat expression from bound expression
+                    (fExpr, _) <- runFresh (toFExprM debugMode boundExpr k) state1
+                    -- Lift lambdas
+                    let (lexpr, lambdas) = liftLambdas debugMode fExpr
+
+                    -- Instead of generating C code, interpret!
+                    interpretResult <- interpret lexpr lambdas True
+                    case interpretResult of
+                      Left err -> return $ Left $ "Evaluation error: " ++ show err
+                      Right val -> return $ Right val
+
+          case result of
+            Left err -> do
+              outputStrLn err
+              replLoop opts state
+            Right val -> case val of
+              VNoop -> replLoop opts state  -- Don't print anything for VNoop
+              _ -> do
+                outputStrLn $ valueToString val
+                replLoop opts state
 
 -- Helper function to determine if input contains a definition
 updateState :: T.Text -> ReplState -> ReplState
@@ -365,59 +456,6 @@ runProgramWithErrorHandling exePath = do
        return (ExitFailure 1))
   return result
 
-replLoop :: Options -> ReplState -> InputT IO ()
-replLoop opts state = do
-  minput <- getInputLine "zayin> "
-  case minput of
-    Nothing -> return ()  -- EOF
-    Just ":q" -> return ()  -- Quit
-    Just ":quit" -> return ()  -- Quit
-    Just ":exit" -> return ()  -- Quit
-    Just ":help" -> do
-      outputStrLn "Commands:"
-      outputStrLn "  :q, :quit, :exit - Exit the REPL"
-      outputStrLn "  :help           - Show this help message"
-      outputStrLn "  :reset          - Reset environment (clear all definitions)"
-      outputStrLn "  :history        - Show input history"
-      outputStrLn "  :env            - Show current environment"
-      replLoop opts state
-    Just ":reset" -> do
-      outputStrLn "Environment reset."
-      replLoop opts state { environment = [] }
-    Just ":history" -> do
-      outputStrLn "Input history:"
-      forM_ (zip [1..] (reverse $ history state)) $ \(i, input) ->
-        outputStrLn $ show (i :: Int) ++ ": " ++ T.unpack input
-      replLoop opts state
-    Just ":env" -> do
-      outputStrLn "Current environment:"
-      forM_ (environment state) $ \def ->
-        outputStrLn $ T.unpack def
-      replLoop opts state
-    Just input
-      | T.null (T.strip (T.pack input)) -> replLoop opts state
-      | otherwise -> do
-          let inputText = T.pack input
-          -- Combine environment with new input
-          let fullProgram = T.unlines (environment state) <> inputText
-
-          -- Run compiler and execution
-          result <- liftIO $ compileSource opts (buildDir state) fullProgram True
-          case result of
-            Left err -> do
-              outputStrLn $ "Error: " ++ err
-              -- Continue the REPL loop with updated history
-              replLoop opts $ state { history = inputText : history state }
-
-            Right exePath -> do
-              -- Run the compiled program
-              exitCode <- liftIO $ runProgramWithErrorHandling exePath
-              when (exitCode /= ExitSuccess) $
-                liftIO $ hPutStrLn stderr "Execution failed!"
-
-              -- Continue the REPL loop with updated state
-              let newState = updateState inputText state
-              replLoop opts $ newState { history = inputText : history newState }
 
 --------------------------------------------------------------------------------
 -- Main Function
@@ -427,30 +465,47 @@ main :: IO ()
 main = do
   opts <- execParser optsInfo
 
+  -- Configure output based on debug flag
+  let debugMode = debug opts
+      -- Optional debug message for when running in debug mode
+      debugMsg = when debugMode $
+                   putStrLn "Debug mode enabled. Showing detailed compilation information."
+
   case cmd opts of
-    Repl -> runRepl opts
+    Repl -> do
+      debugMsg
+      runRepl opts
 
     Run -> case sourceFile opts of
       Nothing -> putStrLn "Error: Source file required for 'run' command" >> exitFailure
       Just srcFile -> do
+        debugMsg
         src <- TIO.readFile srcFile
         buildDir <- generateBuildDir
+
+        when debugMode $ putStrLn $ "Created build directory: " ++ buildDir
 
         result <- compileSource opts buildDir src False
         case result of
           Left err -> putStrLn ("Compilation failed: " ++ err) >> exitFailure
           Right exePath -> do
+            when debugMode $ putStrLn $ "Running compiled program: " ++ exePath
             -- Run the compiled program
             callProcess exePath []
 
             -- Cleanup
-            unless (keepTmpdir opts) $ removeDirectoryRecursive buildDir
+            unless (keepTmpdir opts) $ do
+              when debugMode $ putStrLn $ "Cleaning up build directory: " ++ buildDir
+              removeDirectoryRecursive buildDir
 
     Compile {output = out} -> case sourceFile opts of
       Nothing -> putStrLn "Error: Source file required for 'compile' command" >> exitFailure
       Just srcFile -> do
+        debugMsg
         src <- TIO.readFile srcFile
         buildDir <- generateBuildDir
+
+        when debugMode $ putStrLn $ "Created build directory: " ++ buildDir
 
         result <- compileSource opts buildDir src False
         case result of
@@ -461,4 +516,6 @@ main = do
             putStrLn $ "Compiled binary written to " ++ out
 
             -- Cleanup
-            unless (keepTmpdir opts) $ removeDirectoryRecursive buildDir
+            unless (keepTmpdir opts) $ do
+              when debugMode $ putStrLn $ "Cleaning up build directory: " ++ buildDir
+              removeDirectoryRecursive buildDir

@@ -10,14 +10,15 @@ module Zayin.AST
     freshName,
     toBoundExprM,
     logDebugM,
+    runFresh,
   )
 where
 
-import Control.Monad (foldM)
+import Control.Monad (foldM, when)
+import Control.Monad.Logger
 import Control.Monad.State
 import qualified Data.Map as Map
 import qualified Data.Text as T
-import qualified Debug.Trace as Debug
 import qualified Zayin.BoundExpr as BE
 import Zayin.Literals (Literal (..))
 
@@ -46,19 +47,28 @@ data ExprBody = ExprBody
 
 data Gen = Gen (Int -> Int)
 
-type Fresh a = State Gen a
+-- Update Fresh monad to include logging capabilities
+type Fresh a = LoggingT (StateT Gen IO) a
 
-logDebugM :: (Show a) => String -> a -> Fresh a
-logDebugM prefix x = do
-  Debug.traceM (prefix ++ ": " ++ show x)
+-- Run the Fresh monad computations with logging to stderr
+runFresh :: Fresh a -> Gen -> IO (a, Gen)
+runFresh action gen = runStateT (runStderrLoggingT action) gen
+
+-- Conditionally log debug messages with proper formatting
+logDebugM :: (Show a) => Bool -> String -> a -> Fresh a
+logDebugM debugMode prefix x = do
+  when debugMode $
+    logDebugN $ T.pack $ prefix ++ ": " ++ show x
   return x
 
 -- Explicit debug logging for each stage
-logStage :: String -> Fresh a -> Fresh a
-logStage stage action = do
-  Debug.traceM $ "=== Starting " ++ stage ++ " ==="
+logStage :: Bool -> String -> Fresh a -> Fresh a
+logStage debugMode stage action = do
+  when debugMode $
+    logDebugN $ T.pack $ "=== Starting " ++ stage ++ " ==="
   result <- action
-  Debug.traceM $ "=== Completed " ++ stage ++ " ==="
+  when debugMode $
+    logDebugN $ T.pack $ "=== Completed " ++ stage ++ " ==="
   return result
 
 freshName :: T.Text -> Fresh T.Text
@@ -68,73 +78,73 @@ freshName prefix = do
   put g2
   return $ prefix <> "$" <> T.pack (show (f 0))
 
-rewrite :: (Expr -> Fresh Expr) -> Expr -> Fresh Expr
-rewrite f expr = do
-  logDebugM "rewrite before" expr
+rewrite :: Bool -> (Expr -> Fresh Expr) -> Expr -> Fresh Expr
+rewrite debugMode f expr = do
+  logDebugM debugMode "rewrite before" expr
   processed <- case expr of
     EVar {} -> return expr
     ELit {} -> return expr
     EBuiltinIdent {} -> return expr
     EIf c t e -> do
-      logDebugM "rewriting if condition" c
-      c' <- rewrite f c
-      t' <- rewrite f t
-      e' <- rewrite f e
+      logDebugM debugMode "rewriting if condition" c
+      c' <- rewrite debugMode f c
+      t' <- rewrite debugMode f t
+      e' <- rewrite debugMode f e
       return $ EIf c' t' e'
     ESet n e -> do
-      logDebugM "rewriting set" (n, e)
-      e' <- rewrite f e
+      logDebugM debugMode "rewriting set" (n, e)
+      e' <- rewrite debugMode f e
       let result = ESet n e'
-      logDebugM "set after rewrite" result
+      logDebugM debugMode "set after rewrite" result
       return result
     ELet bs body -> do
-      logDebugM "rewriting let bindings" bs
+      logDebugM debugMode "rewriting let bindings" bs
       bs' <-
         mapM
           ( \(n, e) -> do
-              e' <- rewrite f e
+              e' <- rewrite debugMode f e
               return (n, e')
           )
           bs
-      body' <- rewriteBody f body
+      body' <- rewriteBody debugMode f body
       return $ ELet bs' body'
     ELam ps body -> do
-      logDebugM "rewriting lambda body" body
-      body' <- rewriteBody f body
+      logDebugM debugMode "rewriting lambda body" body
+      body' <- rewriteBody debugMode f body
       return $ ELam ps body'
     EApp fun args -> do
-      logDebugM "rewriting application" (fun, args)
-      fun' <- rewrite f fun
-      args' <- mapM (rewrite f) args
+      logDebugM debugMode "rewriting application" (fun, args)
+      fun' <- rewrite debugMode f fun
+      args' <- mapM (rewrite debugMode f) args
       return $ EApp fun' args'
   result <- f processed
-  logDebugM "rewrite after" result
+  logDebugM debugMode "rewrite after" result
   return result
 
-rewriteBody :: (Expr -> Fresh Expr) -> ExprBody -> Fresh ExprBody
-rewriteBody f (ExprBody exprs final) = do
-  logDebugM "rewriting body exprs" exprs
+rewriteBody :: Bool -> (Expr -> Fresh Expr) -> ExprBody -> Fresh ExprBody
+rewriteBody debugMode f (ExprBody exprs final) = do
+  logDebugM debugMode "rewriting body exprs" exprs
   exprs' <-
     mapM
       ( \case
           Def n e -> do
-            logDebugM "rewriting define" (n, e)
-            e' <- rewrite f e
+            logDebugM debugMode "rewriting define" (n, e)
+            e' <- rewrite debugMode f e
             return $ Def n e'
           Expr e -> do
-            logDebugM "rewriting body expr" e
-            e' <- rewrite f e
+            logDebugM debugMode "rewriting body expr" e
+            e' <- rewrite debugMode f e
             return $ Expr e'
       )
       exprs
-  final' <- rewrite f final
+  final' <- rewrite debugMode f final
   let result = ExprBody exprs' final'
-  logDebugM "rewriteBody result" result
+  logDebugM debugMode "rewriteBody result" result
   return result
 
-pullDefines :: ExprBody -> Fresh ExprBody
-pullDefines (ExprBody exprs final) = do
-  logDebugM "pullDefines input" exprs
+pullDefines :: Bool -> ExprBody -> Fresh ExprBody
+pullDefines debugMode (ExprBody exprs final) = do
+  logDebugM debugMode "pullDefines input" exprs
 
   -- Transform defines into sets and collect names
   let (defines, bodyExprs) =
@@ -143,75 +153,83 @@ pullDefines (ExprBody exprs final) = do
               case expr of
                 Def name e ->
                   let setExpr = Expr (ESet name e)
-                   in Debug.trace
-                        ("converting define to set: " ++ show (name, e, setExpr))
-                        (name : defs, setExpr : body)
+                   in (name : defs, setExpr : body)
                 other -> (defs, other : body)
           )
           ([], [])
           exprs
 
-  logDebugM "Defines found" defines
-  logDebugM "Body with sets" bodyExprs
+  -- Log the defines we found (moved outside of foldr)
+  when debugMode $
+    mapM_ (\def -> logDebugN $ T.pack $ "converted define to set: " ++ show def) defines
+
+  logDebugM debugMode "Defines found" defines
+  logDebugM debugMode "Body with sets" bodyExprs
 
   -- Create let bindings and wrap body
   let letBindings = [(name, ELit LNil) | name <- defines]
   let bodyWithSets = ExprBody bodyExprs final
   let result = ExprBody [] (ELet letBindings bodyWithSets)
 
-  logDebugM "pullDefines result" result
+  logDebugM debugMode "pullDefines result" result
   return result
 
-liftDefines :: Expr -> Fresh Expr
-liftDefines expr = do
-  Debug.traceM "=== Starting liftDefines ==="
+liftDefines :: Bool -> Expr -> Fresh Expr
+liftDefines debugMode expr = do
+  when debugMode $
+    logDebugN "=== Starting liftDefines ==="
   result <-
     rewrite
+      debugMode
       ( \case
           ELet bindings body -> do
-            logDebugM "lifting defines in let" body
-            body' <- pullDefines body
+            logDebugM debugMode "lifting defines in let" body
+            body' <- pullDefines debugMode body
             return $ ELet bindings body'
           ELam params body -> do
-            logDebugM "lifting defines in lambda" body
-            body' <- pullDefines body
+            logDebugM debugMode "lifting defines in lambda" body
+            body' <- pullDefines debugMode body
             return $ ELam params body'
           e -> return e
       )
       expr
-  Debug.traceM "=== Completed liftDefines ==="
+  when debugMode $
+    logDebugN "=== Completed liftDefines ==="
   return result
 
-removeLet :: Expr -> Fresh Expr
-removeLet expr = do
-  Debug.traceM "=== Starting removeLet ==="
+removeLet :: Bool -> Expr -> Fresh Expr
+removeLet debugMode expr = do
+  when debugMode $
+    logDebugN "=== Starting removeLet ==="
   result <-
     rewrite
+      debugMode
       ( \case
           ELet bindings body -> do
-            logDebugM "removing let" (bindings, body)
+            logDebugM debugMode "removing let" (bindings, body)
             let (names, exprs) = unzip bindings
             let result = EApp (ELam names body) exprs
-            logDebugM "let removal result" result
+            logDebugM debugMode "let removal result" result
             return result
           e -> return e
       )
       expr
-  Debug.traceM "=== Completed removeLet ==="
+  when debugMode $
+    logDebugN "=== Completed removeLet ==="
   return result
 
-toBoundExprM :: Expr -> Fresh BE.BExpr
-toBoundExprM expr = logStage "toBoundExprM" $ do
-  logDebugM "initial expr" expr
-  expr' <- liftDefines expr
-  logDebugM "after define lifting" expr'
-  expr'' <- removeLet expr'
-  logDebugM "after let removal" expr''
-  toBoundExprInner expr'' Map.empty
+toBoundExprM :: Bool -> Expr -> Fresh BE.BExpr
+toBoundExprM debugMode expr = logStage debugMode "toBoundExprM" $ do
+  logDebugM debugMode "initial expr" expr
+  expr' <- liftDefines debugMode expr
+  logDebugM debugMode "after define lifting" expr'
+  expr'' <- removeLet debugMode expr'
+  logDebugM debugMode "after let removal" expr''
+  toBoundExprInner debugMode expr'' Map.empty
 
-toBoundExprInner :: Expr -> Map.Map T.Text T.Text -> Fresh BE.BExpr
-toBoundExprInner expr env = do
-  logDebugM "toBoundExprInner" (expr, env)
+toBoundExprInner :: Bool -> Expr -> Map.Map T.Text T.Text -> Fresh BE.BExpr
+toBoundExprInner debugMode expr env = do
+  logDebugM debugMode "toBoundExprInner" (expr, env)
   case expr of
     EVar name -> do
       let boundName = Map.findWithDefault name name env
@@ -221,17 +239,17 @@ toBoundExprInner expr env = do
     EBuiltinIdent name ->
       return $ BE.BuiltinIdent name
     EIf cond t f -> do
-      c' <- toBoundExprInner cond env
-      t' <- toBoundExprInner t env
-      f' <- toBoundExprInner f env
+      c' <- toBoundExprInner debugMode cond env
+      t' <- toBoundExprInner debugMode t env
+      f' <- toBoundExprInner debugMode f env
       return $ BE.If c' t' f'
     ESet name val -> do
-      logDebugM "converting set" (name, val)
+      logDebugM debugMode "converting set" (name, val)
       -- Use the bound name from the environment if it exists, otherwise generate fresh
       let boundName = Map.findWithDefault name name env
-      val' <- toBoundExprInner val env
+      val' <- toBoundExprInner debugMode val env
       let result = BE.Set boundName val'
-      logDebugM "set conversion result" result
+      logDebugM debugMode "set conversion result" result
       return result
     ELam params body -> do
       -- First generate fresh names for all parameters
@@ -250,19 +268,19 @@ toBoundExprInner expr env = do
       result <- case (bodyExprs body, params) of
         ([], []) -> do
           unused <- freshName "_unused"
-          body' <- toBoundExprInner (finalExpr body) env
+          body' <- toBoundExprInner debugMode (finalExpr body) env
           return $ BE.Lam unused body'
         (exprs, _) -> do
-          let processExprs [] final = toBoundExprInner final paramEnv
+          let processExprs [] final = toBoundExprInner debugMode final paramEnv
               processExprs (Expr e : rest) final = do
                 unused <- freshName "_unused"
-                e' <- toBoundExprInner e paramEnv
+                e' <- toBoundExprInner debugMode e paramEnv
                 final' <- processExprs rest final
                 return $ BE.App (BE.Lam unused final') e'
               processExprs (Def n e : rest) final = do
                 -- Use the bound name from paramEnv if it exists
                 let boundName = Map.findWithDefault n n paramEnv
-                e' <- toBoundExprInner e paramEnv
+                e' <- toBoundExprInner debugMode e paramEnv
                 final' <- processExprs rest final
                 return $ BE.App (BE.Lam boundName final') e'
 
@@ -275,11 +293,11 @@ toBoundExprInner expr env = do
               freshParams
       return result
     EApp f [] -> do
-      f' <- toBoundExprInner f env
+      f' <- toBoundExprInner debugMode f env
       return $ BE.App f' (BE.Lit LNil)
     EApp f (a : as) -> do
-      f' <- toBoundExprInner f env
-      a' <- toBoundExprInner a env
-      foldM (\acc e -> BE.App acc <$> toBoundExprInner e env) (BE.App f' a') as
+      f' <- toBoundExprInner debugMode f env
+      a' <- toBoundExprInner debugMode a env
+      foldM (\acc e -> BE.App acc <$> toBoundExprInner debugMode e env) (BE.App f' a') as
     ELet _ _ ->
       error "Let expressions should have been removed"

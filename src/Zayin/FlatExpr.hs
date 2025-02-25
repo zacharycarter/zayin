@@ -3,12 +3,12 @@
 
 module Zayin.FlatExpr (FExpr (..), liftLambdas) where
 
+import Debug.Trace (trace)
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.Text as T
-import Debug.Trace (trace)
 import qualified Zayin.LiftedExpr as L
 import Zayin.Literals (Literal)
 
@@ -72,9 +72,14 @@ freeVarsLExpr lambdaMap expr = case expr of
       Just liftedLambda -> L.freeVars liftedLambda  -- use the field from the lifted lambda record
       Nothing -> Set.empty
 
-liftLambdasM :: FExpr -> LiftingContext -> (L.LExpr, LiftingContext)
-liftLambdasM expr ctx =
-  trace
+-- Use trace for debugging, which is safe in pure code
+debugTrace :: Bool -> String -> a -> a
+debugTrace False _ x = x
+debugTrace True msg x = trace msg x
+
+liftLambdasM :: Bool -> FExpr -> LiftingContext -> (L.LExpr, LiftingContext)
+liftLambdasM debugMode expr ctx =
+  debugTrace debugMode
     ( "\n=== Lambda Lifting: Processing expression ===\n"
         ++ "Expression: "
         ++ show expr
@@ -84,13 +89,13 @@ liftLambdasM expr ctx =
     )
     $ case expr of
       LamOne param body ->
-        let (body', ctx1) = liftLambdasM body ctx
+        let (body', ctx1) = liftLambdasM debugMode body ctx
             free = freeVarsLExpr (lambdas ctx1) body' -- Compute free vars AFTER lifting nested lambdas
             (id, ctx2) = getFreshId ctx1
             lambda = L.LiftedLambda id [param] free body'
             ctx3 = addLambda lambda ctx2
             result = (L.Lifted id, ctx3)
-         in trace
+         in debugTrace debugMode
               ( "\nLifting LamOne: param="
                   ++ show param
                   ++ "\n"
@@ -108,13 +113,13 @@ liftLambdasM expr ctx =
               )
               result
       LamTwo p1 p2 body ->
-        let (body', ctx1) = liftLambdasM body ctx
+        let (body', ctx1) = liftLambdasM debugMode body ctx
             free = freeVarsLExpr (lambdas ctx1) body' -- Compute free vars AFTER lifting nested lambdas
             (id, ctx2) = getFreshId ctx1
             lambda = L.LiftedLambda id [p1, p2] free body'
             ctx3 = addLambda lambda ctx2
             result = (L.Lifted id, ctx3)
-         in trace
+         in debugTrace debugMode
               ( "\nLifting LamTwo: params="
                   ++ show [p1, p2]
                   ++ "\n"
@@ -132,11 +137,11 @@ liftLambdasM expr ctx =
               )
               result
       If c t f ->
-        let (c', ctx1) = liftLambdasM c ctx
-            (t', ctx2) = liftLambdasM t ctx1
-            (f', ctx3) = liftLambdasM f ctx2
+        let (c', ctx1) = liftLambdasM debugMode c ctx
+            (t', ctx2) = liftLambdasM debugMode t ctx1
+            (f', ctx3) = liftLambdasM debugMode f ctx2
             result = (L.If c' t' f', ctx3)
-         in trace
+         in debugTrace debugMode
               ( "\nProcessing If expression\n"
                   ++ "Processed condition: "
                   ++ show c'
@@ -156,10 +161,10 @@ liftLambdasM expr ctx =
               )
               result
       SetThen v e1 e2 ->
-        let (e1', ctx1) = liftLambdasM e1 ctx
-            (e2', ctx2) = liftLambdasM e2 ctx1
+        let (e1', ctx1) = liftLambdasM debugMode e1 ctx
+            (e2', ctx2) = liftLambdasM debugMode e2 ctx1
             result = (L.SetThen v e1' e2', ctx2)
-         in trace
+         in debugTrace debugMode
               ( "\nProcessing SetThen: var="
                   ++ show v
                   ++ "\n"
@@ -179,9 +184,9 @@ liftLambdasM expr ctx =
               result
       CallOne f x -> case f of
         BuiltinIdent i ->
-          let (x', ctx1) = liftLambdasM x ctx
+          let (x', ctx1) = liftLambdasM debugMode x ctx
               result = (L.CallOne (L.BuiltinIdent i) x', ctx1)
-           in trace
+           in debugTrace debugMode
                 ( "\nProcessing CallOne (Builtin)\n"
                     ++ "Direct builtin: "
                     ++ show i
@@ -196,10 +201,10 @@ liftLambdasM expr ctx =
                 )
                 result
         _ ->
-          let (f', ctx1) = liftLambdasM f ctx
-              (x', ctx2) = liftLambdasM x ctx1
+          let (f', ctx1) = liftLambdasM debugMode f ctx
+              (x', ctx2) = liftLambdasM debugMode x ctx1
               result = (L.CallOne f' x', ctx2)
-           in trace
+           in debugTrace debugMode
                 ( "\nProcessing CallOne\n"
                     ++ "Processed function: "
                     ++ show f'
@@ -215,10 +220,10 @@ liftLambdasM expr ctx =
                 result
       CallTwo f x y -> case f of
         BuiltinIdent i ->
-          let (x', ctx1) = liftLambdasM x ctx
-              (y', ctx2) = liftLambdasM y ctx1
+          let (x', ctx1) = liftLambdasM debugMode x ctx
+              (y', ctx2) = liftLambdasM debugMode y ctx1
               result = (L.CallTwo (L.BuiltinIdent i) x' y', ctx2)
-           in trace
+           in debugTrace debugMode
                 ( "\nProcessing CallTwo (Builtin)\n"
                     ++ "Direct builtin: "
                     ++ show i
@@ -239,11 +244,11 @@ liftLambdasM expr ctx =
                 )
                 result
         _ ->
-          let (f', ctx1) = liftLambdasM f ctx
-              (x', ctx2) = liftLambdasM x ctx1
-              (y', ctx3) = liftLambdasM y ctx2
+          let (f', ctx1) = liftLambdasM debugMode f ctx
+              (x', ctx2) = liftLambdasM debugMode x ctx1
+              (y', ctx3) = liftLambdasM debugMode y ctx2
               result = (L.CallTwo f' x' y', ctx3)
-           in trace
+           in debugTrace debugMode
                 ( "\nProcessing CallTwo\n"
                     ++ "Processed function: "
                     ++ show f'
@@ -264,19 +269,19 @@ liftLambdasM expr ctx =
                 )
                 result
       Var v ->
-        trace
+        debugTrace debugMode
           ("\nProcessing Var: " ++ show v)
           (L.Var v, ctx)
       Lit l ->
-        trace
+        debugTrace debugMode
           ("\nProcessing Lit: " ++ show l)
           (L.Lit l, ctx)
       BuiltinIdent i ->
-        trace
+        debugTrace debugMode
           ("\nProcessing BuiltinIdent: " ++ show i)
           (L.BuiltinIdent i, ctx)
 
-liftLambdas :: FExpr -> (L.LExpr, HashMap Int L.LiftedLambda)
-liftLambdas expr =
-  let (lexpr, ctx) = liftLambdasM expr initialContext
+liftLambdas :: Bool -> FExpr -> (L.LExpr, HashMap Int L.LiftedLambda)
+liftLambdas debugMode expr =
+  let (lexpr, ctx) = liftLambdasM debugMode expr initialContext
    in (lexpr, lambdas ctx)

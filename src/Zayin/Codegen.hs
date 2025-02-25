@@ -21,7 +21,6 @@ import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import qualified Data.Text as T
-import Debug.Trace (traceShow)
 import Zayin.LiftedExpr
 import Zayin.Literals
 
@@ -81,13 +80,20 @@ data CodegenCtx = CodegenCtx
     ctxDecls :: [CDecl],
     ctxStmts :: [CStmt],
     ctxLambdas :: HashMap Int LiftedLambda,
-    ctxLambdaEnvs :: HashMap Int T.Text
+    ctxLambdaEnvs :: HashMap Int T.Text,
+    ctxDebugMode :: Bool -- Added debug flag to context
   }
 
-initialCtx :: HashMap Int LiftedLambda -> CodegenCtx
-initialCtx lambdas = CodegenCtx 0 [] [] [] lambdas HashMap.empty
+initialCtx :: Bool -> HashMap Int LiftedLambda -> CodegenCtx
+initialCtx debugMode lambdas = CodegenCtx 0 [] [] [] lambdas HashMap.empty debugMode
 
 type Codegen a = LoggingT (StateT CodegenCtx IO) a
+
+-- Logger helper that respects debug flag
+logDebugWhen :: T.Text -> Codegen ()
+logDebugWhen msg = do
+  debugMode <- gets ctxDebugMode
+  when debugMode $ logDebugN msg
 
 genVarId :: Codegen Int
 genVarId = do
@@ -124,24 +130,24 @@ nameForFreeVar name =
 
 withStmtScope :: Codegen a -> Codegen (a, [CStmt])
 withStmtScope action = do
-  logDebugN "=== withStmtScope ==="
+  logDebugWhen "=== withStmtScope ==="
   -- Save current statements
   oldStmts <- gets ctxStmts
-  logDebugN $ "oldStmts: " <> T.pack (show oldStmts)
+  logDebugWhen $ "oldStmts: " <> T.pack (show oldStmts)
   -- Clear statement buffer
   lift $ modify $ \ctx -> ctx {ctxStmts = []}
   clearedStmts <- gets ctxStmts
-  logDebugN $ "cleared ctx: " <> T.pack (show clearedStmts)
+  logDebugWhen $ "cleared ctx: " <> T.pack (show clearedStmts)
   -- Run the action
   result <- action
 
   -- Get the new statements
   newStmts <- gets ctxStmts
-  logDebugN $ "newStmts " <> T.pack (show newStmts)
+  logDebugWhen $ "newStmts " <> T.pack (show newStmts)
   -- Restore old statements
   lift $ modify $ \ctx -> ctx {ctxStmts = oldStmts}
   restoredStmts <- gets ctxStmts
-  logDebugN $ "restored ctx: " <> T.pack (show restoredStmts)
+  logDebugWhen $ "restored ctx: " <> T.pack (show restoredStmts)
   -- Return result and statements from this scope
   return (result, reverse newStmts)
 
@@ -154,7 +160,7 @@ envStruct lambda = do
       unionFree = Set.union (freeVars lambda) captured
       members = map (\v -> (nameForFreeVar v, objectType)) (Set.toList unionFree)
       filtered = filter (\(name, _) -> name /= "v_") members
-  logDebugN $
+  logDebugWhen $
     "envStruct for lambda "
       <> T.pack (show (lambdaId lambda))
       <> ": freeVars = "
@@ -207,7 +213,7 @@ makeEnvCode lambda parentEnv = do
 
 generateClosure :: LiftedLambda -> CExpr -> Codegen CExpr
 generateClosure lambda currentEnv = do
-  logDebugN $ "Generating closure for lambda: " <> T.pack (show $ lambdaId lambda)
+  logDebugWhen $ "Generating closure for lambda: " <> T.pack (show $ lambdaId lambda)
   (closureExpr, newStmts) <- withStmtScope $ do
     envExpr <- makeEnvCode lambda currentEnv
 
@@ -236,7 +242,8 @@ generateEnvCast lambda expr =
     (EPreUnOp "&" (EArrow expr "env"))
     (TPtr $ TStruct $ "env_" <> T.pack (show $ lambdaId lambda))
 
-filterEnvAssignments :: (MonadLogger m) => [CStmt] -> Set.Set T.Text -> m [CStmt]
+-- Updated filterEnvAssignments to check debug flag from context
+filterEnvAssignments :: [CStmt] -> Set.Set T.Text -> Codegen [CStmt]
 filterEnvAssignments stmts allowedSet =
   mapM filterStmt stmts
   where
@@ -244,8 +251,8 @@ filterEnvAssignments stmts allowedSet =
       SExpr (EBinOp "=" lhs rhs) ->
         case lhs of
           EArrow _ attr | not (attr `Set.member` allowedSet) -> do
-            logDebugN $ "=== filterEnvAssignments stmt: " <> T.pack (show stmt) <> " ==="
-            logDebugN $ "=== filterEnvAssignments allowedSet: " <> T.pack (show allowedSet) <> " ==="
+            logDebugWhen $ "=== filterEnvAssignments stmt: " <> T.pack (show stmt) <> " ==="
+            logDebugWhen $ "=== filterEnvAssignments allowedSet: " <> T.pack (show allowedSet) <> " ==="
             return $ SExpr (ELitInt 0)
           _ -> return stmt
       _ -> return stmt
@@ -263,12 +270,9 @@ mapExceptLastM f (x : xs@(_ : _)) = do
   ys <- mapExceptLastM f xs
   return (y : ys)
 
--- transform :: T.Text -> IO (T.Text, T.Text)
--- transform t = return (t, T.append t "_suffix")
-
 generateFunc :: LiftedLambda -> Codegen ()
 generateFunc lambda = do
-  logDebugN $ "=== generateFunc for lambda: " <> T.pack (show (lambdaId lambda)) <> " ==="
+  logDebugWhen $ "=== generateFunc for lambda: " <> T.pack (show (lambdaId lambda)) <> " ==="
   -- Compute the "captured" parameters (those not marked unused)
   paramNames <-
     mapM
@@ -290,7 +294,7 @@ generateFunc lambda = do
       allowedSet = Set.union (Set.union freeVarNames captured) (Set.fromList ["env"])
       envObjType = TPtr (TStruct "env_obj")
       allParams = paramNamesToTypes ++ [("env_in", envObjType)]
-  logDebugN $
+  logDebugWhen $
     "generateFunc for lambda "
       <> T.pack (show (lambdaId lambda))
       <> ": captured = "
@@ -418,10 +422,10 @@ builtinIdentCodegen ident = do
 
 doCodegen :: LExpr -> CExpr -> Codegen CExpr
 doCodegen expr currentEnv = do
-  logDebugN $ "doCodegen processing expression: " <> T.pack (show expr)
+  logDebugWhen $ "doCodegen processing expression: " <> T.pack (show expr)
   case expr of
     Var name -> do
-      logDebugN $ "Processing variable: " <> name
+      logDebugWhen $ "Processing variable: " <> name
       return $
         EArrow
           ( ECast
@@ -430,7 +434,7 @@ doCodegen expr currentEnv = do
           )
           "val"
     Lit lit -> do
-      logDebugN $ "Processing literal: " <> T.pack (show lit)
+      logDebugWhen $ "Processing literal: " <> T.pack (show lit)
       case lit of
         LString s -> do
           dest <- genVar
@@ -490,16 +494,16 @@ doCodegen expr currentEnv = do
       -- Process continuation
       doCodegen cont currentEnv
     Lifted id -> do
-      logDebugN $ "Processing Lifted: " <> T.pack (show id)
+      logDebugWhen $ "Processing Lifted: " <> T.pack (show id)
       ctx <- get
       case HashMap.lookup id (ctxLambdas ctx) of
         Just lambda -> generateClosure lambda currentEnv
         Nothing -> error $ "Unknown lambda id: " ++ show id
     If cond thenExpr elseExpr -> do
-      logDebugN $ "=== If ==="
-      logDebugN $ "  If cond:  " <> T.pack (show cond)
-      logDebugN $ "  If thenExpr:  " <> T.pack (show thenExpr)
-      logDebugN $ "  If elseExpr:  " <> T.pack (show elseExpr)
+      logDebugWhen $ "=== If ==="
+      logDebugWhen $ "  If cond:  " <> T.pack (show cond)
+      logDebugWhen $ "  If thenExpr:  " <> T.pack (show thenExpr)
+      logDebugWhen $ "  If elseExpr:  " <> T.pack (show elseExpr)
 
       condExpr <- doCodegen cond currentEnv
       thenFinal <- doCodegen thenExpr currentEnv
@@ -511,9 +515,9 @@ doCodegen expr currentEnv = do
               (SBlock [SExpr thenFinal])
               (SBlock [SExpr elseFinal])
 
-      logDebugN $ "  If condFinal:  " <> T.pack (show condExpr)
-      logDebugN $ "  If thenFinal:  " <> T.pack (show thenFinal)
-      logDebugN $ "  If elseFinal:  " <> T.pack (show elseFinal)
+      logDebugWhen $ "  If condFinal:  " <> T.pack (show condExpr)
+      logDebugWhen $ "  If thenFinal:  " <> T.pack (show thenFinal)
+      logDebugWhen $ "  If elseFinal:  " <> T.pack (show elseFinal)
 
       return $ ELitInt 0
     CallOne f arg -> do
@@ -521,40 +525,41 @@ doCodegen expr currentEnv = do
       argExpr <- doCodegen arg currentEnv
       return $ EMacroCall "call_closure_one" [fExpr, argExpr]
     CallTwo f arg1 arg2 -> do
-      logDebugN $ "=== CallTwo:  " <> T.pack (show f) <> " ==="
-      logDebugN $ "  CallTwo currentEnv:  " <> T.pack (show currentEnv)
-      logDebugN $ "  CallTwo arg1:  " <> T.pack (show arg1)
-      logDebugN $ "  CallTwo arg2:  " <> T.pack (show arg2)
+      logDebugWhen $ "=== CallTwo:  " <> T.pack (show f) <> " ==="
+      logDebugWhen $ "  CallTwo currentEnv:  " <> T.pack (show currentEnv)
+      logDebugWhen $ "  CallTwo arg1:  " <> T.pack (show arg1)
+      logDebugWhen $ "  CallTwo arg2:  " <> T.pack (show arg2)
       fExpr <- doCodegen f currentEnv
-      logDebugN $ "  CallTwo fExpr:  " <> T.pack (show fExpr)
+      logDebugWhen $ "  CallTwo fExpr:  " <> T.pack (show fExpr)
       arg1Expr <- doCodegen arg1 currentEnv
-      logDebugN $ "  CallTwo arg1Expr:  " <> T.pack (show arg1Expr)
+      logDebugWhen $ "  CallTwo arg1Expr:  " <> T.pack (show arg1Expr)
       arg2Expr <- doCodegen arg2 currentEnv
-      logDebugN $ "  CallTwo arg2Expr:  " <> T.pack (show arg2Expr)
+      logDebugWhen $ "  CallTwo arg2Expr:  " <> T.pack (show arg2Expr)
       return $ EMacroCall "call_closure_two" [fExpr, arg1Expr, arg2Expr]
 
-codegen :: LExpr -> HashMap Int LiftedLambda -> IO ([CStmt], [CDecl], [CDecl])
-codegen expr lambdas = do
-  let ctx = initialCtx lambdas
+-- Updated codegen to take debug flag
+codegen :: Bool -> LExpr -> HashMap Int LiftedLambda -> IO ([CStmt], [CDecl], [CDecl])
+codegen debugMode expr lambdas = do
+  let ctx = initialCtx debugMode lambdas
   (finalExpr, finalCtx) <-
     runStateT
       ( runStderrLoggingT $ do
-          logDebugN $ "Starting codegen with lambdas: " <> T.pack (show (HashMap.keys lambdas))
+          logDebugWhen $ "Starting codegen with lambdas: " <> T.pack (show (HashMap.keys lambdas))
           traverse_
             ( \l -> do
-                logDebugN $ "Processing lambda " <> T.pack (show (lambdaId l))
+                logDebugWhen $ "Processing lambda " <> T.pack (show (lambdaId l))
                 -- Do not union in any extra free–variables from the parent.
                 struct <- envStruct l
                 addProto struct
                 generateFunc l
             )
             (HashMap.elems lambdas)
-          logDebugN "Starting main doCodegen"
+          logDebugWhen "Starting main doCodegen"
           (expr', mainStmts) <- withStmtScope $ do
             result <- doCodegen expr (EVar "env")
             addStmt $ SExpr result
             return result
-          logDebugN $ "Completed main doCodegen with " <> T.pack (show (length mainStmts)) <> " statements"
+          logDebugWhen $ "Completed main doCodegen with " <> T.pack (show (length mainStmts)) <> " statements"
           traverse_ addStmt mainStmts
           return expr'
       )

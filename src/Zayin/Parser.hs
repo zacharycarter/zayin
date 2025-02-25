@@ -1,8 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Zayin.Parser (parseProgram) where
+module Zayin.Parser (parseProgram, parseWithDebug) where
 
+import Control.Monad (when)
 import Control.Monad.Logger (logDebugN, runStderrLoggingT, LoggingT)
 import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Reader (ReaderT, runReaderT, ask)
 import Data.Char (isSpace, isDigit, isAlpha, isAlphaNum)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -11,6 +13,19 @@ import qualified Data.Map as Map
 
 import Zayin.AST
 import Zayin.Literals (Literal(..))
+
+--------------------------------------------------------------------------------
+-- Debug Context
+--------------------------------------------------------------------------------
+
+-- Add a reader monad to track debug state
+type ParserM a = ReaderT Bool (LoggingT IO) a
+
+-- Debug log helper that only logs when debug mode is enabled
+debugLog :: Text -> ParserM ()
+debugLog msg = do
+  debugEnabled <- ask
+  when debugEnabled $ logDebugN msg
 
 --------------------------------------------------------------------------------
 -- Token Definitions and Lexer with Layout Insertion
@@ -28,19 +43,21 @@ data Token
   | TEOF
   deriving (Show, Eq)
 
-lexZayin :: Text -> IO [Token]
-lexZayin input = runStderrLoggingT $ do
-  logDebugN "Lexing input with layout processing"
-  let rawLines = T.lines input
-  toks <- lexLines rawLines [] 0
-  return (toks ++ [TEOF])
+lexZayin :: Bool -> Text -> IO [Token]
+lexZayin debugMode input = runStderrLoggingT $ runReaderT lexAction debugMode
   where
-    lexLines :: [Text] -> [Int] -> Int -> LoggingT IO [Token]
+    lexAction = do
+      debugLog "Lexing input with layout processing"
+      let rawLines = T.lines input
+      toks <- lexLines rawLines [] 0
+      return (toks ++ [TEOF])
+
+    lexLines :: [Text] -> [Int] -> Int -> ParserM [Token]
     lexLines [] indentStack _ = return (dedentAll indentStack)
     lexLines (l:ls) indentStack _ = do
       let currentIndent = T.length (T.takeWhile isSpace l)
           lineContent   = T.strip l
-      logDebugN $ "Lexing line: " <> l <> " (indent " <> T.pack (show currentIndent) <> ")"
+      debugLog $ "Lexing line: " <> l <> " (indent " <> T.pack (show currentIndent) <> ")"
       let (indentToks, newStack) = computeIndentTokens currentIndent indentStack
       toksLine <- lexLineTokens lineContent
       restToks <- lexLines ls newStack currentIndent
@@ -57,6 +74,7 @@ lexZayin input = runStderrLoggingT $ do
       | cur == s  = ([], stack)
       | cur < s   = let (deds, newStack) = popUntil cur stack
                     in (deds, newStack)
+
     popUntil :: Int -> [Int] -> ([Token], [Int])
     popUntil cur [] = ([], [])
     popUntil cur (s:ss)
@@ -64,10 +82,10 @@ lexZayin input = runStderrLoggingT $ do
       | cur < s   = let (d, ns) = popUntil cur ss in (TDedent : d, ns)
       | otherwise = ([], s:ss)
 
-    lexLineTokens :: Text -> LoggingT IO [Token]
+    lexLineTokens :: Text -> ParserM [Token]
     lexLineTokens txt = do
       let toks = tokenizeLine txt
-      logDebugN $ "Tokenizing line: " <> txt <> " -> " <> T.pack (show toks)
+      debugLog $ "Tokenizing line: " <> txt <> " -> " <> T.pack (show toks)
       return toks
 
 tokenizeLine :: Text -> [Token]
@@ -159,7 +177,7 @@ renameVarsInBodyExpr varMap bodyExpr = case bodyExpr of
 -- Parser Combinators using LoggingT IO (with layout skipping)
 --------------------------------------------------------------------------------
 
-newtype Parser a = Parser { runParser :: [Token] -> LoggingT IO (Either String (a, [Token])) }
+newtype Parser a = Parser { runParser :: [Token] -> ParserM (Either String (a, [Token])) }
 
 instance Functor Parser where
   fmap f p = Parser $ \ts -> do
@@ -200,13 +218,13 @@ consume pred = Parser $ \ts ->
   let ts' = dropWhile isLayout ts
   in case ts' of
        (t:rest) | pred t -> do
-           logDebugN $ "Consumed token: " <> T.pack (show t)
+           debugLog $ "Consumed token: " <> T.pack (show t)
            return (Right (t, rest))
        (t:_) -> do
-           logDebugN $ "Failed to consume token, found: " <> T.pack (show t)
+           debugLog $ "Failed to consume token, found: " <> T.pack (show t)
            return (Left $ "Unexpected token: " ++ show t)
        [] -> do
-           logDebugN "Failed to consume token, end of input"
+           debugLog "Failed to consume token, end of input"
            return (Left "Unexpected end of input")
   where
     isLayout t = case t of
@@ -221,7 +239,7 @@ tryConsume pred = Parser $ \ts ->
   let ts' = dropWhile isLayout ts
   in case ts' of
        (t:rest) | pred t -> do
-           logDebugN $ "Try consumed token: " <> T.pack (show t)
+           debugLog $ "Try consumed token: " <> T.pack (show t)
            return (Right (Just t, rest))
        _ -> return (Right (Nothing, ts))
   where
@@ -236,7 +254,7 @@ consumeLayout :: (Token -> Bool) -> Parser (Maybe Token)
 consumeLayout pred = Parser $ \ts ->
   case ts of
     (t:rest) | pred t -> do
-        logDebugN $ "Consumed layout token: " <> T.pack (show t)
+        debugLog $ "Consumed layout token: " <> T.pack (show t)
         return (Right (Just t, rest))
     _ -> return (Right (Nothing, ts))
 
@@ -322,7 +340,7 @@ parseIndentedExpr params = Parser $ \ts -> do
     (TIndent:rest) -> do
       case dropWhile isLayout rest of
         (TKeyword "if":_) -> do
-          logDebugN "Found indented if-expression for macro body"
+          debugLog "Found indented if-expression for macro body"
           -- First parse the expression normally
           result <- runParser parseIf rest
           case result of
@@ -332,7 +350,7 @@ parseIndentedExpr params = Parser $ \ts -> do
               let paramMap = Map.fromList (zip params (map (\i -> "$" <> T.pack (show i)) [1..length params]))
               -- Rename all variables in the expression according to the mapping
               let renamedExpr = renameVarsInExpr paramMap expr
-              logDebugN $ "Renamed variables in macro body: " <> T.pack (show renamedExpr)
+              debugLog $ "Renamed variables in macro body: " <> T.pack (show renamedExpr)
               return (Right (renamedExpr, remainingTokens))
         _ -> return (Left "Expected if-expression in macro body")
     _ -> return (Left "Expected indented block for macro body")
@@ -575,11 +593,17 @@ combineStmts :: [ExprBodyExpr] -> Expr
 combineStmts stmts =
   let (defs, exprs) = partitionDefs stmts
   in case exprs of
+       -- Handle the case where there are only function definitions (no expressions)
+       [] | not (null defs) -> let mainExpr = ELit LNil  -- Implicit nil result
+                               in EApp (ELam [] (ExprBody defs mainExpr)) []
+
+       -- If there are truly no statements at all, this is an error
        []  -> error "No final expression in program"
-       [e] -> EApp (ELam [] (ExprBody defs e)) []
+
+       -- Standard case: one or more expressions
+       [e] -> EApp (ELam [] (ExprBody defs e)) []  -- Single expression case
        _   -> let finalExpr = last exprs
                   preceding = init exprs
-
                   -- Generate proper sequence with exit continuations
                   chainedExprs = foldr1 makeSequenceWithExit preceding
                   finalSequence = makeSequenceWithExit chainedExprs finalExpr
@@ -602,20 +626,27 @@ dropLayout = filter (not . isLayout)
       TNewline -> True
       _        -> False
 
+-- Add a version that takes the debug flag
+parseWithDebug :: Bool -> Text -> IO (Either String Expr)
+parseWithDebug debugMode input = do
+  tokens <- lexZayin debugMode input
+  runStderrLoggingT $ runReaderT (parseAction tokens) debugMode
+  where
+    parseAction tokens = do
+      debugLog $ "Tokens after layout: " <> T.pack (show tokens)
+      res <- runParser parseProgramExprs tokens
+      case res of
+        Right (stmts, remaining) ->
+           if dropLayout remaining == [TEOF]
+              then do
+                let progAst = combineStmts stmts
+                debugLog $ "Parsing complete: " <> T.pack (show progAst)
+                return (Right progAst)
+              else do
+                debugLog $ "Unconsumed tokens: " <> T.pack (show remaining)
+                return (Left ("Parsing error: unconsumed tokens " ++ show remaining))
+        Left err -> return (Left err)
+
+-- Updated top-level API for backward compatibility
 parseProgram :: Text -> IO (Either String Expr)
-parseProgram input = do
-  toks <- lexZayin input
-  runStderrLoggingT $ do
-    logDebugN $ "Tokens after layout: " <> T.pack (show toks)
-    res <- runParser parseProgramExprs toks
-    case res of
-      Right (stmts, remaining) ->
-         if dropLayout remaining == [TEOF]
-            then do
-              let progAst = combineStmts stmts
-              logDebugN $ "Parsing complete: " <> T.pack (show progAst)
-              return (Right progAst)
-            else do
-              logDebugN $ "Unconsumed tokens: " <> T.pack (show remaining)
-              return (Left ("Parsing error: unconsumed tokens " ++ show remaining))
-      Left err -> return (Left err)
+parseProgram = parseWithDebug False
