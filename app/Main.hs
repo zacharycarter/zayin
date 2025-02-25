@@ -16,11 +16,13 @@ import Data.Semigroup ((<>))
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Options.Applicative
+import System.Console.ANSI
 import System.Console.Haskeline
 import System.Directory (copyFile, removeDirectoryRecursive, createDirectoryIfMissing)
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath ((</>))
-import System.IO (hPutStrLn, stderr)
+import System.IO (hPutStrLn, stderr, stdout)
 import System.IO.Temp (createTempDirectory)
 import System.Process (ProcessHandle, StdStream (..), callProcess, createProcess, cwd, proc, std_err, std_out, waitForProcess)
 
@@ -33,7 +35,7 @@ import qualified Zayin.CPS as CPS
 import Zayin.Codegen (codegen)
 import Zayin.FlatExpr (liftLambdas)
 import Zayin.FlatExpr.Pretty (renderFExpr)
-import Zayin.Interpreter (interpret, valueToString, Value(..))
+import Zayin.Interpreter (emptyEnv, interpretWithEnv, valueToString, Environment(..), Value(..))
 import Zayin.LiftedExpr.Pretty (renderLExpr, renderLiftedLambda)
 import Zayin.Literals
 import Zayin.Macros (expandMacros)
@@ -216,15 +218,23 @@ generateProgramSource src =
       T.unlines
         [ "int main(void) {",
           "    mi_version();",
-          "    struct closure_obj initial_closure = object_closure_one_new(main_lambda, NULL);",
-          "    struct thunk initial_thunk = {",
-          "        .closr = &initial_closure,",
-          "        .one = {NULL},",
-          "    };",
-          "",
-          "    struct thunk *thnk_heap = mi_malloc(sizeof(struct thunk));",
-          "    memcpy(thnk_heap, &initial_thunk, sizeof(struct thunk));",
-          "    zayin_start(thnk_heap);",
+          "    gc_thread_data *thd;",
+          "    long stack_size = global_stack_size = STACK_SIZE;",
+          "    long heap_size = global_heap_size = HEAP_SIZE;",
+          "    mclosure0(clos_exit,&zyn_exit);",
+          "    mclosure0(entry_pt,&c_entry_pt);",
+          "    gc_initialize();",
+          "    thd = mi_malloc(sizeof(gc_thread_data));",
+          "    gc_thread_data_init(thd, 0, (char *) &stack_size, stack_size);",
+          "    thd->gc_cont = &entry_pt;",
+          "    thd->gc_args[0] = &clos_halt;",
+          "    thd->gc_num_args = 1;",
+          "    thd->thread_id = pthread_self();",
+          "    gc_add_mutator(thd);",
+          "    Cyc_heap_init(heap_size);",
+          "    thd->thread_state = CYC_THREAD_STATE_RUNNABLE;"
+          "    zyn_start_trampoline(thd);",
+          "    return 0;"
           "}"
         ]
     ]
@@ -326,10 +336,71 @@ compileSource opts buildDir src isRepl = runCompilation $ do
 -- REPL Implementation
 --------------------------------------------------------------------------------
 
+-- Display the banner, adapting to terminal capabilities
+displayZayinBanner :: IO ()
+displayZayinBanner = do
+  -- Check if terminal supports colors and if colors are not disabled
+  noColor <- (elem "NOCOLOR" . map fst) <$> getEnvironment
+  supportsANSI <- hSupportsANSI stdout
+
+  if supportsANSI && not noColor
+    then displayColorBanner
+    else displaySimpleBanner
+
+-- Colored version
+displayColorBanner :: IO ()
+displayColorBanner = do
+  setSGR [SetColor Foreground Vivid Blue]
+  putStrLn zayinLogo
+  setSGR [SetColor Foreground Vivid White]
+  setSGR [Reset]
+  putStrLn ""
+
+-- Simple version without colors
+displaySimpleBanner :: IO ()
+displaySimpleBanner = do
+  putStrLn zayinLogo
+  putStrLn ""
+
+-- The scaled-down logo
+zayinLogo :: String
+zayinLogo = unlines
+  [ "                                                    "
+  , "                                                    "
+  , "                                                    "
+  , "                     .-.                            "
+  , "                   .-@@*.                           "
+  , "                   .#@@@@@@@@@@#+.                  "
+  , "                   :@@@@@@@@@@@@@@-.                "
+  , "                   .#@@@@@@@@@@@@@+.                "
+  , "                    .#@@@@@@@@@@@@+.                "
+  , "                       ...*@-:...                   "
+  , "                         -@%.                       "
+  , "                        .%@-                        "
+  , "                        :@@:                        "
+  , "                       .#@@-                        "
+  , "                       .@@@#.                       "
+  , "                       .@@@@.                       "
+  , "                       .@@@@=.                      "
+  , "                       .%@@@*.                      "
+  , "                        +@@@%:                      "
+  , "                        .@@@@-                      "
+  , "                        .@@@@-                      "
+  , "                        .%@@@-                      "
+  , "                        .%@@%:                      "
+  , "                        .@@@:                       "
+  , "                       .=+:                         "
+  , "                                                    "
+  , "                                                    "
+  , "                                                    "
+  ]
+
 data ReplState = ReplState
   { buildDir :: FilePath
   , history :: [T.Text]  -- Previous inputs
   , environment :: [T.Text]  -- Definitions (macros, functions) to persist
+  , interpreterEnv :: Environment
+  , lambdaMap :: LambdaMap
   }
 
 runRepl :: Options -> IO ()
@@ -345,8 +416,11 @@ runRepl opts = do
         { buildDir = dir
         , history = []
         , environment = []
+        , interpreterEnv = emptyEnv
+        , lambdaMap = emptyLambdaMap
         }
 
+  displayZayinBanner
   putStrLn "Zayin REPL v0.1"
   putStrLn "Type expressions to evaluate, :help for commands"
   when debugMode $ putStrLn "[Debug mode enabled]"
@@ -364,42 +438,35 @@ replLoop opts state = do
   let debugMode = debug opts
   minput <- getInputLine "zayin> "
   case minput of
-    Nothing -> return ()  -- EOF
-    Just ":q" -> return ()  -- Quit
-    Just ":quit" -> return ()  -- Quit
-    Just ":exit" -> return ()  -- Quit
-    Just ":help" -> do
-      outputStrLn "Commands:"
-      outputStrLn "  :q, :quit, :exit - Exit the REPL"
-      outputStrLn "  :help           - Show this help message"
-      outputStrLn "  :reset          - Reset environment (clear all definitions)"
-      outputStrLn "  :history        - Show input history"
-      outputStrLn "  :env            - Show current environment"
-      outputStrLn "  :debug          - Toggle debug mode"
-      replLoop opts state
+    -- Handle commands the same as before (no changes needed for :q, :help, etc.)
+
+    -- Update the :reset command to clear the environment
     Just ":reset" -> do
       outputStrLn "Environment reset."
-      replLoop opts state { environment = [] }
-    Just ":history" -> do
-      outputStrLn "Input history:"
-      forM_ (zip [1..] (reverse $ history state)) $ \(i, input) ->
-        outputStrLn $ show (i :: Int) ++ ": " ++ T.unpack input
-      replLoop opts state
+      replLoop opts state { environment = [], interpreterEnv = emptyEnv }
+
+    -- Update the :env command to show environment content
     Just ":env" -> do
       outputStrLn "Current environment:"
       forM_ (environment state) $ \def ->
         outputStrLn $ T.unpack def
       replLoop opts state
-    Just ":debug" -> do
-      let newOpts = opts { debug = not debugMode }
-      outputStrLn $ "Debug mode " ++ (if debug newOpts then "enabled" else "disabled")
-      replLoop newOpts state
+
+    -- Handle normal expressions
     Just input
       | T.null (T.strip (T.pack input)) -> replLoop opts state
       | otherwise -> do
           let inputText = T.pack input
 
-          -- Run through your existing pipeline until you get LExpr
+          -- Update history
+          let stateWithHistory = state { history = inputText : history state }
+
+          -- If it's a function/macro definition, also update the textual environment
+          let updatedState = if isMacroOrFunctionDef inputText
+                            then stateWithHistory { environment = environment stateWithHistory ++ [inputText] }
+                            else stateWithHistory
+
+          -- Run through the pipeline using existing approach
           result <- liftIO $ do
             parsedEither <- parseWithDebug debugMode inputText
             case parsedEither of
@@ -416,21 +483,40 @@ replLoop opts state = do
                     -- Lift lambdas
                     let (lexpr, lambdas) = liftLambdas debugMode fExpr
 
-                    -- Instead of generating C code, interpret!
-                    interpretResult <- interpret lexpr lambdas True
-                    case interpretResult of
-                      Left err -> return $ Left $ "Evaluation error: " ++ show err
-                      Right val -> return $ Right val
+                    -- Pass the current environment to interpret and get new environment back
+                    interpretWithEnv lexpr lambdas True (interpreterEnv updatedState) (interpreterEnv updatedState)
 
+        case result of
+          Left err -> do
+            outputStrLn err
+            replLoop opts updatedState  -- Keep the same state on error
+          Right (val, newEnv, newLambdaMap) -> do  -- Extract the lambda map too
+            -- Store both the updated environment and lambda map
+            let finalState = updatedState {
+                  interpreterEnv = newEnv,
+                  lambdaMap = newLambdaMap  -- Update lambda map
+                }
+
+            -- Only print the result if it's not VNoop
+            case val of
+              VNoop -> replLoop opts finalState
+              _ -> do
+                outputStrLn $ valueToString val
+                replLoop opts finalState
           case result of
             Left err -> do
               outputStrLn err
-              replLoop opts state
-            Right val -> case val of
-              VNoop -> replLoop opts state  -- Don't print anything for VNoop
-              _ -> do
-                outputStrLn $ valueToString val
-                replLoop opts state
+              replLoop opts updatedState  -- Keep the same environment on error
+            Right (val, newEnv) -> do
+              -- Store the updated environment
+              let finalState = updatedState { interpreterEnv = newEnv }
+
+              -- Only print the result if it's not VNoop
+              case val of
+                VNoop -> replLoop opts finalState
+                _ -> do
+                  outputStrLn $ valueToString val
+                  replLoop opts finalState
 
 -- Helper function to determine if input contains a definition
 updateState :: T.Text -> ReplState -> ReplState

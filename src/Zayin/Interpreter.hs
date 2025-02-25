@@ -2,25 +2,38 @@
 
 module Zayin.Interpreter
   ( interpret
+  , interpretWithEnv
   , Value(..)
   , Environment
   , emptyEnv
   , InterpreterError(..)
   , valueToString
+  , LambdaMap       -- Export this type
+  , emptyLambdaMap  -- Export an empty lambda map
   ) where
 
+import Control.Monad (when)
+import Control.Monad.Except
+import Control.Monad.State
+import Control.Monad.Reader
+import qualified Data.HashMap.Strict as HashMap
+import Data.List (isPrefixOf)
 import qualified Data.Map as Map
+import Data.Maybe (listToMaybe)
 import qualified Data.Text as T
 import qualified Data.Set as Set
-import qualified Data.HashMap.Strict as HashMap
-import Control.Monad.State
-import Control.Monad.Except
-import Control.Monad.Reader
 import System.Exit (exitWith, exitSuccess, ExitCode(..))
 
 import Zayin.AST
 import Zayin.Literals
 import Zayin.LiftedExpr
+
+-- Type alias for lambda maps
+type LambdaMap = HashMap.HashMap Int LiftedLambda
+
+-- Empty lambda map
+emptyLambdaMap :: LambdaMap
+emptyLambdaMap = HashMap.empty
 
 -- Runtime value representation
 data Value
@@ -56,7 +69,7 @@ data InterpreterError
 type Environment = Map.Map T.Text Value
 
 -- Interpreter monad with access to all lambda definitions
-type Interpreter a = ExceptT InterpreterError (ReaderT (HashMap.HashMap Int LiftedLambda) (StateT InterpreterState IO)) a
+type Interpreter a = ExceptT InterpreterError (ReaderT LambdaMap (StateT InterpreterState IO)) a
 
 -- Interpreter state
 data InterpreterState = InterpreterState
@@ -64,6 +77,7 @@ data InterpreterState = InterpreterState
   , currentEnv :: Environment
   , replMode :: Bool
   , lastValue :: Value
+  , debugMode :: Bool  -- Add debugging flag
   }
 
 -- Initial empty environment
@@ -71,13 +85,52 @@ emptyEnv :: Environment
 emptyEnv = Map.empty
 
 -- Initialize interpreter state
-initialState :: Bool -> InterpreterState
-initialState isRepl = InterpreterState
+initialState :: Bool -> Bool -> InterpreterState
+initialState isRepl isDebug = InterpreterState
   { globalEnv = builtinEnv
   , currentEnv = Map.empty
   , replMode = isRepl
   , lastValue = VNil
+  , debugMode = isDebug
   }
+
+-- Helper function to find mangled variables
+findMangledVariable :: T.Text -> Environment -> Maybe Value
+findMangledVariable name env =
+  -- First try exact match
+  case Map.lookup name env of
+    Just val -> Just val
+    Nothing ->
+      -- Then try with any numeric suffix
+      let prefix = name `T.append` "$"
+          candidates = filter (\k -> prefix `T.isPrefixOf` k) (Map.keys env)
+      in case candidates of
+          [] -> Nothing
+          (k:_) -> Map.lookup k env
+
+-- Logging function for debugging
+logDebug :: String -> Interpreter ()
+logDebug msg = do
+  st <- get
+  when (debugMode st) $ liftIO $ putStrLn $ "DEBUG: " ++ msg
+
+-- Environment logging helper
+logEnv :: String -> Environment -> Interpreter ()
+logEnv label env = do
+  st <- get
+  when (debugMode st) $ do
+    liftIO $ putStrLn $ "DEBUG: " ++ label ++ " keys: " ++ show (Map.keys env)
+    liftIO $ putStrLn $ "DEBUG: " ++ label ++ " values: " ++ show (map showValueType (Map.elems env))
+  where
+    showValueType :: Value -> String
+    showValueType (VInt _) = "Int"
+    showValueType (VString _) = "String"
+    showValueType (VBool _) = "Bool"
+    showValueType VNil = "Nil"
+    showValueType (VClosure _ id) = "Closure " ++ show id
+    showValueType (VBuiltinFunc name _) = "Builtin " ++ T.unpack name
+    showValueType (VCons _ _) = "Cons"
+    showValueType VNoop = "Noop"
 
 -- Builtin function registry
 builtinEnv :: Environment
@@ -110,87 +163,162 @@ builtinEnv = Map.fromList
 -- Execute a lifted expression
 evalExpr :: LExpr -> Environment -> Interpreter Value
 evalExpr expr env = case expr of
-  Var name ->
-    case Map.lookup name env of
-      Just val -> return val
-      Nothing -> throwError $ UnboundVariable name
+  Var name -> do
+    logDebug $ "Looking up variable: " ++ T.unpack name
+    logEnv "Local environment" env
+    st <- get
+    logEnv "Global environment" (globalEnv st)
 
-  Lit lit -> return $ case lit of
-    LInt n -> VInt n
-    LString s -> VString s
-    LBool b -> VBool b
-    LNil -> VNil
+    -- First check local environment with mangling-aware lookup
+    case findMangledVariable name env of
+      Just val -> do
+        logDebug $ "Found " ++ T.unpack name ++ " in local environment: " ++ show val
+        return val
+      Nothing -> do
+        -- Then check global environment with mangling-aware lookup
+        state <- get
+        case findMangledVariable name (globalEnv state) of
+          Just val -> do
+            logDebug $ "Found " ++ T.unpack name ++ " in global environment: " ++ show val
+            return val
+          Nothing -> do
+            logDebug $ "Variable not found: " ++ T.unpack name
+            throwError $ UnboundVariable name
 
-  BuiltinIdent name ->
+  Lit lit -> do
+    let val = case lit of
+          LInt n -> VInt n
+          LString s -> VString s
+          LBool b -> VBool b
+          LNil -> VNil
+    logDebug $ "Evaluating literal: " ++ show val
+    return val
+
+  BuiltinIdent name -> do
+    logDebug $ "Looking up builtin: " ++ T.unpack name
     case Map.lookup name builtinEnv of
-      Just val -> return val
-      Nothing -> throwError $ UnknownBuiltin name
+      Just val -> do
+        logDebug $ "Found builtin: " ++ T.unpack name
+        return val
+      Nothing -> do
+        logDebug $ "Unknown builtin: " ++ T.unpack name
+        throwError $ UnknownBuiltin name
 
   SetThen var valExpr contExpr -> do
+    logDebug $ "Setting variable: " ++ T.unpack var
     val <- evalExpr valExpr env
+    logDebug $ "Value of " ++ T.unpack var ++ ": " ++ show val
+
     let env' = Map.insert var val env
+    logDebug $ "Updated local environment with: " ++ T.unpack var
+
+    -- Also update the global environment
+    oldState <- get
+    logEnv "Global environment before update" (globalEnv oldState)
+
+    modify $ \s -> s { globalEnv = Map.insert var val (globalEnv s) }
+
+    newState <- get
+    logEnv "Global environment after update" (globalEnv newState)
+
     evalExpr contExpr env'
 
   If condExpr thenExpr elseExpr -> do
+    logDebug "Evaluating if condition"
     condVal <- evalExpr condExpr env
+    logDebug $ "Condition result: " ++ show condVal
     case condVal of
-      VBool False -> evalExpr elseExpr env
-      VNil -> evalExpr elseExpr env
-      _ -> evalExpr thenExpr env
+      VBool False -> do
+        logDebug "Taking else branch"
+        evalExpr elseExpr env
+      VNil -> do
+        logDebug "Taking else branch (condition was nil)"
+        evalExpr elseExpr env
+      _ -> do
+        logDebug "Taking then branch"
+        evalExpr thenExpr env
 
-  Lifted lambdaId ->
+  Lifted lambdaId -> do
+    logDebug $ "Creating closure with lambda id: " ++ show lambdaId
     -- Create a closure with current environment and lambda id
     return $ VClosure env lambdaId
 
   -- In CPS, CallOne means f(arg) where f already has its continuation
   CallOne funcExpr argExpr -> do
+    logDebug "Evaluating function in CallOne"
     funcVal <- evalExpr funcExpr env
+    logDebug $ "Function value: " ++ show funcVal
+    logDebug "Evaluating argument in CallOne"
     argVal <- evalExpr argExpr env
+    logDebug $ "Argument value: " ++ show argVal
 
     case funcVal of
       -- For builtins, we need special handling as they're not in CPS form
       VBuiltinFunc name impl -> do
+        logDebug $ "Calling builtin: " ++ T.unpack name
         -- For a unary function with implicit continuation (like exit)
         impl [argVal]
 
       -- For user-defined closures in CPS form
       VClosure closureEnv lambdaId -> do
+        logDebug $ "Calling closure with lambda id: " ++ show lambdaId
         lambdas <- ask
         case HashMap.lookup lambdaId lambdas of
-          Nothing -> throwError $ UnknownLambda lambdaId
+          Nothing -> do
+            logDebug $ "Unknown lambda: " ++ show lambdaId
+            throwError $ UnknownLambda lambdaId
           Just lambda -> do
             -- In CPS, the function already knows its continuation
             -- So we just call it with its argument
+            logDebug "Setting up call environment"
             let callEnv = setupCallEnv lambda closureEnv [argVal]
+            logDebug "Evaluating lambda body"
             evalExpr (body lambda) callEnv
 
-      other -> throwError $ ApplicationError $ "Cannot apply: " ++ valueToString other
+      other -> do
+        logDebug $ "Cannot apply: " ++ valueToString other
+        throwError $ ApplicationError $ "Cannot apply: " ++ valueToString other
 
   -- In CPS, CallTwo means f(arg, cont) - second arg is the continuation
   CallTwo funcExpr arg1Expr contExpr -> do
+    logDebug "Evaluating function in CallTwo"
     funcVal <- evalExpr funcExpr env
+    logDebug $ "Function value: " ++ show funcVal
+    logDebug "Evaluating arg1 in CallTwo"
     arg1Val <- evalExpr arg1Expr env
+    logDebug $ "Arg1 value: " ++ show arg1Val
+    logDebug "Evaluating continuation in CallTwo"
     contVal <- evalExpr contExpr env
+    logDebug $ "Continuation value: " ++ show contVal
 
     case funcVal of
       -- For builtins that take a continuation
       VBuiltinFunc name impl -> do
+        logDebug $ "Calling builtin with continuation: " ++ T.unpack name
         -- Execute the builtin
         result <- impl [arg1Val]
         -- Then invoke the continuation with the result
+        logDebug "Applying continuation to builtin result"
         applyContinuation contVal result
 
       -- For user-defined closures
       VClosure closureEnv lambdaId -> do
+        logDebug $ "Calling closure with lambda id: " ++ show lambdaId
         lambdas <- ask
         case HashMap.lookup lambdaId lambdas of
-          Nothing -> throwError $ UnknownLambda lambdaId
+          Nothing -> do
+            logDebug $ "Unknown lambda: " ++ show lambdaId
+            throwError $ UnknownLambda lambdaId
           Just lambda -> do
             -- The continuation is the second parameter in CPS form
+            logDebug "Setting up call environment with continuation"
             let callEnv = setupCallEnv lambda closureEnv [arg1Val, contVal]
+            logDebug "Evaluating lambda body"
             evalExpr (body lambda) callEnv
 
-      other -> throwError $ ApplicationError $ "Cannot apply: " ++ valueToString other
+      other -> do
+        logDebug $ "Cannot apply: " ++ valueToString other
+        throwError $ ApplicationError $ "Cannot apply: " ++ valueToString other
 
 -- Helper to set up the environment for a function call
 setupCallEnv :: LiftedLambda -> Environment -> [Value] -> Environment
@@ -218,17 +346,24 @@ applyContinuation :: Value -> Value -> Interpreter Value
 applyContinuation contVal argVal =
   case contVal of
     VClosure closureEnv lambdaId -> do
+      logDebug $ "Applying continuation with lambda id: " ++ show lambdaId
       lambdas <- ask
       case HashMap.lookup lambdaId lambdas of
-        Nothing -> throwError $ UnknownLambda lambdaId
+        Nothing -> do
+          logDebug $ "Unknown lambda for continuation: " ++ show lambdaId
+          throwError $ UnknownLambda lambdaId
         Just lambda -> do
+          logDebug "Setting up continuation environment"
           let callEnv = setupCallEnv lambda closureEnv [argVal]
+          logDebug "Evaluating continuation body"
           evalExpr (body lambda) callEnv
 
-    VBuiltinFunc _ impl ->
+    VBuiltinFunc name impl -> do
+      logDebug $ "Applying builtin continuation: " ++ T.unpack name
       impl [argVal]
 
-    other ->
+    other -> do
+      logDebug $ "Cannot use as continuation: " ++ valueToString other
       throwError $ ApplicationError $ "Cannot use as continuation: " ++ valueToString other
 
 
@@ -646,14 +781,55 @@ valueToString (VCons car cdr) = "(" ++ valueToString car ++ " . " ++ valueToStri
 valueToString VNoop = "<no output>"
 
 -- Main interpretation function
-interpret :: LExpr -> HashMap.HashMap Int LiftedLambda -> Bool -> IO (Either InterpreterError Value)
+interpret :: LExpr -> LambdaMap -> Bool -> IO (Either InterpreterError Value)
 interpret expr lambdaMap isRepl = do
+  liftIO $ putStrLn ("DEBUG: Starting interpret with replMode = " ++ show isRepl)
+
   (result, finalState) <- runStateT
                             (runReaderT
                               (runExceptT (evalExpr expr Map.empty))
                               lambdaMap)
-                            (initialState isRepl)
+                            (initialState isRepl False)
+
+  liftIO $ putStrLn ("DEBUG: interpret finished with result: " ++ either show show result)
+  liftIO $ putStrLn ("DEBUG: Final global env keys: " ++ show (Map.keys (globalEnv finalState)))
+
   -- Return either the error or the stored last value
   return $ case result of
     Left err -> Left err
     Right _ -> Right (lastValue finalState)  -- Return last value instead of result
+
+-- Updated to also return the lambda map
+interpretWithEnv :: LExpr -> LambdaMap -> Bool -> Environment -> IO (Either String (Value, Environment, LambdaMap))
+interpretWithEnv expr lambdaMap isRepl initialEnv = do
+  liftIO $ putStrLn ("DEBUG: Starting interpretWithEnv with replMode = " ++ show isRepl)
+  liftIO $ putStrLn ("DEBUG: Initial env keys: " ++ show (Map.keys initialEnv))
+  liftIO $ putStrLn ("DEBUG: Initial lambda map size: " ++ show (HashMap.size lambdaMap))
+
+  let initState = InterpreterState
+        { globalEnv = Map.union initialEnv builtinEnv  -- Use provided environment and merge with builtins
+        , currentEnv = Map.empty
+        , replMode = isRepl
+        , lastValue = VNil
+        , debugMode = True  -- Enable debug mode
+        }
+
+  liftIO $ putStrLn ("DEBUG: Initial global env keys after merging with builtins: " ++ show (Map.keys (globalEnv initState)))
+
+  (result, finalState) <- runStateT
+                            (runReaderT
+                              (runExceptT (evalExpr expr Map.empty))
+                              lambdaMap)
+                            initState
+
+  let resultMsg = case result of
+        Left err -> "Error: " ++ show err
+        Right _ -> "Success: " ++ valueToString (lastValue finalState)
+
+  liftIO $ putStrLn ("DEBUG: interpretWithEnv finished with result: " ++ resultMsg)
+  liftIO $ putStrLn ("DEBUG: Final global env keys: " ++ show (Map.keys (globalEnv finalState)))
+
+  -- Return the result value, updated environment, AND the lambda map
+  return $ case result of
+    Left err -> Left (show err)  -- Convert InterpreterError to String
+    Right _ -> Right (lastValue finalState, globalEnv finalState, lambdaMap)

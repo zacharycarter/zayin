@@ -1,7 +1,9 @@
 #include <assert.h>
-#include <mimalloc.h>
 #include <stdbool.h>
 #include <string.h>
+
+#include <mimalloc.h>
+#include <ck_array.h>
 
 #include "base.h"
 #include "common.h"
@@ -53,6 +55,8 @@ static struct gc_funcs gc_func_map[] = {
                                   .mark = gc_mark_noop,
                                   .free = gc_free_noop},
 };
+
+
 
 // This does nothing, the gc will call free() on the object if it was heap
 // allocated
@@ -491,7 +495,10 @@ void gc_major(struct gc_context *ctx, struct thunk *thnk) {
   gc_heap_maintain();
 }
 
-void gc_init(void) { gc_global_data.nodes = vector_gc_heap_nodes_new(100); }
+void gc_init(void)
+{
+  gc_global_data.nodes = vector_gc_heap_nodes_new(100);
+}
 
 // wrapped malloc that adds allocated stuff to the bookkeeper
 void *gc_malloc(size_t size) {
@@ -514,4 +521,346 @@ void gc_heap_maintain(void) {
   gc_global_data.nodes.length = last_i;
   if (last_i && (original_len / last_i) > 2)
     vector_gc_heap_nodes_shrink_to_fit(&gc_global_data.nodes);
+}
+
+// NEW Implementation
+
+typedef struct vpbuffer_t vpbuffer;
+struct vpbuffer_t {
+  void **buf;
+  int len;
+  int count;
+};
+
+vpbuffer *vp_create(void);
+void vp_add(vpbuffer * v, void *obj);
+
+/* Utility functions */
+void **vpbuffer_realloc(void **buf, int *len);
+void **vpbuffer_add(void **buf, int *len, int i, void *obj);
+void vpbuffer_free(void **buf);
+
+// Generic buffer functions
+void **vpbuffer_realloc(void **buf, int *len)
+{
+  return realloc(buf, (*len) * sizeof(void *));
+}
+
+void **vpbuffer_add(void **buf, int *len, int i, void *obj)
+{
+  if (i == *len) {
+    *len *= 2;
+    buf = vpbuffer_realloc(buf, len);
+  }
+  buf[i] = obj;
+  return buf;
+}
+
+void vpbuffer_free(void **buf)
+{
+  free(buf);
+}
+
+vpbuffer *vp_create(void)
+{
+  vpbuffer *v = malloc(sizeof(vpbuffer));
+  v->len = 128;
+  v->count = 0;
+  v->buf = NULL;
+  v->buf = vpbuffer_realloc(v->buf, &(v->len));
+  return v;
+}
+
+void vp_add(vpbuffer * v, void *obj)
+{
+  v->buf = vpbuffer_add(v->buf, &(v->len), v->count++, obj);
+}
+
+////////////////////
+// Global defines
+
+// 64-bit is 3, 32-bit is 2
+#define GC_BLOCK_BITS 5
+
+/* HEAP definitions, based off heap from Chibi scheme */
+#define gc_heap_first_block(h) ((object)(h->data + gc_heap_align(gc_free_chunk_size)))
+#define gc_heap_end(h) ((object)((char*)h->data + h->size))
+#define gc_heap_pad_size(s) (sizeof(struct gc_heap_t) + (s) + gc_heap_align(1))
+#define gc_free_chunk_size (sizeof(gc_free_list))
+
+#define gc_align(n, bits) (((n)+(1<<(bits))-1)&(((uintptr_t)-1)-((1<<(bits))-1)))
+
+// Align to 8 byte block size (EG: 8, 16, etc)
+#define gc_word_align(n) gc_align((n), 3)
+
+// Align on GC_BLOCK_BITS, currently block size of 32 bytes
+#define gc_heap_align(n) gc_align(n, GC_BLOCK_BITS)
+
+////////////////////
+// Global variables
+
+// Note: will need to use atomics and/or locking to access any
+// variables shared between threads
+static unsigned char gc_color_mark = 5; // Black, is swapped during GC
+static unsigned char gc_color_clear = 3;        // White, is swapped during GC
+static unsigned char gc_color_purple = 1;       // There are many "shades" of purple, this is the most recent one
+// unfortunately this had to be split up; const colors are located in types.h
+
+static int gc_status_col = STATUS_SYNC1;
+static int gc_stage = STAGE_RESTING;
+static int gc_threads_merged = 0;
+
+static void **mark_stack = NULL;
+static int mark_stack_len = 0;
+static int mark_stack_i = 0;
+
+// Data for the "main" thread which is guaranteed to always be there.
+static gc_thread_data *primordial_thread = NULL;
+
+static ck_array_t new_mutators;
+static ck_array_t zyn_mutators;
+static ck_array_t old_mutators;
+static pthread_mutex_t mutators_lock;
+
+static void zyn_free(void *p, size_t m, bool d)
+{
+  mi_free(p);
+  return;
+}
+
+static void *zyn_malloc(size_t b)
+{
+  return mi_malloc(b);
+}
+
+static void *zyn_realloc(void *r, size_t a, size_t b, bool d)
+{
+  return mi_realloc(r, b);
+}
+
+static struct ck_malloc zyn_allocator = {
+  .malloc = zyn_malloc,
+  .free = zyn_free,
+  .realloc = zyn_realloc
+};
+
+/** Mark buffers
+ *
+ * For these, we need a buffer than can grow as needed but that can also be
+ * used concurrently by both a mutator thread and a collector thread.
+ */
+
+static mark_buffer *mark_buffer_init(unsigned initial_size)
+{
+  mark_buffer *mb = malloc(sizeof(mark_buffer));
+  mb->buf = malloc(sizeof(void *) * initial_size);
+  mb->buf_len = initial_size;
+  mb->next = NULL;
+  return mb;
+}
+
+/////////////
+// Functions
+
+/**
+ * @brief Perform one-time initialization before mutators can be executed
+ */
+void gc_initialize(void)
+{
+  if (ck_array_init(&zyn_mutators, CK_ARRAY_MODE_SPMC, &zyn_allocator, 10) == 0) {
+    fprintf(stderr, "Unable to initialize mutator array\n");
+    exit(1);
+  }
+  if (ck_array_init(&new_mutators, CK_ARRAY_MODE_SPMC, &zyn_allocator, 10) == 0) {
+    fprintf(stderr, "Unable to initialize mutator array\n");
+    exit(1);
+  }
+  if (ck_array_init(&old_mutators, CK_ARRAY_MODE_SPMC, &zyn_allocator, 10) == 0) {
+    fprintf(stderr, "Unable to initialize mutator array\n");
+    exit(1);
+  }
+
+  // Initialize collector's mark stack
+  mark_stack_len = 128;
+  mark_stack = vpbuffer_realloc(mark_stack, &(mark_stack_len));
+
+  // Here is as good a place as any to do this...
+  if (pthread_mutex_init(&(mutators_lock), NULL) != 0) {
+    fprintf(stderr, "Unable to initialize mutators_lock mutex\n");
+    exit(1);
+  }
+}
+
+/**
+ * @brief  Add data for a new mutator that is starting to run.
+ * @param  thd  Thread data for the mutator
+ */
+void gc_add_mutator(gc_thread_data * thd)
+{
+  pthread_mutex_lock(&mutators_lock);
+  if (ck_array_put_unique(&zyn_mutators, (void *)thd) < 0) {
+    fprintf(stderr, "Unable to allocate memory for a new thread, exiting\n");
+    exit(1);
+  }
+  ck_array_commit(&zyn_mutators);
+  pthread_mutex_unlock(&mutators_lock);
+
+  // Main thread is always the first one added
+  if (primordial_thread == NULL) {
+    primordial_thread = thd;
+  } else {
+    // At this point the mutator is running, so remove it from the new list
+    pthread_mutex_lock(&mutators_lock);
+    ck_array_remove(&new_mutators, (void *)thd);
+    ck_array_commit(&new_mutators);
+    pthread_mutex_unlock(&mutators_lock);
+  }
+}
+
+/**
+ * @brief Create a new heap page.
+ *        The caller must hold the necessary locks.
+ * @param  heap_type  Define the size of objects that will be allocated on this heap
+ * @param  size       Requested size (unpadded) of the heap
+ * @param  thd        Calling mutator's thread data object
+ * @return Pointer to the newly allocated heap page, or NULL
+ *         if the allocation failed.
+ */
+gc_heap *gc_heap_create(int heap_type, size_t size, gc_thread_data * thd)
+{
+  gc_free_list *free, *next;
+  gc_heap *h;
+  size_t padded_size;
+  size = gc_heap_align(size);
+  padded_size = gc_heap_pad_size(size);
+  h = malloc(padded_size);
+  if (!h)
+    return NULL;
+  h->type = heap_type;
+  h->size = size;
+  h->ttl = 10;
+  h->next_free = h;
+  h->last_alloc_size = 0;
+  thd->cached_heap_total_sizes[heap_type] += size;
+  thd->cached_heap_free_sizes[heap_type] += size;
+  h->data = (char *)gc_heap_align(sizeof(h->data) + (uintptr_t) & (h->data));
+  h->next = NULL;
+  h->num_unswept_children = 0;
+  free = h->free_list = (gc_free_list *) h->data;
+  next = (gc_free_list *) (((char *)free) + gc_heap_align(gc_free_chunk_size));
+  free->size = 0;               // First one is just a dummy record
+  free->next = next;
+  next->size = size - gc_heap_align(gc_free_chunk_size);
+  next->next = NULL;
+#if GC_DEBUG_TRACE
+  fprintf(stderr, "DEBUG h->data addr: %p\n", &(h->data));
+  fprintf(stderr, "DEBUG h->data addr: %p\n", h->data);
+  fprintf(stderr, ("heap: %p-%p data: %p-%p size: %zu\n"),
+          h, ((char *)h) + gc_heap_pad_size(size), h->data, h->data + size,
+          size);
+  fprintf(stderr, ("first: %p end: %p\n"), (object) gc_heap_first_block(h),
+          (object) gc_heap_end(h));
+  fprintf(stderr, ("free1: %p-%p free2: %p-%p\n"), free,
+          ((char *)free) + free->size, next, ((char *)next) + next->size);
+#endif
+  if (heap_type <= LAST_FIXED_SIZE_HEAP_TYPE) {
+    h->block_size = (heap_type + 1) * 32;
+//
+    h->remaining = size - (size % h->block_size);
+    h->data_end = h->data + h->remaining;
+    h->free_list = NULL;        // No free lists with bump&pop
+// This is for starting with a free list, but we want bump&pop instead
+//    h->remaining = 0;
+//    h->data_end = NULL;
+//    gc_init_fixed_size_free_list(h);
+  } else {
+    h->block_size = 0;
+    h->remaining = 0;
+    h->data_end = NULL;
+  }
+  // Lazy sweeping
+  h->free_size = size;
+  h->is_full = 0;
+  h->is_unswept = 0;
+  return h;
+}
+
+void gc_thread_data_init(gc_thread_data * thd, int mut_num, char *stack_base,
+                         long stack_size)
+{
+  char stack_ref;
+  thd->stack_start = stack_base;
+#if STACK_GROWTH_IS_DOWNWARD
+  thd->stack_limit = stack_base - stack_size;
+#else
+  thd->stack_limit = stack_base + stack_size;
+#endif
+  if (stack_overflow(stack_base, &stack_ref)) {
+    fprintf(stderr,
+            "Error: Stack is growing in the wrong direction! Rebuild with STACK_GROWTH_IS_DOWNWARD changed to %d\n",
+            (1 - STACK_GROWTH_IS_DOWNWARD));
+    exit(1);
+  }
+  thd->stack_traces = mi_calloc(MAX_STACK_TRACES, sizeof(char *));
+  thd->stack_trace_idx = 0;
+  thd->stack_prev_frame = NULL;
+  thd->mutations = NULL;
+  thd->mutation_buflen = 128;
+  thd->mutation_count = 0;
+  thd->mutations = vpbuffer_realloc(thd->mutations, &(thd->mutation_buflen));
+  thd->globals_changed = 1;
+  thd->param_objs = NULL;
+  thd->exception_handler_stack = NULL;
+  thd->scm_thread_obj = NULL;
+  thd->thread_state = ZYN_THREAD_STATE_NEW;
+  //thd->mutator_num = mut_num;
+  thd->jmp_start = malloc(sizeof(jmp_buf));
+  thd->gc_args = malloc(sizeof(object) * NUM_GC_ARGS);
+  thd->gc_num_args = 0;
+  thd->moveBufLen = 0;
+  gc_thr_grow_move_buffer(thd);
+  thd->gc_alloc_color = ck_pr_load_8(&gc_color_clear);
+  thd->gc_trace_color = thd->gc_alloc_color;
+  thd->gc_done_tracing = 0;
+  thd->gc_status = ck_pr_load_int(&gc_status_col);
+  thd->pending_writes = 0;
+  thd->last_write = 0;
+  thd->last_read = 0;
+  thd->mark_buffer = mark_buffer_init(128);
+  if (pthread_mutex_init(&(thd->lock), NULL) != 0) {
+    fprintf(stderr, "Unable to initialize thread mutex\n");
+    exit(1);
+  }
+  thd->heap_num_huge_allocations = 0;
+  thd->num_minor_gcs = 0;
+  thd->cached_heap_free_sizes = mi_calloc(5, sizeof(uintptr_t));
+  thd->cached_heap_total_sizes = mi_calloc(5, sizeof(uintptr_t));
+  thd->heap = mi_calloc(1, sizeof(gc_heap_root));
+  thd->heap->heap = mi_calloc(1, sizeof(gc_heap *) * NUM_HEAP_TYPES);
+  thd->heap->heap[HEAP_HUGE] = gc_heap_create(HEAP_HUGE, 1024, thd);
+  for (int i = 0; i < HEAP_HUGE; i++) {
+    thd->heap->heap[i] = gc_heap_create(i, INITIAL_HEAP_SIZE, thd);
+  }
+}
+
+/**
+ * @brief Increase the size of the mutator's move buffer
+ * @param d Mutator's thread data object
+ */
+void gc_thr_grow_move_buffer(gc_thread_data * d)
+{
+  if (!d)
+    return;
+
+  if (d->moveBufLen == 0) {     // Special case
+    d->moveBufLen = 128;
+    d->moveBuf = NULL;
+  } else {
+    d->moveBufLen *= 2;
+  }
+
+  d->moveBuf = realloc(d->moveBuf, d->moveBufLen * sizeof(void *));
+#if GC_DEBUG_TRACE
+  fprintf(stderr, "grew moveBuffer, len = %d\n", d->moveBufLen);
+#endif
 }

@@ -20,6 +20,7 @@ extra-source-files:
 description:         Please see the README on GitHub at <https://github.com/githubuser/zayin#readme>
 
 dependencies:
+- ansi-terminal >= 1.1 && < 2
 - base >= 4.7 && < 5
 - hspec >= 2.11 && < 3
 - bytestring >= 0.12 && < 1

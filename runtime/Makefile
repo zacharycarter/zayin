@@ -46,6 +46,13 @@ endif
 
 MIMALLOC_INCLUDE = $(MIMALLOC_DIR)/include
 
+# ck (Concurrency Kit)
+CK_DIR = $(DEPS_ROOT)/ck
+CK_REPO = https://github.com/concurrencykit/ck.git
+CK_BUILD_DIR = $(CK_DIR)/out
+CK_STATIC_LIB = $(CK_BUILD_DIR)/lib/libck.a
+CK_INCLUDE = $(CK_BUILD_DIR)/include
+
 # SANITIZE variable controls the sanitizer mode
 SANITIZE ?=
 
@@ -64,6 +71,7 @@ SRCS = gc.c base.c builtin.c bit_array.c
 # Important: Only add include flag after mimalloc is built
 ALL_CFLAGS = $(CFLAGS) $(SAN_FLAGS)
 MIMALLOC_CFLAGS = -I$(MIMALLOC_INCLUDE)
+CK_CFLAGS = -I$(CK_INCLUDE)
 
 TESTS = test_queue
 
@@ -79,38 +87,66 @@ mimalloc: $(MIMALLOC_STATIC_LIB)
 $(MIMALLOC_STATIC_LIB):
 	$(call log,Setting up mimalloc (SANITIZE=$(SANITIZE)))
 	$(call log,Checking if mimalloc is already built...)
-	@if [ -f "$(MIMALLOC_STATIC_LIB)" ]; then \
-		$(call log,Mimalloc already built at $(MIMALLOC_STATIC_LIB) ✅); \
-	else \
-		$(call log,Mimalloc needs to be built); \
-		mkdir -p $(DEPS_ROOT); \
-		if [ ! -d "$(MIMALLOC_DIR)" ]; then \
-			$(call log,Cloning mimalloc to shared location...); \
-			git clone $(MIMALLOC_REPO) $(MIMALLOC_DIR); \
-		else \
-			$(call log,Mimalloc already cloned, proceeding with build); \
-		fi; \
-		$(call log,Creating build directory $(MIMALLOC_BUILD_DIR)); \
-		mkdir -p $(MIMALLOC_BUILD_DIR); \
-		$(call log,Configuring mimalloc with cmake...); \
+	$(if $(wildcard $(MIMALLOC_STATIC_LIB)),\
+		$(call log,Mimalloc already built at $(MIMALLOC_STATIC_LIB) ✅),\
+		$(call log,Mimalloc needs to be built);\
+		mkdir -p $(DEPS_ROOT);\
+		$(if $(wildcard $(MIMALLOC_DIR)),\
+			$(call log,Mimalloc already cloned, proceeding with build),\
+			$(call log,Cloning mimalloc to shared location...);\
+			git clone $(MIMALLOC_REPO) $(MIMALLOC_DIR));\
+		$(call log,Creating build directory $(MIMALLOC_BUILD_DIR));\
+		mkdir -p $(MIMALLOC_BUILD_DIR);\
+		$(call log,Configuring mimalloc with cmake...);\
 		cd $(MIMALLOC_BUILD_DIR) && \
 		cmake $(MIMALLOC_DIR) -DCMAKE_BUILD_TYPE=Release \
 			$(CMAKE_EXTRA_FLAGS) \
 			-DMI_BUILD_SHARED=OFF \
-			-DMI_BUILD_TESTS=OFF; \
-		$(call log,Building mimalloc...); \
-		cd $(MIMALLOC_BUILD_DIR) && $(MAKE); \
-		touch $(MIMALLOC_STATIC_LIB); \
-		$(call log,Mimalloc built successfully at $(MIMALLOC_STATIC_LIB) ✅); \
-	fi
+			-DMI_BUILD_TESTS=OFF;\
+		$(call log,Building mimalloc...);\
+		cd $(MIMALLOC_BUILD_DIR) && $(MAKE);\
+		touch $(MIMALLOC_STATIC_LIB);\
+		$(call log,Mimalloc built successfully at $(MIMALLOC_STATIC_LIB) ✅)\
+	)
+
+# =============================================================
+# ck build target - with shared caching
+# =============================================================
+.PHONY: ck
+
+ck: $(CK_STATIC_LIB)
+
+$(CK_STATIC_LIB):
+	$(call log,Setting up ck)
+	$(call log,Checking if ck is already built...)
+	$(if $(wildcard $(CK_STATIC_LIB)),\
+		$(call log,ck already built at $(CK_STATIC_LIB) ✅),\
+		$(call log,ck needs to be built);\
+		mkdir -p $(DEPS_ROOT);\
+		$(if $(wildcard $(CK_DIR)),\
+			$(call log,ck already cloned, proceeding with build),\
+			$(call log,Cloning ck to shared location...);\
+			git clone $(CK_REPO) $(CK_DIR));\
+		$(call log,Creating build directory $(CK_BUILD_DIR));\
+		mkdir -p $(CK_BUILD_DIR);\
+		$(call log,Configuring ck with autoconf...);\
+		cd $(CK_DIR) && \
+		./configure --prefix=$(CK_BUILD_DIR);\
+		$(call log,Building ck...);\
+		cd $(CK_DIR) && $(MAKE);\
+		$(call log,Installing ck...);\
+		$(MAKE) install;\
+		touch $(CK_STATIC_LIB);\
+		$(call log,ck built successfully at $(CK_STATIC_LIB) ✅)\
+	)
 
 # =============================================================
 # Object file rules - depend on mimalloc being built first
 # =============================================================
 
-%.o: %.c | mimalloc
+%.o: %.c | mimalloc ck
 	$(call log,Building $@)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) -c $< -o $@)
+	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $(CK_CFLAGS) -c $< -o $@)
 
 # =============================================================
 # Main executable
@@ -118,15 +154,15 @@ $(MIMALLOC_STATIC_LIB):
 
 compiled_result: compiled_result.c gc.o base.o builtin.o bit_array.o
 	$(call log,Building compiled_result)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $^ $(MIMALLOC_STATIC_LIB) -o $@)
+	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $(CK_CFLAGS) $^ $(MIMALLOC_STATIC_LIB) $(CK_STATIC_LIB) -o $@)
 
 # =============================================================
 # Test targets
 # =============================================================
 
-test_queue: test_queue.c | mimalloc
+test_queue: test_queue.c | mimalloc ck
 	$(call log,Building test_queue)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $< $(MIMALLOC_STATIC_LIB) -o $@)
+	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $(CK_CFLAGS) $< $(MIMALLOC_STATIC_LIB) $(CK_STATIC_LIB) -o $@)
 
 # Note that test_base.c is not found, so removing it from the test targets
 .PHONY: test
@@ -154,6 +190,7 @@ show-flags:
 	$(call log,CFLAGS: $(CFLAGS))
 	$(call log,ALL_CFLAGS: $(ALL_CFLAGS))
 	$(call log,MIMALLOC_CFLAGS: $(MIMALLOC_CFLAGS))
+	$(call log,CK_CFLAGS: $(CK_CFLAGS))
 	$(call log,SANITIZE: $(SANITIZE))
 	$(call log,SAN_FLAGS: $(SAN_FLAGS))
 	$(call log,DEPS_ROOT: $(DEPS_ROOT))
@@ -174,6 +211,10 @@ clean:
 
 clean-mimalloc:
 	$(call log,Cleaning mimalloc build directory)
+	-rm -rf $(MIMALLOC_BUILD_DIR)
+
+clean-ck:
+	$(call log,Cleaning ck build directory)
 	-rm -rf $(MIMALLOC_BUILD_DIR)
 
 clean-all: clean

@@ -1,6 +1,9 @@
 #ifndef SOMESCHEME_GC_H
 #define SOMESCHEME_GC_H
 
+#include <pthread.h>
+#include <setjmp.h>
+
 #include "base.h"
 #include "queue.h"
 #include "hash_table.h"
@@ -92,5 +95,8 @@ void gc_mark_obj(struct gc_context *, struct obj *);
 
 void gc_heap_maintain(void);
 void *gc_malloc(size_t);
+
+// NEW Implementation
+
 
 #endif // SOMESCHEME_GC_H

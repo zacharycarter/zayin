@@ -310,3 +310,31 @@ struct ht_obj object_ht_obj_new() {
 
   return (struct ht_obj){.base = object_base_new(OBJ_HT), .ht = ht};
 }
+
+// NEW Implementation
+
+/**
+ * @brief Perform one-time heap initializations for the program
+ * @param heap_size Unused
+ */
+void gc_init_heap(long heap_size)
+{
+  /* if (!ck_hs_init(&lib_table, */
+  /*                 CK_HS_MODE_OBJECT | CK_HS_MODE_SPMC, */
+  /*                 hs_hash, hs_compare, &my_allocator, 32, 43423)) { */
+  /*   fprintf(stderr, "Unable to initialize library table\n"); */
+  /*   exit(1); */
+  /* } */
+  /* if (!ck_hs_init(&symbol_table, */
+  /*                 CK_HS_MODE_OBJECT | CK_HS_MODE_SPMC, */
+  /*                 hs_hash, hs_compare, */
+  /*                 &my_allocator, symbol_table_initial_size, 43423)) { */
+  /*   fprintf(stderr, "Unable to initialize symbol table\n"); */
+  /*   exit(1); */
+  /* } */
+  /* if (pthread_mutex_init(&(symbol_table_lock), NULL) != 0) { */
+  /*   fprintf(stderr, "Unable to initialize symbol_table_lock mutex\n"); */
+  /*   exit(1); */
+  /* } */
+  /* //ht_test(); // JAE - DEBUGGING!! */
+}

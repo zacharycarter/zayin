@@ -164,4 +164,8 @@ DEFINE_TWO_ARG_FROM_BUILTIN(eq);
 
 _Bool obj_is_truthy(struct obj *);
 
+// NEW Implementation
+
+void zyn_exit(void *data, object clo, int argc, object * args);
+
 #endif // SOMESCHEME_BUILTIN_H
