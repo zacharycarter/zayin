@@ -291,11 +291,16 @@ peek = Parser $ \ts ->
 
 -- A top-level statement is a macro definition, function definition, or a plain expression.
 parseTopStmt :: Parser ExprBodyExpr
-parseTopStmt = parseMacroDef <|> parseFnDef <|> parseExprWithSemicolon
+parseTopStmt = parseMacroDef <|> parseFnDef <|> parseLetStmt <|> parseExprWithSemicolon
   where
     parseExprWithSemicolon = do
       e <- parseExprList  -- Use parseExprList to handle semicolon-separated expressions
       return (Expr e)
+
+    -- Parse a let binding as a top-level statement
+    parseLetStmt = do
+      letExpr <- parseLet
+      return (Expr letExpr)
 
 -- | Parse a macro definition of the form:
 --    macro name(param1, param2): <body>
@@ -387,6 +392,68 @@ parseArgs = (do
     return (case tok of TIdent a -> a; _ -> ""))
   return (arg:rest)) <|> return []
 
+-- | Parse a let binding of the form:
+--    let <name> = <expr> [, <name> = <expr>]* in <body>
+--    or
+--    let <name> = <expr>
+--    <body>
+parseLet :: Parser Expr
+parseLet = do
+  _ <- consume (== TIdent "let")
+
+  -- Parse the first binding
+  firstBinding <- parseBinding
+
+  -- Check for additional bindings separated by commas
+  moreBindings <- many (do
+    _ <- tryConsume (== TSymbol ",")
+    parseBinding)
+
+  let bindings = firstBinding : moreBindings
+
+  -- Check for 'in' keyword or colon
+  mIn <- tryConsume (== TIdent "in")
+  mColon <- tryConsume (== TSymbol ":")
+
+  case (mIn, mColon) of
+    -- If there's an 'in', parse a single expression as the body
+    (Just _, _) -> do
+      bodyExpr <- parseExpr
+      return (ELet bindings (ExprBody [] bodyExpr))
+
+    -- If there's a colon, parse a single expression as the body
+    (_, Just _) -> do
+      bodyExpr <- parseExpr
+      return (ELet bindings (ExprBody [] bodyExpr))
+
+    -- Otherwise, look for a newline and parse the body as subsequent statements
+    _ -> do
+      -- Skip newlines and check for indentation
+      _ <- consumeLayout (== TNewline)
+
+      -- Parse the body expression or expressions
+      bodyExprs <- parseMultipleTopStmts
+
+      -- Transform the body expressions into a proper body
+      case bodyExprs of
+        [] -> return (ELet bindings (ExprBody [] (ELit LNil)))
+        [Expr e] -> return (ELet bindings (ExprBody [] e))
+        _ ->
+          let (defs, exprs) = partitionDefs bodyExprs
+              finalExpr = if null exprs
+                          then ELit LNil
+                          else last exprs
+          in return (ELet bindings (ExprBody defs finalExpr))
+
+-- Helper to parse a single binding (name = expr)
+parseBinding :: Parser (T.Text, Expr)
+parseBinding = do
+  nameToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+  let name = case nameToken of TIdent n -> n; _ -> ""
+  _ <- consume (== TSymbol "=")
+  expr <- parseExpr
+  return (name, expr)
+
 -- | Parse a sequence of top-level statements.
 parseProgramExprs :: Parser [ExprBodyExpr]
 parseProgramExprs = do
@@ -448,6 +515,7 @@ parseExpr = do
   case nextTok of
     Just (TKeyword "if") -> parseIf
     Just (TIdent "unless") -> parseMacroUsage
+    Just (TIdent "let") -> parseLet
     _ -> parseAdd >>= parseExprWithCall
   where
     parseExprWithCall expr = (do

@@ -63,6 +63,21 @@ main = hspec $ do
         exitCode `shouldBe` ExitSuccess
         output `shouldSatisfy` (\out -> "5" `isInfixOf` out)
 
+    it "let binding" $ do
+      withSystemTempDirectory "zayin-test" $ \tmpDir -> do
+        let srcFile    = tmpDir </> "let.zyn"
+            binaryFile = tmpDir </> "a.out"
+            source     = "let x = 5\ndisplay x"
+        writeFile srcFile source
+        -- Invoke the compiler in compile mode, specifying the output binary.
+        compileWithOutput binaryFile srcFile
+        exists <- doesFileExist binaryFile
+        exists `shouldBe` True
+        -- Run the produced binary and capture its output.
+        (exitCode, output, _) <- readProcessWithExitCode binaryFile [] ""
+        exitCode `shouldBe` ExitSuccess
+        output `shouldSatisfy` (\out -> "5" `isInfixOf` out)
+
     it "conditional" $ do
       withSystemTempDirectory "zayin-test" $ \tmpDir -> do
         let srcFile    = tmpDir </> "if.zyn"
