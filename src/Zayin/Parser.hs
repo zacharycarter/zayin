@@ -6,6 +6,8 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Char (isSpace, isDigit, isAlpha, isAlphaNum)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Map (Map)
+import qualified Data.Map as Map
 
 import Zayin.AST
 import Zayin.Literals (Literal(..))
@@ -105,10 +107,53 @@ isPunctuation :: Char -> Bool
 isPunctuation c = c `elem` ("()+-*/=,:;" :: String)
 
 isKeyword :: Text -> Bool
-isKeyword w = w `elem` ["if", "then", "else", "fn", "where", "do", "true", "false", "nil"]
+isKeyword w = w `elem` ["if", "then", "else", "fn", "where", "do", "true", "false", "nil", "not"]
 
 isBuiltin :: Text -> Bool
-isBuiltin w = w `elem` ["display"]
+isBuiltin w = w `elem` ["display", "not"]
+
+--------------------------------------------------------------------------------
+-- Expression AST Transformation for Variable Renaming in Macros
+--------------------------------------------------------------------------------
+
+-- Rename variables in an expression based on a mapping
+renameVarsInExpr :: Map Text Text -> Expr -> Expr
+renameVarsInExpr varMap expr = case expr of
+  EVar name -> case Map.lookup name varMap of
+                 Just newName -> EVar newName
+                 Nothing -> EVar name
+  ELit lit -> ELit lit
+  EBuiltinIdent name -> EBuiltinIdent name
+  EIf cond thenE elseE ->
+    EIf (renameVarsInExpr varMap cond)
+        (renameVarsInExpr varMap thenE)
+        (renameVarsInExpr varMap elseE)
+  ESet name value ->
+    ESet name (renameVarsInExpr varMap value)
+  ELet bindings body ->
+    let renamedBindings = [(name, renameVarsInExpr varMap val) | (name, val) <- bindings]
+        renamedBody = renameVarsInExprBody varMap body
+    in ELet renamedBindings renamedBody
+  ELam params body ->
+    -- Don't rename variables shadowed by lambda parameters
+    let filteredMap = foldr Map.delete varMap params
+        renamedBody = renameVarsInExprBody filteredMap body
+    in ELam params renamedBody
+  EApp func args ->
+    EApp (renameVarsInExpr varMap func) (map (renameVarsInExpr varMap) args)
+
+-- Rename variables in an expression body
+renameVarsInExprBody :: Map Text Text -> ExprBody -> ExprBody
+renameVarsInExprBody varMap (ExprBody exprs finalExpr) =
+  let renamedExprs = map (renameVarsInBodyExpr varMap) exprs
+      renamedFinal = renameVarsInExpr varMap finalExpr
+  in ExprBody renamedExprs renamedFinal
+
+-- Rename variables in a body expression
+renameVarsInBodyExpr :: Map Text Text -> ExprBodyExpr -> ExprBodyExpr
+renameVarsInBodyExpr varMap bodyExpr = case bodyExpr of
+  Def name expr -> Def name (renameVarsInExpr varMap expr)
+  Expr expr -> Expr (renameVarsInExpr varMap expr)
 
 --------------------------------------------------------------------------------
 -- Parser Combinators using LoggingT IO (with layout skipping)
@@ -157,13 +202,49 @@ consume pred = Parser $ \ts ->
        (t:rest) | pred t -> do
            logDebugN $ "Consumed token: " <> T.pack (show t)
            return (Right (t, rest))
-       _ -> return (Left "Unexpected token")
+       (t:_) -> do
+           logDebugN $ "Failed to consume token, found: " <> T.pack (show t)
+           return (Left $ "Unexpected token: " ++ show t)
+       [] -> do
+           logDebugN "Failed to consume token, end of input"
+           return (Left "Unexpected end of input")
   where
     isLayout t = case t of
       TIndent  -> True
       TDedent  -> True
       TNewline -> True
       _        -> False
+
+-- Try to consume a token without failing if not found
+tryConsume :: (Token -> Bool) -> Parser (Maybe Token)
+tryConsume pred = Parser $ \ts ->
+  let ts' = dropWhile isLayout ts
+  in case ts' of
+       (t:rest) | pred t -> do
+           logDebugN $ "Try consumed token: " <> T.pack (show t)
+           return (Right (Just t, rest))
+       _ -> return (Right (Nothing, ts))
+  where
+    isLayout t = case t of
+      TIndent  -> True
+      TDedent  -> True
+      TNewline -> True
+      _        -> False
+
+-- Helper to explicitly consume a layout token
+consumeLayout :: (Token -> Bool) -> Parser (Maybe Token)
+consumeLayout pred = Parser $ \ts ->
+  case ts of
+    (t:rest) | pred t -> do
+        logDebugN $ "Consumed layout token: " <> T.pack (show t)
+        return (Right (Just t, rest))
+    _ -> return (Right (Nothing, ts))
+
+-- Helper to skip all empty lines and whitespace between statements
+skipEmptyLines :: Parser ()
+skipEmptyLines = Parser $ \ts ->
+  let ts' = dropWhile (\t -> t == TNewline || t == TIndent || t == TDedent) ts
+  in return (Right ((), ts'))
 
 -- Parse many occurrences.
 many :: Parser a -> Parser [a]
@@ -172,15 +253,95 @@ many p = (do
   xs <- many p
   return (x:xs)) <|> return []
 
+-- Look ahead at the next token without consuming it
+peek :: Parser (Maybe Token)
+peek = Parser $ \ts ->
+  let ts' = dropWhile isLayout ts
+  in case ts' of
+       (t:_) -> return (Right (Just t, ts))
+       []    -> return (Right (Nothing, ts))
+  where
+    isLayout t = case t of
+      TIndent  -> True
+      TDedent  -> True
+      TNewline -> True
+      _        -> False
+
 --------------------------------------------------------------------------------
 -- Top-Level Statement Parsers Producing ExprBodyExpr
 --------------------------------------------------------------------------------
 
--- A top-level statement is either a function definition or a plain expression.
+-- A top-level statement is a macro definition, function definition, or a plain expression.
 parseTopStmt :: Parser ExprBodyExpr
-parseTopStmt = parseFnDef <|> (do
-  e <- parseExpr
-  return (Expr e))
+parseTopStmt = parseMacroDef <|> parseFnDef <|> parseExprWithSemicolon
+  where
+    parseExprWithSemicolon = do
+      e <- parseExprList  -- Use parseExprList to handle semicolon-separated expressions
+      return (Expr e)
+
+-- | Parse a macro definition of the form:
+--    macro name(param1, param2): <body>
+parseMacroDef :: Parser ExprBodyExpr
+parseMacroDef = do
+  tok <- peek
+  case tok of
+    Just (TIdent "macro") -> do
+      _ <- consume (== TIdent "macro")
+      nameToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+      let macroName = case nameToken of TIdent n -> n; _ -> ""
+      _ <- consume (== TSymbol "(")
+      params <- parseArgs
+      _ <- consume (== TSymbol ")")
+      _ <- consume (== TSymbol ":")
+
+      -- Try to parse indented block for macro body - with parameter mapping
+      bodyExpr <- parseIndentedExpr params
+
+      -- Skip any trailing newlines
+      skipEmptyLines
+
+      -- Create the macro definition AST node
+      -- First define a lambda with the macro parameters
+      let macroParamNames = map (\i -> "$" <> T.pack (show i)) [1..length params]
+      let macroImpl = ELam macroParamNames (ExprBody [] bodyExpr)
+
+      -- Wrap in a lambda that takes the macro name
+      let macroLambda = ELam [macroName] (ExprBody [] macroImpl)
+
+      -- Return as a definition bound to "macro"
+      return (Def "macro" macroLambda)
+    _ -> Parser $ \_ -> return (Left "Not a macro definition")
+
+-- Parse an indented expression (used for macro body) with parameter renaming
+parseIndentedExpr :: [Text] -> Parser Expr
+parseIndentedExpr params = Parser $ \ts -> do
+  -- We need to look for an indented expression that starts with "if not"
+  -- Find the next line after the newline
+  let skipNewlines = dropWhile (== TNewline) ts
+  case skipNewlines of
+    (TIndent:rest) -> do
+      case dropWhile isLayout rest of
+        (TKeyword "if":_) -> do
+          logDebugN "Found indented if-expression for macro body"
+          -- First parse the expression normally
+          result <- runParser parseIf rest
+          case result of
+            Left err -> return (Left err)
+            Right (expr, remainingTokens) -> do
+              -- Create variable renaming map from parameters to $1, $2, etc.
+              let paramMap = Map.fromList (zip params (map (\i -> "$" <> T.pack (show i)) [1..length params]))
+              -- Rename all variables in the expression according to the mapping
+              let renamedExpr = renameVarsInExpr paramMap expr
+              logDebugN $ "Renamed variables in macro body: " <> T.pack (show renamedExpr)
+              return (Right (renamedExpr, remainingTokens))
+        _ -> return (Left "Expected if-expression in macro body")
+    _ -> return (Left "Expected indented block for macro body")
+  where
+    isLayout t = case t of
+      TIndent -> True
+      TDedent -> True
+      TNewline -> True
+      _ -> False
 
 -- | Parse a function definition of the form:
 --    fn <name>(<args>): <body>
@@ -210,45 +371,125 @@ parseArgs = (do
 
 -- | Parse a sequence of top-level statements.
 parseProgramExprs :: Parser [ExprBodyExpr]
-parseProgramExprs = many parseTopStmt
+parseProgramExprs = do
+  _ <- skipEmptyLines
+  result <- parseMultipleTopStmts
+  _ <- skipEmptyLines
+  return result
+
+-- Parse multiple top-level statements separated by empty lines
+parseMultipleTopStmts :: Parser [ExprBodyExpr]
+parseMultipleTopStmts = do
+  -- Try to parse a statement
+  mTok <- peek
+  case mTok of
+    Just TEOF -> return []  -- End of input
+    Just _ -> do
+      -- Parse one statement
+      stmt <- parseTopStmt
+      -- Skip any trailing newlines/empty lines
+      _ <- skipEmptyLines
+      -- Parse more statements
+      rest <- parseMultipleTopStmts
+      return (stmt : rest)
+    Nothing -> return []  -- No more tokens
 
 --------------------------------------------------------------------------------
 -- Expression Parsers Producing Our Actual AST
 --------------------------------------------------------------------------------
 
+-- Parse a lambda expression (anonymous function)
+parseLambda :: Parser Expr
+parseLambda = do
+  _ <- consume (== TSymbol "(")
+  _ <- consume (== TKeyword "fn")
+  _ <- consume (== TSymbol "(")
+  args <- parseArgs
+  _ <- consume (== TSymbol ")")
+  _ <- consume (== TSymbol ":")
+  body <- parseExpr
+  _ <- consume (== TSymbol ")")
+  return (ELam args (ExprBody [] body))
+
+-- Parse a macro usage expression (unless(condition): body)
+parseMacroUsage :: Parser Expr
+parseMacroUsage = do
+  macroName <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+  let name = case macroName of TIdent n -> n; _ -> ""
+  _ <- consume (== TSymbol "(")
+  arg1 <- parseExpr
+  _ <- consume (== TSymbol ")")
+  _ <- consume (== TSymbol ":")
+  arg2 <- parseExpr
+  return (EApp (EVar name) [arg1, arg2])
+
 -- Expressions include if-expressions, addition, function calls, and primaries.
 parseExpr :: Parser Expr
-parseExpr = parseIf <|> parseAdd
+parseExpr = do
+  nextTok <- peek
+  case nextTok of
+    Just (TKeyword "if") -> parseIf
+    Just (TIdent "unless") -> parseMacroUsage
+    _ -> parseAdd >>= parseExprWithCall
+  where
+    parseExprWithCall expr = (do
+      _ <- tryConsume (== TSymbol "(")
+      arg <- parseExpr
+      _ <- consume (== TSymbol ")")
+      let callExpr = EApp expr [arg]
+      -- Check for additional function applications
+      parseExprWithCall callExpr) <|> return expr
 
+-- Parse expressions separated by semicolons for top-level statements
 parseExprList :: Parser Expr
 parseExprList = do
-  exprs <- sepBy parseExpr (consume (== TSymbol ";"))
-  return $ case exprs of
-    [] -> ELit LNil
-    [x] -> x
-    xs -> foldr1 makeSequence xs
-  where
-    makeSequence e1 e2 =
-      -- Create a sequence by applying each expression to display
-      EApp (ELam ["_"] (ExprBody [] e2)) [e1]
+  -- Parse the first expression
+  first <- parseExpr
+
+  -- See if there's a semicolon followed by more expressions
+  semi <- tryConsume (== TSymbol ";")
+  case semi of
+    Just _ -> do
+      -- Parse the rest of the expressions
+      rest <- parseExprList
+      -- Return a sequence where expressions are evaluated in order
+      return $ EApp (ELam ["_"] (ExprBody [] rest)) [first]
+    Nothing -> return first
 
 -- Parse a list of expressions separated by semicolons
 parseIf :: Parser Expr
 parseIf = do
   _    <- consume (== TKeyword "if")
+
+  -- Support for 'not' operator within the condition
+  mNot <- tryConsume (== TKeyword "not")
   cond <- parseExpr
-  _    <- consume (== TSymbol ":")
-  thenE <- parseExprList
-  return (EIf cond thenE (ELit LNil))
+
+  -- Apply 'not' if present
+  let finalCond = case mNot of
+        Just _  -> EApp (EBuiltinIdent "not") [cond]
+        Nothing -> cond
+
+  _ <- consume (== TSymbol ":")
+  thenE <- parseExpr
+
+  -- Parse optional 'else' clause
+  mElse <- tryConsume (== TKeyword "else")
+  case mElse of
+    Just _  -> do
+      _ <- consume (== TSymbol ":")
+      elseE <- parseExpr
+      return (EIf finalCond thenE elseE)
+    Nothing -> return (EIf finalCond thenE (ELit LNil))
 
 -- Helper for parsing separated lists
 sepBy :: Parser a -> Parser b -> Parser [a]
-sepBy p sep = do
+sepBy p sep = (do
   first <- p
   rest <- many (do
     _ <- sep
     p)
-  return (first : rest)
+  return (first : rest)) <|> return []
 
 -- Parse left-associative addition.
 parseAdd :: Parser Expr
@@ -288,11 +529,13 @@ parseCall = do
 
 -- Parse a primary expression.
 parsePrimary :: Parser Expr
-parsePrimary = (do
-  _ <- consume (== TSymbol "(")
-  e <- parseExpr
-  _ <- consume (== TSymbol ")")
-  return e) <|> parseTermSimple
+parsePrimary = parseLambda <|> parseParens <|> parseTermSimple
+  where
+    parseParens = do
+      _ <- consume (== TSymbol "(")
+      e <- parseExpr
+      _ <- consume (== TSymbol ")")
+      return e
 
 -- Parse a simple term: identifier or number.
 parseTermSimple :: Parser Expr
@@ -335,19 +578,29 @@ combineStmts stmts =
        []  -> error "No final expression in program"
        [e] -> EApp (ELam [] (ExprBody defs e)) []
        _   -> let finalExpr = last exprs
-                  preceding   = init exprs
-              in EApp (ELam [] (ExprBody (defs ++ map Expr preceding) finalExpr)) []
+                  preceding = init exprs
+
+                  -- Generate proper sequence with exit continuations
+                  chainedExprs = foldr1 makeSequenceWithExit preceding
+                  finalSequence = makeSequenceWithExit chainedExprs finalExpr
+              in EApp (ELam [] (ExprBody defs finalSequence)) []
+  where
+    -- Chain expressions with continuations that don't depend on earlier results
+    makeSequenceWithExit e1 e2 =
+      EApp (ELam ["_"] (ExprBody [] e2)) [e1]
 
 --------------------------------------------------------------------------------
 -- Top-Level parseProgram Function
 --------------------------------------------------------------------------------
 
 dropLayout :: [Token] -> [Token]
-dropLayout = dropWhile (\t -> case t of
-                                TIndent  -> True
-                                TDedent  -> True
-                                TNewline -> True
-                                _        -> False)
+dropLayout = filter (not . isLayout)
+  where
+    isLayout t = case t of
+      TIndent  -> True
+      TDedent  -> True
+      TNewline -> True
+      _        -> False
 
 parseProgram :: Text -> IO (Either String Expr)
 parseProgram input = do

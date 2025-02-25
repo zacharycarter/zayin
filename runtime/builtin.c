@@ -99,8 +99,6 @@ void to_string_k(struct obj *v, struct obj *k, struct env_obj *env) {
 }
 
 void display_k(struct obj *v, struct obj *k, struct env_obj *env) {
-  printf("inside display!\n");
-
   char *res = obj_to_string_internal(v);
 
   printf("%s\n", res);
@@ -129,8 +127,8 @@ _Bool obj_is_truthy(struct obj *obj) {
 
 struct int_obj object_int_obj_not(struct obj *v) {
   // If you want to only allow certain types, do an explicit check:
-  if (v->tag != OBJ_INT && v->tag != OBJ_STR && v->tag) {
-    RUNTIME_ERROR("'not' expects an int, string; received tag %d", v->tag);
+  if (v->tag != OBJ_INT && v->tag != OBJ_STR && v->tag != OBJ_BOOL && v->tag) {
+    RUNTIME_ERROR("'not' expects an int, string, bool; received tag %d", v->tag);
   }
   _Bool result = !obj_is_truthy(v);
   return object_int_obj_new(result);

@@ -5,6 +5,9 @@ CFLAGS ?= -g -O1
 # Enable verbose output by default
 V ?= 1
 
+# Add parallelism to make, but disable for better error messages
+MAKEFLAGS += --no-print-directory
+
 # Logging functions (macOS compatible)
 ifeq ($(V),1)
   define log
@@ -22,8 +25,13 @@ else
   endef
 endif
 
-# Mimalloc paths (using relative paths)
-MIMALLOC_DIR = thirdparty/mimalloc
+# Common directory for shared dependencies across projects
+# Use absolute path for consistent access from any project folder
+DEPS_ROOT ?= $(HOME)/.cache/compiler_deps
+
+# Mimalloc paths (using shared location)
+MIMALLOC_DIR = $(DEPS_ROOT)/mimalloc
+MIMALLOC_REPO = https://github.com/microsoft/mimalloc.git
 
 # Set build directory and library name based on sanitizer mode
 ifeq ($(SANITIZE),asan)
@@ -33,7 +41,7 @@ ifeq ($(SANITIZE),asan)
 else
   MIMALLOC_BUILD_DIR = $(MIMALLOC_DIR)/out/release
   MIMALLOC_STATIC_LIB = $(MIMALLOC_BUILD_DIR)/libmimalloc.a
-  CMAKE_EXTRA_FLAGS = -DMI_OVERRIDE=OFF
+  CMAKE_EXTRA_FLAGS = -DMI_OVERRIDE=ON
 endif
 
 MIMALLOC_INCLUDE = $(MIMALLOC_DIR)/include
@@ -50,108 +58,124 @@ ifeq ($(SANITIZE),tsan)
   SAN_FLAGS = -fsanitize=thread
 endif
 
-# Combine all flags in the correct order
-ALL_CFLAGS = $(CFLAGS) -I$(MIMALLOC_INCLUDE) $(SAN_FLAGS)
+# Define source files
+SRCS = gc.c base.c builtin.c bit_array.c
 
-TESTS = test_queue test_base
+# Important: Only add include flag after mimalloc is built
+ALL_CFLAGS = $(CFLAGS) $(SAN_FLAGS)
+MIMALLOC_CFLAGS = -I$(MIMALLOC_INCLUDE)
+
+TESTS = test_queue
 
 default: compiled_result
 
-# Rule to clone and build mimalloc if needed
+# =============================================================
+# Mimalloc build target - with shared caching
+# =============================================================
+.PHONY: mimalloc
+
+mimalloc: $(MIMALLOC_STATIC_LIB)
+
 $(MIMALLOC_STATIC_LIB):
 	$(call log,Setting up mimalloc (SANITIZE=$(SANITIZE)))
-	$(call log,Checking if mimalloc needs to be cloned...)
-	@if [ ! -d "$(MIMALLOC_DIR)" ]; then \
-		$(call log,Cloning mimalloc...); \
-		mkdir -p thirdparty && \
-		git clone https://github.com/microsoft/mimalloc.git $(MIMALLOC_DIR); \
+	$(call log,Checking if mimalloc is already built...)
+	@if [ -f "$(MIMALLOC_STATIC_LIB)" ]; then \
+		$(call log,Mimalloc already built at $(MIMALLOC_STATIC_LIB) ✅); \
+	else \
+		$(call log,Mimalloc needs to be built); \
+		mkdir -p $(DEPS_ROOT); \
+		if [ ! -d "$(MIMALLOC_DIR)" ]; then \
+			$(call log,Cloning mimalloc to shared location...); \
+			git clone $(MIMALLOC_REPO) $(MIMALLOC_DIR); \
+		else \
+			$(call log,Mimalloc already cloned, proceeding with build); \
+		fi; \
+		$(call log,Creating build directory $(MIMALLOC_BUILD_DIR)); \
+		mkdir -p $(MIMALLOC_BUILD_DIR); \
+		$(call log,Configuring mimalloc with cmake...); \
+		cd $(MIMALLOC_BUILD_DIR) && \
+		cmake $(MIMALLOC_DIR) -DCMAKE_BUILD_TYPE=Release \
+			$(CMAKE_EXTRA_FLAGS) \
+			-DMI_BUILD_SHARED=OFF \
+			-DMI_BUILD_TESTS=OFF; \
+		$(call log,Building mimalloc...); \
+		cd $(MIMALLOC_BUILD_DIR) && $(MAKE); \
+		touch $(MIMALLOC_STATIC_LIB); \
+		$(call log,Mimalloc built successfully at $(MIMALLOC_STATIC_LIB) ✅); \
 	fi
-	$(call log,Creating build directory $(MIMALLOC_BUILD_DIR))
-	@mkdir -p $(MIMALLOC_BUILD_DIR)
-	$(call log,Configuring mimalloc with cmake...)
-	@cd $(MIMALLOC_BUILD_DIR) && \
-	cmake $(CURDIR)/$(MIMALLOC_DIR) -DCMAKE_BUILD_TYPE=Release \
-		$(CMAKE_EXTRA_FLAGS) \
-		-DMI_BUILD_SHARED=OFF \
-		-DMI_BUILD_TESTS=OFF
-	$(call log,Building mimalloc...)
-	@cd $(MIMALLOC_BUILD_DIR) && make
-	$(call log,Mimalloc built successfully ✅)
 
-# Updated compilation rules to include mimalloc
-# compiled_result: compiled_result.c gc.c base.c builtin.c bit_array.c scheduler.c thread_context.c $(MIMALLOC_STATIC_LIB)
-compiled_result: compiled_result.c gc.c base.c builtin.c bit_array.c $(MIMALLOC_STATIC_LIB)
+# =============================================================
+# Object file rules - depend on mimalloc being built first
+# =============================================================
+
+%.o: %.c | mimalloc
+	$(call log,Building $@)
+	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) -c $< -o $@)
+
+# =============================================================
+# Main executable
+# =============================================================
+
+compiled_result: compiled_result.c gc.o base.o builtin.o bit_array.o
 	$(call log,Building compiled_result)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) $^ -o $@)
+	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $^ $(MIMALLOC_STATIC_LIB) -o $@)
 
-base.o: base.c base.h gc.h queue.h vec.h common.h $(MIMALLOC_STATIC_LIB)
-	$(call log,Building base.o)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) -c base.c -o base.o)
+# =============================================================
+# Test targets
+# =============================================================
 
-gc.o: gc.c gc.h base.h hash_table.h vec.h queue.h $(MIMALLOC_STATIC_LIB)
-	$(call log,Building gc.o)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) -c gc.c -o gc.o)
-
-builtin.o: builtin.c builtin.h base.h $(MIMALLOC_STATIC_LIB)
-	$(call log,Building builtin.o)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) -c builtin.c -o builtin.o)
-
-bit_array.o: bit_array.c bit_array.h $(MIMALLOC_STATIC_LIB)
-	$(call log,Building bit_array.o)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) -c bit_array.c -o bit_array.o)
-
-test_queue: test_queue.c queue.h $(MIMALLOC_STATIC_LIB)
+test_queue: test_queue.c | mimalloc
 	$(call log,Building test_queue)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) test_queue.c $(MIMALLOC_STATIC_LIB) -o test_queue)
+	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $< $(MIMALLOC_STATIC_LIB) -o $@)
 
-test_base: test_base.c base.h base.o gc.o $(MIMALLOC_STATIC_LIB)
-	$(call log,Building test_base)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) test_base.c base.o gc.o $(MIMALLOC_STATIC_LIB) -o test_base)
-
-.PHONY: clean test clean-mimalloc clean-all build-asan show-flags
-
-# Add a convenience target to show flags
-show-flags:
-	$(call log,Compiler: $(CC))
-	$(call log,CFLAGS: $(CFLAGS))
-	$(call log,ALL_CFLAGS: $(ALL_CFLAGS))
-	$(call log,SANITIZE: $(SANITIZE))
-	$(call log,SAN_FLAGS: $(SAN_FLAGS))
-	$(call log,MIMALLOC_DIR: $(MIMALLOC_DIR))
-	$(call log,MIMALLOC_BUILD_DIR: $(MIMALLOC_BUILD_DIR))
-	$(call log,MIMALLOC_STATIC_LIB: $(MIMALLOC_STATIC_LIB))
-
-# Add a convenience target for ASAN builds
-build-asan:
-	$(call log,Starting ASAN build)
-	$(MAKE) clean-all
-	$(MAKE) SANITIZE=asan
-
+# Note that test_base.c is not found, so removing it from the test targets
+.PHONY: test
 test: $(TESTS)
 	$(call log,Running tests with ASAN_OPTIONS=verbosity=1)
 	@for t in $(TESTS); do \
 		$(call log,Running $$t); \
-		ASAN_OPTIONS=verbosity=1 ./$$t; \
+		ASAN_OPTIONS=verbosity=1 MallocNanoZone=0 ./$$t; \
 	done
 
+# Add a convenience target for ASAN builds
+.PHONY: build-asan
+build-asan:
+	$(call log,Starting ASAN build)
+	$(MAKE) clean
+	$(MAKE) SANITIZE=asan
+
+# =============================================================
+# Utility targets
+# =============================================================
+
+.PHONY: show-flags
+show-flags:
+	$(call log,Compiler: $(CC))
+	$(call log,CFLAGS: $(CFLAGS))
+	$(call log,ALL_CFLAGS: $(ALL_CFLAGS))
+	$(call log,MIMALLOC_CFLAGS: $(MIMALLOC_CFLAGS))
+	$(call log,SANITIZE: $(SANITIZE))
+	$(call log,SAN_FLAGS: $(SAN_FLAGS))
+	$(call log,DEPS_ROOT: $(DEPS_ROOT))
+	$(call log,MIMALLOC_DIR: $(MIMALLOC_DIR))
+	$(call log,MIMALLOC_BUILD_DIR: $(MIMALLOC_BUILD_DIR))
+	$(call log,MIMALLOC_STATIC_LIB: $(MIMALLOC_STATIC_LIB))
+
+# =============================================================
+# Clean targets
+# =============================================================
+
+.PHONY: clean clean-mimalloc clean-all
 clean:
-	$(call log,Cleaning build artifacts)
-	-rm -f base.o
-	-rm -f base
-	-rm -f gc.o
-	-rm -f builtin.o
-	-rm -f compiled_result.o
-	-rm -f bit_array.o
-	# -rm -f scheduler.o
-	# -rm -f thread_context.o
+	$(call log,Cleaning local build artifacts)
+	-rm -f *.o
 	-rm -f test_queue
-	-rm -f test_base
 	-rm -f compiled_result
 
 clean-mimalloc:
 	$(call log,Cleaning mimalloc build directory)
-	-rm -rf $(MIMALLOC_DIR)/out
+	-rm -rf $(MIMALLOC_BUILD_DIR)
 
-clean-all: clean clean-mimalloc
-	$(call log,Cleaning all artifacts including mimalloc repository)
-	-rm -rf $(MIMALLOC_DIR)
+clean-all: clean
+	$(call log,Cleaning all shared dependencies)
+	-rm -rf $(DEPS_ROOT)

@@ -31,7 +31,7 @@ compileWithOutput binaryFile srcFile = do
 main :: IO ()
 main = hspec $ do
   describe "Compiler End-to-End Tests" $ do
-    it "compiles and runs hello world" $ do
+    it "hello world" $ do
       withSystemTempDirectory "zayin-test" $ \tmpDir -> do
         let srcFile    = tmpDir </> "arith.zyn"
             binaryFile = tmpDir </> "a.out"
@@ -47,7 +47,7 @@ main = hspec $ do
         exitCode `shouldBe` ExitSuccess
         output `shouldSatisfy` (\out -> "Hello, World!" `isInfixOf` out)
        
-    it "compiles and runs an arithmetic program" $ do
+    it "addition" $ do
       withSystemTempDirectory "zayin-test" $ \tmpDir -> do
         let srcFile    = tmpDir </> "arith.zyn"
             binaryFile = tmpDir </> "a.out"
@@ -63,7 +63,7 @@ main = hspec $ do
         exitCode `shouldBe` ExitSuccess
         output `shouldSatisfy` (\out -> "5" `isInfixOf` out)
 
-    it "compiles and runs a conditional program" $ do
+    it "conditional" $ do
       withSystemTempDirectory "zayin-test" $ \tmpDir -> do
         let srcFile    = tmpDir </> "if.zyn"
             binaryFile = tmpDir </> "a.out"
@@ -79,7 +79,7 @@ main = hspec $ do
         exitCode `shouldBe` ExitSuccess
         output `shouldSatisfy` (\out -> "false" `isInfixOf` out)
 
-    it "compiles and runs a lambda function program" $ do
+    it "lambda" $ do
       withSystemTempDirectory "zayin-test" $ \tmpDir -> do
         let srcFile    = tmpDir </> "lambda.zyn"
             binaryFile = tmpDir </> "a.out"
@@ -93,7 +93,7 @@ main = hspec $ do
         exitCode `shouldBe` ExitSuccess
         output `shouldSatisfy` (\out -> "5" `isInfixOf` out)
 
-    it "compiles and runs a program with macro expansion" $ do
+    it "macro" $ do
       withSystemTempDirectory "zayin-test" $ \tmpDir -> do
         let srcFile    = tmpDir </> "macro.zyn"
             binaryFile = tmpDir </> "a.out"

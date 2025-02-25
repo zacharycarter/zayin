@@ -1,2 +1,11 @@
 .stack-work/
 *~
+
+# macOS
+.DS_Store
+
+# Output name used by test suite
+a.out
+
+# Temporary compilation directories
+zayin-*

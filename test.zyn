@@ -1,1 +1,4 @@
-if 0: display "bad"; display "good"
+macro unless(a, b):
+  if not a: b else: nil
+
+unless(false): display("macro works!")

@@ -3,8 +3,8 @@
 
 module Main where
 
-import Control.Exception (SomeException, catch)
-import Control.Monad (unless, when)
+import Control.Exception (SomeException, catch, finally)
+import Control.Monad (unless, when, void)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Logger (LoggingT, logDebugN, logErrorN, logInfoN, runStderrLoggingT)
 import Control.Monad.State
@@ -16,13 +16,15 @@ import Data.Semigroup ((<>))
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Options.Applicative
-import System.Directory (copyFile, removeDirectoryRecursive)
+import System.Console.Haskeline
+import System.Directory (copyFile, removeDirectoryRecursive, createDirectoryIfMissing)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath ((</>))
+import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (createTempDirectory)
 import System.Process (ProcessHandle, StdStream (..), callProcess, createProcess, cwd, proc, std_err, std_out, waitForProcess)
-import Text.Parsec (parse)
--- Import your own modules (make sure these are available in your project)
+
+-- Import your own modules
 import Zayin.AST
 import Zayin.AST.Pretty
 import Zayin.BoundExpr.Pretty
@@ -34,23 +36,22 @@ import Zayin.FlatExpr.Pretty (renderFExpr)
 import Zayin.LiftedExpr.Pretty (renderLExpr, renderLiftedLambda)
 import Zayin.Literals
 import Zayin.Macros (expandMacros)
-import Zayin.Parser (parseProgram) -- your top-level parser
+import Zayin.Parser (parseProgram)
 import Zayin.Transforms (toFExprM)
 
 --------------------------------------------------------------------------------
 -- Command-line Options
 --------------------------------------------------------------------------------
 
--- Your original command type remains (Run vs Compile with an output file)
-data Cmd = Run | Compile {output :: FilePath}
+data Cmd = Run | Compile {output :: FilePath} | Repl
   deriving (Show)
 
--- Extend Options to include a required positional argument for the source file.
 data Options = Options
   { cmd :: Cmd,
-    sourceFile :: FilePath, -- new: path to the .zai source file
+    sourceFile :: Maybe FilePath, -- optional for REPL mode
     debug :: Bool,
-    keepTmpdir :: Bool
+    keepTmpdir :: Bool,
+    sanitize :: Bool
   }
   deriving (Show)
 
@@ -77,27 +78,32 @@ cmdParser =
               )
               (progDesc "Compile the program")
           )
+        <> command
+          "repl"
+          ( info
+              (pure Repl)
+              (progDesc "Start interactive REPL")
+          )
     )
 
 optionsParser :: Parser Options
 optionsParser =
   Options
     <$> cmdParser
-    <*> argument
-      str
-      ( metavar "SOURCE"
-          <> help "Input source file (.zai)"
-      )
+    <*> optional (argument
+                   str
+                   (metavar "SOURCE" <> help "Input source file (.zyn)"))
     <*> switch (long "debug" <> help "Enable debug output")
     <*> switch (long "keep-tmpdir" <> help "Keep temporary build directory")
+    <*> switch (long "sanitize" <> help "Build with ASAN sanitizer")
 
 optsInfo :: ParserInfo Options
 optsInfo =
   info
     (optionsParser <**> helper)
     ( fullDesc
-        <> progDesc "Compile or run the Zayin program"
-        <> header "zayin - A Zayin compiler"
+        <> progDesc "Compile, run, or start REPL for Zayin programs"
+        <> header "zayin - A Zayin compiler and REPL"
     )
 
 -- | Runtime files embedded at compile time
@@ -114,35 +120,51 @@ runtimeFiles =
     ("gc.c", $(makeRelativeToProject "runtime/gc.c" >>= embedFile)),
     ("hash_table.h", $(makeRelativeToProject "runtime/hash_table.h" >>= embedFile)),
     ("queue.h", $(makeRelativeToProject "runtime/queue.h" >>= embedFile)),
-    -- ("queue_thunk.h", $(makeRelativeToProject "runtime/queue_thunk.h" >>= embedFile)),
-    -- ("scheduler.h", $(makeRelativeToProject "runtime/scheduler.h" >>= embedFile)),
-    -- ("scheduler.c", $(makeRelativeToProject "runtime/scheduler.c" >>= embedFile)),
-    -- ("thread_context.h", $(makeRelativeToProject "runtime/thread_context.h" >>= embedFile)),
-    -- ("thread_context.c", $(makeRelativeToProject "runtime/thread_context.c" >>= embedFile)),
     ("test_queue.c", $(makeRelativeToProject "runtime/test_queue.c" >>= embedFile)),
     ("vec.h", $(makeRelativeToProject "runtime/vec.h" >>= embedFile)),
     ("Makefile", $(makeRelativeToProject "runtime/Makefile" >>= embedFile))
   ]
+
+--------------------------------------------------------------------------------
+-- Compiler Pipeline
+--------------------------------------------------------------------------------
+
+-- Create a persistent build directory for the REPL
+createReplBuildDir :: IO FilePath
+createReplBuildDir = do
+  -- Create a build directory in the current directory
+  let buildDir = ".zayin_repl"
+  createDirectoryIfMissing True buildDir
+
+  -- Copy runtime files
+  forM_ runtimeFiles $ \(path, contents) -> do
+    let fullPath = buildDir </> path
+    BS.writeFile fullPath contents
+
+  return buildDir
 
 copyBinary :: FilePath -> FilePath -> IO ()
 copyBinary tmpDir outputPath =
   copyFile (tmpDir </> "compiled_result") outputPath `catch` handler
   where
     handler :: SomeException -> IO ()
-    handler _ = error "failed copying compiled binary"
+    handler e = error "failed copying compiled binary"
 
-invokeMake :: FilePath -> IO (Either String String)
-invokeMake tmpDir = do
+invokeMake :: FilePath -> Bool -> IO (Either String String)
+invokeMake tmpDir sanitize = do
   putStrLn $ "\n=== Executing make in: " ++ tmpDir ++ " ==="
+
+  let args = if sanitize then ["SANITIZE=asan"] else []
+
   (_, mout, merr, ph) <- createProcess
-    (proc "make" []) {
+    (proc "make" args) {
       cwd = Just tmpDir,
       std_out = CreatePipe,
       std_err = CreatePipe
     }
 
   -- Always log command execution
-  putStrLn "Executing: make SANITIZE=asan"
+  putStrLn $ "Executing: make " ++ unwords args
 
   exitCode <- waitForProcess ph
   stdout <- maybe (return "") TIO.hGetContents mout
@@ -201,8 +223,16 @@ generateProgramSource src =
         ]
     ]
 
+-- Make a REPL-specific wrapper to automatically display the last expression
+wrapForRepl :: T.Text -> T.Text
+wrapForRepl input =
+  -- If the input is a simple expression (not a macro, function, etc.), add 'display' to it
+  if T.all (\c -> c /= '\n') input && not (T.isPrefixOf "macro " $ T.strip input) && not (T.isPrefixOf "fn " $ T.strip input)
+    then "display(" <> input <> ")"
+    else input
+
 --------------------------------------------------------------------------------
--- Main Compilation/Execution Pipeline
+-- Compilation Function
 --------------------------------------------------------------------------------
 
 type CompilationM = LoggingT IO
@@ -210,65 +240,15 @@ type CompilationM = LoggingT IO
 runCompilation :: CompilationM a -> IO a
 runCompilation = runStderrLoggingT
 
-main :: IO ()
-main = runCompilation $ do
-  opts <- liftIO $ execParser optsInfo
-  logInfoN "Starting compilation process..."
+compileSource :: Options -> FilePath -> T.Text -> Bool -> IO (Either String FilePath)
+compileSource opts buildDir src isRepl = runCompilation $ do
+  -- Possibly transform the source for REPL
+  let finalSrc = if isRepl then wrapForRepl src else src
 
-  -- Read source file
-  src <- liftIO $ TIO.readFile (sourceFile opts)
-  logInfoN $ "\nSource being compiled:\n" <> src
+  logInfoN $ "\nSource being compiled:\n" <> finalSrc
 
-  -- Hardcoded AST (uncomment to test compilation without parsing involved)
-  -- let
-  --   parsedAST =
-        -- EApp
-        --   (ELam [] (ExprBody
-        --     { bodyExprs = []
-        --     , finalExpr = EApp (EBuiltinIdent "display") [EApp (EBuiltinIdent "+") [ELit (LInt 1), ELit(LInt 1)]]
-        --     }))
-        --   []
-
-  -- let
-  --   wrappedExpr =
-  --     EApp
-  --       (ELam [] (ExprBody
-  --         { bodyExprs = [ Def "addOne" (ELam ["x"] (ExprBody [] (EApp (EBuiltinIdent "+") [EVar "x", ELit (LInt 1)]))) ]
-  --         , finalExpr = EApp (EVar "addOne") [ELit (LInt 1)]
-  --         }))
-  --       []
-
-  -- Example AST with macro demonstration
-  -- let macroExample =
-  --       EApp
-  --         ( ELam
-  --             []
-  --             ( ExprBody
-  --                 { bodyExprs =
-  --                     [ -- Macro definition
-  --                       Def "macro" $
-  --                         ELam
-  --                           ["unless"]
-  --                           ( ExprBody [] $
-  --                               ELam
-  --                                 ["$1", "$2"]
-  --                                 ( ExprBody [] $
-  --                                     EIf
-  --                                       (EApp (EBuiltinIdent "not") [EVar "$1"])
-  --                                       (EVar "$2")
-  --                                       (ELit LNil)
-  --                                 )
-  --                           )
-  --                     ],
-  --                   finalExpr = EApp (EVar "unless") [ELit (LInt 1), ELit (LInt 2)]
-  --                 }
-  --             )
-  --         )
-  --         [] -- Empty argument list for CPS wrapper
-  -- logInfoN "\nOriginal AST with macro:"
-  -- logDebugN $ T.pack (renderExpr macroExample)
-
-  parsedEither <- liftIO $ parseProgram src
+  -- Parse the source
+  parsedEither <- liftIO $ parseProgram finalSrc
   parsedAST <- case parsedEither of
     Right ast -> do
       logInfoN $ "\nParsed input program into AST:\n" <> T.pack (show ast)
@@ -311,39 +291,174 @@ main = runCompilation $ do
   traverse_ (\p -> logInfoN $ "\nProto: " <> T.pack (show p)) protos
   traverse_ (\d -> logInfoN $ "\nDecl: " <> T.pack (show d)) decls
 
-  -- Generate build directory
-  buildDir <- liftIO generateBuildDir
+  -- Generate C code
   let cCode = generateC rootStmts protos decls
       fullSource = generateProgramSource cCode
 
   logInfoN $ "\nGenerated C Code: " <> fullSource
 
-  -- Write and compile C code
+  -- Write C code
   liftIO $ insertSourceIntoBuildDir buildDir fullSource
-  makeResult <- liftIO $ invokeMake buildDir
+  makeResult <- liftIO $ invokeMake buildDir (sanitize opts)
 
   case makeResult of
     Left errMsg -> do
       logErrorN $ "\nFailed compiling generated C code: " <> T.pack errMsg
-      liftIO exitFailure
+      return $ Left $ "Compilation failed: " ++ errMsg
     Right stdoutStr -> do
       logInfoN "\nCompilation result:"
       when (debug opts) $ logDebugN (T.pack stdoutStr)
+      return $ Right $ buildDir </> "compiled_result"
 
-  -- Handle output
+--------------------------------------------------------------------------------
+-- REPL Implementation
+--------------------------------------------------------------------------------
+
+data ReplState = ReplState
+  { buildDir :: FilePath
+  , history :: [T.Text]  -- Previous inputs
+  , environment :: [T.Text]  -- Definitions (macros, functions) to persist
+  }
+
+runRepl :: Options -> IO ()
+runRepl opts = do
+  -- Create persistent build directory for the REPL
+  dir <- createReplBuildDir
+
+  -- Set up initial state
+  let initialState = ReplState
+        { buildDir = dir
+        , history = []
+        , environment = []
+        }
+
+  putStrLn "Zayin REPL v0.1"
+  putStrLn "Type expressions to evaluate, :help for commands"
+
+  -- Run REPL loop using Haskeline for history and editing
+  finally (runInputT defaultSettings (replLoop opts initialState)) $ do
+    -- Cleanup on exit
+    unless (keepTmpdir opts) $ removeDirectoryRecursive dir
+    putStrLn "Goodbye!"
+
+-- Helper function to determine if input contains a definition
+updateState :: T.Text -> ReplState -> ReplState
+updateState input state
+  | isMacroOrFunctionDef input = state { environment = environment state ++ [input] }
+  | otherwise = state
+
+-- Check if the input is a macro or function definition that should be preserved
+isMacroOrFunctionDef :: T.Text -> Bool
+isMacroOrFunctionDef input =
+  let stripped = T.stripStart input
+  in T.isPrefixOf "macro " stripped || T.isPrefixOf "fn " stripped
+
+-- Handle execution errors without using ScopedTypeVariables
+runProgramWithErrorHandling :: FilePath -> IO ExitCode
+runProgramWithErrorHandling exePath = do
+  result <- catch
+    (do
+      callProcess exePath []
+      return ExitSuccess)
+    (\e -> do
+       let _ = e :: SomeException  -- Type annotation in binding position is allowed
+       return (ExitFailure 1))
+  return result
+
+replLoop :: Options -> ReplState -> InputT IO ()
+replLoop opts state = do
+  minput <- getInputLine "zayin> "
+  case minput of
+    Nothing -> return ()  -- EOF
+    Just ":q" -> return ()  -- Quit
+    Just ":quit" -> return ()  -- Quit
+    Just ":exit" -> return ()  -- Quit
+    Just ":help" -> do
+      outputStrLn "Commands:"
+      outputStrLn "  :q, :quit, :exit - Exit the REPL"
+      outputStrLn "  :help           - Show this help message"
+      outputStrLn "  :reset          - Reset environment (clear all definitions)"
+      outputStrLn "  :history        - Show input history"
+      outputStrLn "  :env            - Show current environment"
+      replLoop opts state
+    Just ":reset" -> do
+      outputStrLn "Environment reset."
+      replLoop opts state { environment = [] }
+    Just ":history" -> do
+      outputStrLn "Input history:"
+      forM_ (zip [1..] (reverse $ history state)) $ \(i, input) ->
+        outputStrLn $ show (i :: Int) ++ ": " ++ T.unpack input
+      replLoop opts state
+    Just ":env" -> do
+      outputStrLn "Current environment:"
+      forM_ (environment state) $ \def ->
+        outputStrLn $ T.unpack def
+      replLoop opts state
+    Just input
+      | T.null (T.strip (T.pack input)) -> replLoop opts state
+      | otherwise -> do
+          let inputText = T.pack input
+          -- Combine environment with new input
+          let fullProgram = T.unlines (environment state) <> inputText
+
+          -- Run compiler and execution
+          result <- liftIO $ compileSource opts (buildDir state) fullProgram True
+          case result of
+            Left err -> do
+              outputStrLn $ "Error: " ++ err
+              -- Continue the REPL loop with updated history
+              replLoop opts $ state { history = inputText : history state }
+
+            Right exePath -> do
+              -- Run the compiled program
+              exitCode <- liftIO $ runProgramWithErrorHandling exePath
+              when (exitCode /= ExitSuccess) $
+                liftIO $ hPutStrLn stderr "Execution failed!"
+
+              -- Continue the REPL loop with updated state
+              let newState = updateState inputText state
+              replLoop opts $ newState { history = inputText : history newState }
+
+--------------------------------------------------------------------------------
+-- Main Function
+--------------------------------------------------------------------------------
+
+main :: IO ()
+main = do
+  opts <- execParser optsInfo
+
   case cmd opts of
-    Compile {output = out} -> do
-      liftIO $ copyBinary buildDir out `catch` handlerCopy
-      logInfoN $ "Compiled binary copied to " <> T.pack out
-    Run -> do
-      let exePath = buildDir </> "compiled_result"
-      logInfoN $ "Running " <> T.pack exePath
-      liftIO $ callProcess exePath []
+    Repl -> runRepl opts
 
-  -- Cleanup
-  unless (keepTmpdir opts) $ do
-    liftIO $ removeDirectoryRecursive buildDir
-    logInfoN "Temporary build directory removed."
-  where
-    handlerCopy :: SomeException -> IO ()
-    handlerCopy _ = error "failed copying compiled binary"
+    Run -> case sourceFile opts of
+      Nothing -> putStrLn "Error: Source file required for 'run' command" >> exitFailure
+      Just srcFile -> do
+        src <- TIO.readFile srcFile
+        buildDir <- generateBuildDir
+
+        result <- compileSource opts buildDir src False
+        case result of
+          Left err -> putStrLn ("Compilation failed: " ++ err) >> exitFailure
+          Right exePath -> do
+            -- Run the compiled program
+            callProcess exePath []
+
+            -- Cleanup
+            unless (keepTmpdir opts) $ removeDirectoryRecursive buildDir
+
+    Compile {output = out} -> case sourceFile opts of
+      Nothing -> putStrLn "Error: Source file required for 'compile' command" >> exitFailure
+      Just srcFile -> do
+        src <- TIO.readFile srcFile
+        buildDir <- generateBuildDir
+
+        result <- compileSource opts buildDir src False
+        case result of
+          Left err -> putStrLn ("Compilation failed: " ++ err) >> exitFailure
+          Right exePath -> do
+            -- Copy the binary to the output location
+            copyBinary buildDir out
+            putStrLn $ "Compiled binary written to " ++ out
+
+            -- Cleanup
+            unless (keepTmpdir opts) $ removeDirectoryRecursive buildDir
