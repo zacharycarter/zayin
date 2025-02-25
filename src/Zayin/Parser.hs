@@ -392,58 +392,70 @@ parseArgs = (do
     return (case tok of TIdent a -> a; _ -> ""))
   return (arg:rest)) <|> return []
 
--- | Parse a let binding of the form:
---    let <name> = <expr> [, <name> = <expr>]* in <body>
---    or
---    let <name> = <expr>
---    <body>
+-- | Parse a let binding with two possible formats:
+--    1. let <name> = <expr> [, <name> = <expr>]*
+--       <body>
+--    2. let
+--       <name> = <expr>
+--       <name> = <expr>
+--       ...
+--       <body>
 parseLet :: Parser Expr
 parseLet = do
   _ <- consume (== TIdent "let")
 
-  -- Parse the first binding
-  firstBinding <- parseBinding
+  -- Check if we have an immediate newline (format 2)
+  mNewline <- tryConsume (== TNewline)
 
-  -- Check for additional bindings separated by commas
-  moreBindings <- many (do
-    _ <- tryConsume (== TSymbol ",")
-    parseBinding)
+  bindings <- case mNewline of
+    -- Format 2: Bindings on separate lines
+    Just _ -> do
+      -- Expect indentation for the bindings block
+      _ <- consumeLayout (== TIndent)
 
-  let bindings = firstBinding : moreBindings
+      -- Parse multiple bindings, each on a separate line
+      binds <- many1 parseBindingLine
 
-  -- Check for 'in' keyword or colon
-  mIn <- tryConsume (== TIdent "in")
-  mColon <- tryConsume (== TSymbol ":")
+      -- Expect dedentation after bindings
+      _ <- consumeLayout (== TDedent)
 
-  case (mIn, mColon) of
-    -- If there's an 'in', parse a single expression as the body
-    (Just _, _) -> do
-      bodyExpr <- parseExpr
-      return (ELet bindings (ExprBody [] bodyExpr))
+      return binds
 
-    -- If there's a colon, parse a single expression as the body
-    (_, Just _) -> do
-      bodyExpr <- parseExpr
-      return (ELet bindings (ExprBody [] bodyExpr))
+    -- Format 1: Bindings on same line separated by commas
+    Nothing -> do
+      -- Parse the first binding
+      firstBinding <- parseBinding
 
-    -- Otherwise, look for a newline and parse the body as subsequent statements
-    _ -> do
-      -- Skip newlines and check for indentation
+      -- Check for additional bindings separated by commas
+      moreBindings <- many (do
+        _ <- tryConsume (== TSymbol ",")
+        parseBinding)
+
+      -- Expect a newline after the bindings
       _ <- consumeLayout (== TNewline)
 
-      -- Parse the body expression or expressions
-      bodyExprs <- parseMultipleTopStmts
+      return (firstBinding : moreBindings)
 
-      -- Transform the body expressions into a proper body
-      case bodyExprs of
-        [] -> return (ELet bindings (ExprBody [] (ELit LNil)))
-        [Expr e] -> return (ELet bindings (ExprBody [] e))
-        _ ->
-          let (defs, exprs) = partitionDefs bodyExprs
-              finalExpr = if null exprs
-                          then ELit LNil
-                          else last exprs
-          in return (ELet bindings (ExprBody defs finalExpr))
+  -- Parse the body expressions
+  bodyExprs <- parseMultipleTopStmts
+
+  -- Transform the body expressions into a proper body
+  case bodyExprs of
+    [] -> return (ELet bindings (ExprBody [] (ELit LNil)))
+    [Expr e] -> return (ELet bindings (ExprBody [] e))
+    _ ->
+      let (defs, exprs) = partitionDefs bodyExprs
+          finalExpr = if null exprs
+                      then ELit LNil
+                      else last exprs
+      in return (ELet bindings (ExprBody defs finalExpr))
+
+-- Helper to parse a binding on a single line with no comma
+parseBindingLine :: Parser (T.Text, Expr)
+parseBindingLine = do
+  binding <- parseBinding
+  _ <- consumeLayout (== TNewline)
+  return binding
 
 -- Helper to parse a single binding (name = expr)
 parseBinding :: Parser (T.Text, Expr)
@@ -453,6 +465,13 @@ parseBinding = do
   _ <- consume (== TSymbol "=")
   expr <- parseExpr
   return (name, expr)
+
+-- Helper for parsing at least one occurrence of something
+many1 :: Parser a -> Parser [a]
+many1 p = do
+  x <- p
+  xs <- many p
+  return (x:xs)
 
 -- | Parse a sequence of top-level statements.
 parseProgramExprs :: Parser [ExprBodyExpr]
