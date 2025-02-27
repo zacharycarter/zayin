@@ -11,10 +11,10 @@ MAKEFLAGS += --no-print-directory
 # Logging functions (macOS compatible)
 ifeq ($(V),1)
   define log
-    echo "🔷 $(1)"
+    @echo "🔷 $(1)"
   endef
   define log_cmd
-    echo "🔶 $(1)" && $(1)
+    @echo "🔶 $(1)" && $(1)
   endef
 else
   define log
@@ -59,7 +59,7 @@ ifeq ($(SANITIZE),tsan)
 endif
 
 # Define source files
-SRCS = gc.c base.c builtin.c bit_array.c
+SRCS = gc.c base.c builtin.c bit_array.c scheduler.c thread_context.c
 
 # Important: Only add include flag after mimalloc is built
 ALL_CFLAGS = $(CFLAGS) $(SAN_FLAGS)
@@ -116,7 +116,7 @@ $(MIMALLOC_STATIC_LIB):
 # Main executable
 # =============================================================
 
-compiled_result: compiled_result.c gc.o base.o builtin.o bit_array.o
+compiled_result: compiled_result.c gc.o base.o builtin.o bit_array.o scheduler.o thread_context.o
 	$(call log,Building compiled_result)
 	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $^ $(MIMALLOC_STATIC_LIB) -o $@)
 

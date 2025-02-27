@@ -58,17 +58,23 @@ runFresh action gen = runStateT (runStderrLoggingT action) gen
 logDebugM :: (Show a) => Bool -> String -> a -> Fresh a
 logDebugM debugMode prefix x = do
   when debugMode $
-    logDebugN $ T.pack $ prefix ++ ": " ++ show x
+    logDebugN $
+      T.pack $
+        prefix ++ ": " ++ show x
   return x
 
 -- Explicit debug logging for each stage
 logStage :: Bool -> String -> Fresh a -> Fresh a
 logStage debugMode stage action = do
   when debugMode $
-    logDebugN $ T.pack $ "=== Starting " ++ stage ++ " ==="
+    logDebugN $
+      T.pack $
+        "=== Starting " ++ stage ++ " ==="
   result <- action
   when debugMode $
-    logDebugN $ T.pack $ "=== Completed " ++ stage ++ " ==="
+    logDebugN $
+      T.pack $
+        "=== Completed " ++ stage ++ " ==="
   return result
 
 freshName :: T.Text -> Fresh T.Text

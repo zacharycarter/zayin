@@ -1,1 +1,3 @@
 fn foo(a): display a
+
+foo(1)

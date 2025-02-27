@@ -510,10 +510,10 @@ doCodegen expr currentEnv = do
       elseFinal <- doCodegen elseExpr currentEnv
 
       addStmt $
-          SIf
-              (EMacroCall "obj_is_truthy" [condExpr])
-              (SBlock [SExpr thenFinal])
-              (SBlock [SExpr elseFinal])
+        SIf
+          (EMacroCall "obj_is_truthy" [condExpr])
+          (SBlock [SExpr thenFinal])
+          (SBlock [SExpr elseFinal])
 
       logDebugWhen $ "  If condFinal:  " <> T.pack (show condExpr)
       logDebugWhen $ "  If thenFinal:  " <> T.pack (show thenFinal)

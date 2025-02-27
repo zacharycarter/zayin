@@ -1,26 +1,26 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Zayin.Interpreter
-  ( interpret
-  , Value(..)
-  , Environment
-  , emptyEnv
-  , InterpreterError(..)
-  , valueToString
-  ) where
+  ( interpret,
+    Value (..),
+    Environment,
+    emptyEnv,
+    InterpreterError (..),
+    valueToString,
+  )
+where
 
-import qualified Data.Map as Map
-import qualified Data.Text as T
-import qualified Data.Set as Set
-import qualified Data.HashMap.Strict as HashMap
-import Control.Monad.State
 import Control.Monad.Except
 import Control.Monad.Reader
-import System.Exit (exitWith, exitSuccess, ExitCode(..))
-
+import Control.Monad.State
+import qualified Data.HashMap.Strict as HashMap
+import qualified Data.Map as Map
+import qualified Data.Set as Set
+import qualified Data.Text as T
+import System.Exit (ExitCode (..), exitSuccess, exitWith)
 import Zayin.AST
-import Zayin.Literals
 import Zayin.LiftedExpr
+import Zayin.Literals
 
 -- Runtime value representation
 data Value
@@ -28,9 +28,9 @@ data Value
   | VString T.Text
   | VBool Bool
   | VNil
-  | VClosure Environment Int               -- CPS-style closure
-  | VBuiltinFunc T.Text ([Value] -> Interpreter Value)  -- Direct-style builtin
-  | VCons Value Value                      -- For list operations
+  | VClosure Environment Int -- CPS-style closure
+  | VBuiltinFunc T.Text ([Value] -> Interpreter Value) -- Direct-style builtin
+  | VCons Value Value -- For list operations
   | VNoop
 
 instance Show Value where
@@ -40,7 +40,7 @@ instance Show Value where
   show VNil = "VNil"
   show VNoop = "VNoop"
   show (VClosure _ id) = "VClosure <env> " ++ show id
-  show (VBuiltinFunc name _) = "VBuiltinFunc " ++ T.unpack name  -- Don't try to show the function
+  show (VBuiltinFunc name _) = "VBuiltinFunc " ++ T.unpack name -- Don't try to show the function
   show (VCons car cdr) = "VCons (" ++ show car ++ ") (" ++ show cdr ++ ")"
 
 -- Error types
@@ -60,10 +60,10 @@ type Interpreter a = ExceptT InterpreterError (ReaderT (HashMap.HashMap Int Lift
 
 -- Interpreter state
 data InterpreterState = InterpreterState
-  { globalEnv :: Environment
-  , currentEnv :: Environment
-  , replMode :: Bool
-  , lastValue :: Value
+  { globalEnv :: Environment,
+    currentEnv :: Environment,
+    replMode :: Bool,
+    lastValue :: Value
   }
 
 -- Initial empty environment
@@ -72,38 +72,40 @@ emptyEnv = Map.empty
 
 -- Initialize interpreter state
 initialState :: Bool -> InterpreterState
-initialState isRepl = InterpreterState
-  { globalEnv = builtinEnv
-  , currentEnv = Map.empty
-  , replMode = isRepl
-  , lastValue = VNil
-  }
+initialState isRepl =
+  InterpreterState
+    { globalEnv = builtinEnv,
+      currentEnv = Map.empty,
+      replMode = isRepl,
+      lastValue = VNil
+    }
 
 -- Builtin function registry
 builtinEnv :: Environment
-builtinEnv = Map.fromList
-  [ ("+", makeBuiltin "+" addFunc)
-  , ("-", makeBuiltin "-" subFunc)
-  , ("*", makeBuiltin "*" mulFunc)
-  , ("/", makeBuiltin "/" divFunc)
-  , ("%", makeBuiltin "%" modFunc)
-  , ("<", makeBuiltin "<" ltFunc)
-  , ("<=", makeBuiltin "<=" leqFunc)
-  , (">", makeBuiltin ">" gtFunc)
-  , (">=", makeBuiltin ">=" geqFunc)
-  , ("not", makeBuiltin "not" notFunc)
-  , ("eq?", makeBuiltin "eq?" eqFunc)
-  , ("cons", makeBuiltin "cons" consFunc)
-  , ("car", makeBuiltin "car" carFunc)
-  , ("cdr", makeBuiltin "cdr" cdrFunc)
-  , ("cons?", makeBuiltin "cons?" isConsFunc)
-  , ("null?", makeBuiltin "null?" isNullFunc)
-  , ("display", makeBuiltin "display" displayFunc)
-  , ("tostring", makeBuiltin "tostring" toStringFunc)
-  , ("string-concat", makeBuiltin "string-concat" stringConcatFunc)
-  , ("exit", makeBuiltin "exit" exitFunc)
-  -- Add more builtins as needed
-  ]
+builtinEnv =
+  Map.fromList
+    [ ("+", makeBuiltin "+" addFunc),
+      ("-", makeBuiltin "-" subFunc),
+      ("*", makeBuiltin "*" mulFunc),
+      ("/", makeBuiltin "/" divFunc),
+      ("%", makeBuiltin "%" modFunc),
+      ("<", makeBuiltin "<" ltFunc),
+      ("<=", makeBuiltin "<=" leqFunc),
+      (">", makeBuiltin ">" gtFunc),
+      (">=", makeBuiltin ">=" geqFunc),
+      ("not", makeBuiltin "not" notFunc),
+      ("eq?", makeBuiltin "eq?" eqFunc),
+      ("cons", makeBuiltin "cons" consFunc),
+      ("car", makeBuiltin "car" carFunc),
+      ("cdr", makeBuiltin "cdr" cdrFunc),
+      ("cons?", makeBuiltin "cons?" isConsFunc),
+      ("null?", makeBuiltin "null?" isNullFunc),
+      ("display", makeBuiltin "display" displayFunc),
+      ("tostring", makeBuiltin "tostring" toStringFunc),
+      ("string-concat", makeBuiltin "string-concat" stringConcatFunc),
+      ("exit", makeBuiltin "exit" exitFunc)
+      -- Add more builtins as needed
+    ]
   where
     makeBuiltin name func = VBuiltinFunc name func
 
@@ -114,34 +116,28 @@ evalExpr expr env = case expr of
     case Map.lookup name env of
       Just val -> return val
       Nothing -> throwError $ UnboundVariable name
-
   Lit lit -> return $ case lit of
     LInt n -> VInt n
     LString s -> VString s
     LBool b -> VBool b
     LNil -> VNil
-
   BuiltinIdent name ->
     case Map.lookup name builtinEnv of
       Just val -> return val
       Nothing -> throwError $ UnknownBuiltin name
-
   SetThen var valExpr contExpr -> do
     val <- evalExpr valExpr env
     let env' = Map.insert var val env
     evalExpr contExpr env'
-
   If condExpr thenExpr elseExpr -> do
     condVal <- evalExpr condExpr env
     case condVal of
       VBool False -> evalExpr elseExpr env
       VNil -> evalExpr elseExpr env
       _ -> evalExpr thenExpr env
-
   Lifted lambdaId ->
     -- Create a closure with current environment and lambda id
     return $ VClosure env lambdaId
-
   -- In CPS, CallOne means f(arg) where f already has its continuation
   CallOne funcExpr argExpr -> do
     funcVal <- evalExpr funcExpr env
@@ -163,7 +159,6 @@ evalExpr expr env = case expr of
             -- So we just call it with its argument
             let callEnv = setupCallEnv lambda closureEnv [argVal]
             evalExpr (body lambda) callEnv
-
       other -> throwError $ ApplicationError $ "Cannot apply: " ++ valueToString other
 
   -- In CPS, CallTwo means f(arg, cont) - second arg is the continuation
@@ -189,29 +184,28 @@ evalExpr expr env = case expr of
             -- The continuation is the second parameter in CPS form
             let callEnv = setupCallEnv lambda closureEnv [arg1Val, contVal]
             evalExpr (body lambda) callEnv
-
       other -> throwError $ ApplicationError $ "Cannot apply: " ++ valueToString other
 
 -- Helper to set up the environment for a function call
 setupCallEnv :: LiftedLambda -> Environment -> [Value] -> Environment
 setupCallEnv lambda closureEnv args =
-  let
-    -- Bind parameters to arguments
-    paramBindings = zip (params lambda) args
-    -- Start with an empty environment
-    emptyEnv = Map.empty
-    -- Add parameter bindings
-    paramEnv = foldr (\(p, a) e -> Map.insert p a e) emptyEnv paramBindings
-    -- Add free variables from closure
-    freeVarsEnv = foldr
-                   (\fv e ->
-                     case Map.lookup fv closureEnv of
-                       Just val -> Map.insert fv val e
-                       Nothing -> e)
-                   paramEnv
-                   (Set.toList $ freeVars lambda)
-  in
-    freeVarsEnv
+  let -- Bind parameters to arguments
+      paramBindings = zip (params lambda) args
+      -- Start with an empty environment
+      emptyEnv = Map.empty
+      -- Add parameter bindings
+      paramEnv = foldr (\(p, a) e -> Map.insert p a e) emptyEnv paramBindings
+      -- Add free variables from closure
+      freeVarsEnv =
+        foldr
+          ( \fv e ->
+              case Map.lookup fv closureEnv of
+                Just val -> Map.insert fv val e
+                Nothing -> e
+          )
+          paramEnv
+          (Set.toList $ freeVars lambda)
+   in freeVarsEnv
 
 -- Helper to apply a continuation to a value
 applyContinuation :: Value -> Value -> Interpreter Value
@@ -224,13 +218,10 @@ applyContinuation contVal argVal =
         Just lambda -> do
           let callEnv = setupCallEnv lambda closureEnv [argVal]
           evalExpr (body lambda) callEnv
-
     VBuiltinFunc _ impl ->
       impl [argVal]
-
     other ->
       throwError $ ApplicationError $ "Cannot use as continuation: " ++ valueToString other
-
 
 -- Builtin function implementations
 
@@ -319,8 +310,9 @@ divFunc [VInt x] =
           applyContinuation cont result
         _ -> throwError $ TypeMismatch "Expected integer as second argument to /" y
     _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied /: " ++ show args
-divFunc [VInt x, VInt y] | y == 0 = throwError $ ApplicationError "Division by zero"
-                         | otherwise = return $ VInt (x `div` y)
+divFunc [VInt x, VInt y]
+  | y == 0 = throwError $ ApplicationError "Division by zero"
+  | otherwise = return $ VInt (x `div` y)
 divFunc [VInt x, contVal@(VClosure _ _)] =
   return $ VBuiltinFunc "/" $ \[arg] -> case arg of
     VInt 0 -> throwError $ ApplicationError "Division by zero"
@@ -346,8 +338,9 @@ modFunc [VInt x] =
           applyContinuation cont result
         _ -> throwError $ TypeMismatch "Expected integer as second argument to %" y
     _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied %: " ++ show args
-modFunc [VInt x, VInt y] | y == 0 = throwError $ ApplicationError "Modulo by zero"
-                         | otherwise = return $ VInt (x `mod` y)
+modFunc [VInt x, VInt y]
+  | y == 0 = throwError $ ApplicationError "Modulo by zero"
+  | otherwise = return $ VInt (x `mod` y)
 modFunc [VInt x, contVal@(VClosure _ _)] =
   return $ VBuiltinFunc "%" $ \[arg] -> case arg of
     VInt 0 -> throwError $ ApplicationError "Modulo by zero"
@@ -542,13 +535,13 @@ displayFunc :: [Value] -> Interpreter Value
 displayFunc [val] = do
   liftIO $ putStrLn $ valueToString val
   state <- get
-  modify $ \s -> s { lastValue = VNoop }  -- Use VNoop to indicate nothing should be printed
-  return VNoop  -- Return VNoop to indicate no printing needed
+  modify $ \s -> s {lastValue = VNoop} -- Use VNoop to indicate nothing should be printed
+  return VNoop -- Return VNoop to indicate no printing needed
 displayFunc [val, contVal@(VClosure _ _)] = do
   liftIO $ putStrLn $ valueToString val
   state <- get
-  modify $ \s -> s { lastValue = VNoop }
-  applyContinuation contVal VNoop  -- Pass VNoop to the continuation
+  modify $ \s -> s {lastValue = VNoop}
+  applyContinuation contVal VNoop -- Pass VNoop to the continuation
 displayFunc args =
   throwError $ ApplicationError $ "Invalid arguments to display: " ++ show args
 
@@ -591,18 +584,23 @@ exitFunc [val] = do
   if replMode state
     then do
       -- Store the value in the state and return it
-      modify $ \s -> s { lastValue = val }
+      modify $ \s -> s {lastValue = val}
       return val
-    else liftIO $ System.Exit.exitWith $ System.Exit.ExitFailure (fromIntegral $
-      case val of
-        VInt code -> code
-        _ -> 0)
+    else
+      liftIO $
+        System.Exit.exitWith $
+          System.Exit.ExitFailure
+            ( fromIntegral $
+                case val of
+                  VInt code -> code
+                  _ -> 0
+            )
 exitFunc [] = do
   state <- get
   if replMode state
     then do
       -- Store nil in the state for empty exit call
-      modify $ \s -> s { lastValue = VNil }
+      modify $ \s -> s {lastValue = VNil}
       return VNil
     else liftIO $ System.Exit.exitSuccess
 exitFunc [VInt code, contVal@(VClosure _ _)] = do
@@ -610,7 +608,7 @@ exitFunc [VInt code, contVal@(VClosure _ _)] = do
   if replMode state
     then do
       -- Store the integer value before continuing
-      modify $ \s -> s { lastValue = VInt code }
+      modify $ \s -> s {lastValue = VInt code}
       applyContinuation contVal VNil
     else liftIO $ System.Exit.exitWith $ System.Exit.ExitFailure (fromIntegral code)
 exitFunc [val, contVal@(VClosure _ _)] = do
@@ -618,7 +616,7 @@ exitFunc [val, contVal@(VClosure _ _)] = do
   if replMode state
     then do
       -- Store the value before continuing
-      modify $ \s -> s { lastValue = val }
+      modify $ \s -> s {lastValue = val}
       applyContinuation contVal VNil
     else liftIO $ System.Exit.exitSuccess
 exitFunc args =
@@ -648,12 +646,14 @@ valueToString VNoop = "<no output>"
 -- Main interpretation function
 interpret :: LExpr -> HashMap.HashMap Int LiftedLambda -> Bool -> IO (Either InterpreterError Value)
 interpret expr lambdaMap isRepl = do
-  (result, finalState) <- runStateT
-                            (runReaderT
-                              (runExceptT (evalExpr expr Map.empty))
-                              lambdaMap)
-                            (initialState isRepl)
+  (result, finalState) <-
+    runStateT
+      ( runReaderT
+          (runExceptT (evalExpr expr Map.empty))
+          lambdaMap
+      )
+      (initialState isRepl)
   -- Return either the error or the stored last value
   return $ case result of
     Left err -> Left err
-    Right _ -> Right (lastValue finalState)  -- Return last value instead of result
+    Right _ -> Right (lastValue finalState) -- Return last value instead of result

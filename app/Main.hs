@@ -4,7 +4,7 @@
 module Main where
 
 import Control.Exception (SomeException, catch, finally)
-import Control.Monad (unless, when, void)
+import Control.Monad (unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Logger (LoggingT, logDebugN, logErrorN, logInfoN, runStderrLoggingT)
 import Control.Monad.State
@@ -17,13 +17,12 @@ import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Options.Applicative
 import System.Console.Haskeline
-import System.Directory (copyFile, removeDirectoryRecursive, createDirectoryIfMissing)
+import System.Directory (copyFile, createDirectoryIfMissing, removeDirectoryRecursive)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (createTempDirectory)
 import System.Process (ProcessHandle, StdStream (..), callProcess, createProcess, cwd, proc, std_err, std_out, waitForProcess)
-
 -- Import your own modules
 import Zayin.AST
 import Zayin.AST.Pretty
@@ -33,7 +32,7 @@ import qualified Zayin.CPS as CPS
 import Zayin.Codegen (codegen)
 import Zayin.FlatExpr (liftLambdas)
 import Zayin.FlatExpr.Pretty (renderFExpr)
-import Zayin.Interpreter (interpret, valueToString, Value(..))
+import Zayin.Interpreter (Value (..), interpret, valueToString)
 import Zayin.LiftedExpr.Pretty (renderLExpr, renderLiftedLambda)
 import Zayin.Literals
 import Zayin.Macros (expandMacros)
@@ -91,9 +90,11 @@ optionsParser :: Parser Options
 optionsParser =
   Options
     <$> cmdParser
-    <*> optional (argument
-                   str
-                   (metavar "SOURCE" <> help "Input source file (.zyn)"))
+    <*> optional
+      ( argument
+          str
+          (metavar "SOURCE" <> help "Input source file (.zyn)")
+      )
     <*> switch (long "debug" <> help "Enable debug output")
     <*> switch (long "keep-tmpdir" <> help "Keep temporary build directory")
     <*> switch (long "sanitize" <> help "Build with ASAN sanitizer")
@@ -121,6 +122,11 @@ runtimeFiles =
     ("gc.c", $(makeRelativeToProject "runtime/gc.c" >>= embedFile)),
     ("hash_table.h", $(makeRelativeToProject "runtime/hash_table.h" >>= embedFile)),
     ("queue.h", $(makeRelativeToProject "runtime/queue.h" >>= embedFile)),
+    ("queue_thunk.h", $(makeRelativeToProject "runtime/queue_thunk.h" >>= embedFile)),
+    ("scheduler.h", $(makeRelativeToProject "runtime/scheduler.h" >>= embedFile)),
+    ("scheduler.c", $(makeRelativeToProject "runtime/scheduler.c" >>= embedFile)),
+    ("thread_context.h", $(makeRelativeToProject "runtime/thread_context.h" >>= embedFile)),
+    ("thread_context.c", $(makeRelativeToProject "runtime/thread_context.c" >>= embedFile)),
     ("test_queue.c", $(makeRelativeToProject "runtime/test_queue.c" >>= embedFile)),
     ("vec.h", $(makeRelativeToProject "runtime/vec.h" >>= embedFile)),
     ("Makefile", $(makeRelativeToProject "runtime/Makefile" >>= embedFile))
@@ -157,12 +163,13 @@ invokeMake tmpDir sanitize debugMode = do
 
   let args = if sanitize then ["SANITIZE=asan"] else []
 
-  (_, mout, merr, ph) <- createProcess
-    (proc "make" args) {
-      cwd = Just tmpDir,
-      std_out = CreatePipe,
-      std_err = CreatePipe
-    }
+  (_, mout, merr, ph) <-
+    createProcess
+      (proc "make" args)
+        { cwd = Just tmpDir,
+          std_out = CreatePipe,
+          std_err = CreatePipe
+        }
 
   -- Log command execution only in debug mode
   when debugMode $ putStrLn $ "Executing: make " ++ unwords args
@@ -181,12 +188,16 @@ invokeMake tmpDir sanitize debugMode = do
     ExitSuccess ->
       if debugMode
         then return $ Right $ T.unpack stdout
-        else return $ Right ""  -- Empty string when not in debug mode, since we don't need the output
+        else return $ Right "" -- Empty string when not in debug mode, since we don't need the output
     ExitFailure code ->
-      return $ Left $ "Make failed with exit code: " ++ show code ++
-                     (if debugMode
-                       then "\nstdout: " ++ T.unpack stdout ++ "\nstderr: " ++ T.unpack stderr
-                       else "")  -- Simplified error message when not in debug mode
+      return $
+        Left $
+          "Make failed with exit code: "
+            ++ show code
+            ++ ( if debugMode
+                   then "\nstdout: " ++ T.unpack stdout ++ "\nstderr: " ++ T.unpack stderr
+                   else "" -- Simplified error message when not in debug mode
+               )
 
 insertSourceIntoBuildDir :: FilePath -> T.Text -> IO ()
 insertSourceIntoBuildDir tmpDir source = do
@@ -209,22 +220,96 @@ generateProgramSource src =
           "#include <stdlib.h>",
           "#include <string.h>",
           "#include <unistd.h>",
+          "#include <stdbool.h>", -- Added for bool type
           "#include \"base.h\"",
-          "#include \"builtin.h\""
+          "#include \"builtin.h\"",
+          "#include \"gc.h\"",
+          "#include \"scheduler.h\"", -- Added for threading
+          "#include \"thread_context.h\"", -- Added for thread context
+          ""
         ],
       src,
       T.unlines
-        [ "int main(void) {",
-          "    mi_version();",
+        [ "// Parse command line arguments",
+          "static bool parse_args(int argc, char *argv[], bool *use_threading) {",
+          "    *use_threading = false;",
+          "    ",
+          "    for (int i = 1; i < argc; i++) {",
+          "        if (strcmp(argv[i], \"--use-threading\") == 0) {",
+          "            *use_threading = true;",
+          "        }",
+          "    }",
+          "    ",
+          "    return true;",
+          "}",
+          "",
+          "// Entry point for worker threads",
+          "static void run_program_threaded(void) {",
+          "    // Initialize thread context and GC for main thread",
+          "    thread_context_init(0);",
+          "    gc_thread_init(0);",
+          "    ",
+          "    // Create initial thunk",
           "    struct closure_obj initial_closure = object_closure_one_new(main_lambda, NULL);",
           "    struct thunk initial_thunk = {",
           "        .closr = &initial_closure,",
           "        .one = {NULL},",
           "    };",
+          "    ",
+          "    // Create heap-allocated thunk",
+          "    struct thunk *thnk_heap = gc_malloc(sizeof(struct thunk));",
+          "    memcpy(thnk_heap, &initial_thunk, sizeof(struct thunk));",
+          "    ",
+          "    // Start the scheduler with worker threads",
+          "    start_scheduler();",
+          "    ",
+          "    // Schedule the main program thunk",
+          "    schedule_thunk(thnk_heap);",
+          "    ",
+          "    while (1) {",
+          "        sleep(1);",
+          "    }",
           "",
+          "    // Clean up",
+          "    stop_scheduler();",
+          "}",
+          "",
+          "// Traditional single-threaded entry point",
+          "static void run_program_single_threaded(void) {",
+          "    // Create initial thunk",
+          "    struct closure_obj initial_closure = object_closure_one_new(main_lambda, NULL);",
+          "    struct thunk initial_thunk = {",
+          "        .closr = &initial_closure,",
+          "        .one = {NULL},",
+          "    };",
+          "    ",
+          "    // Create heap-allocated thunk",
           "    struct thunk *thnk_heap = mi_malloc(sizeof(struct thunk));",
           "    memcpy(thnk_heap, &initial_thunk, sizeof(struct thunk));",
+          "    ",
+          "    // Run the program directly (original behavior)",
           "    zayin_start(thnk_heap);",
+          "}",
+          "",
+          "int main(int argc, char *argv[]) {",
+          "    mi_version();",
+          "    ",
+          "    // Parse command line arguments",
+          "    bool use_threading = false;",
+          "    parse_args(argc, argv, &use_threading);",
+          "    ",
+          "    if (true) {",
+          "        // Initialize global GC first",
+          "        gc_global_init();",
+          "        ",
+          "        // Run with threading enabled",
+          "        run_program_threaded();",
+          "    } else {",
+          "        // Run in traditional single-threaded mode",
+          "        run_program_single_threaded();",
+          "    }",
+          "    ",
+          "    return 0;",
           "}"
         ]
     ]
@@ -240,7 +325,7 @@ runCompilation = runStderrLoggingT
 
 compileSource :: Options -> FilePath -> T.Text -> Bool -> IO (Either String FilePath)
 compileSource opts buildDir src isRepl = runCompilation $ do
-   -- Possibly transform the source for REPL
+  -- Possibly transform the source for REPL
   let debugMode = debug opts
 
   when debugMode $ logInfoN $ "\nSource being compiled:\n" <> src
@@ -261,7 +346,8 @@ compileSource opts buildDir src isRepl = runCompilation $ do
   expandedExpr <- case expandMacros parsedAST of
     Right e -> do
       when debugMode $
-        logInfoN $ "\nExpanded AST after macro processing:" <> T.pack (renderExpr e)
+        logInfoN $
+          "\nExpanded AST after macro processing:" <> T.pack (renderExpr e)
       return e
     Left err -> do
       logErrorN $ "Macro expansion failed: " <> T.pack err
@@ -273,7 +359,8 @@ compileSource opts buildDir src isRepl = runCompilation $ do
   -- Use runFresh instead of runState for toBoundExprM with debug flag
   (boundExpr, state1) <- liftIO $ runFresh (toBoundExprM debugMode expandedExpr) initial
   when debugMode $
-    logInfoN $ "\nBound Expression: " <> T.pack (renderBExpr boundExpr)
+    logInfoN $
+      "\nBound Expression: " <> T.pack (renderBExpr boundExpr)
 
   let k = CPS.BuiltinIdent "exit"
 
@@ -281,7 +368,8 @@ compileSource opts buildDir src isRepl = runCompilation $ do
   (fExpr, _) <- liftIO $ runFresh (toFExprM debugMode boundExpr k) state1
 
   when debugMode $
-    logInfoN $ "\nAfter CPS conversion: " <> T.pack (renderFExpr fExpr)
+    logInfoN $
+      "\nAfter CPS conversion: " <> T.pack (renderFExpr fExpr)
 
   -- Updated to pass debug flag to liftLambdas
   let (e, lambdas) = liftLambdas debugMode fExpr
@@ -307,12 +395,12 @@ compileSource opts buildDir src isRepl = runCompilation $ do
       fullSource = generateProgramSource cCode
 
   when debugMode $
-    logInfoN $ "\nGenerated C Code: " <> fullSource
+    logInfoN $
+      "\nGenerated C Code: " <> fullSource
 
   -- Write C code
   liftIO $ insertSourceIntoBuildDir buildDir fullSource
-  makeResult <- liftIO $ invokeMake buildDir (sanitize opts) debugMode  -- Pass debug flag to invokeMake
-
+  makeResult <- liftIO $ invokeMake buildDir (sanitize opts) debugMode -- Pass debug flag to invokeMake
   case makeResult of
     Left errMsg -> do
       logErrorN $ "\nFailed compiling generated C code: " <> T.pack errMsg
@@ -327,9 +415,9 @@ compileSource opts buildDir src isRepl = runCompilation $ do
 --------------------------------------------------------------------------------
 
 data ReplState = ReplState
-  { buildDir :: FilePath
-  , history :: [T.Text]  -- Previous inputs
-  , environment :: [T.Text]  -- Definitions (macros, functions) to persist
+  { buildDir :: FilePath,
+    history :: [T.Text], -- Previous inputs
+    environment :: [T.Text] -- Definitions (macros, functions) to persist
   }
 
 runRepl :: Options -> IO ()
@@ -341,11 +429,12 @@ runRepl opts = do
   when debugMode $ putStrLn $ "REPL build directory: " ++ dir
 
   -- Set up initial state
-  let initialState = ReplState
-        { buildDir = dir
-        , history = []
-        , environment = []
-        }
+  let initialState =
+        ReplState
+          { buildDir = dir,
+            history = [],
+            environment = []
+          }
 
   putStrLn "Zayin REPL v0.1"
   putStrLn "Type expressions to evaluate, :help for commands"
@@ -364,10 +453,10 @@ replLoop opts state = do
   let debugMode = debug opts
   minput <- getInputLine "zayin> "
   case minput of
-    Nothing -> return ()  -- EOF
-    Just ":q" -> return ()  -- Quit
-    Just ":quit" -> return ()  -- Quit
-    Just ":exit" -> return ()  -- Quit
+    Nothing -> return () -- EOF
+    Just ":q" -> return () -- Quit
+    Just ":quit" -> return () -- Quit
+    Just ":exit" -> return () -- Quit
     Just ":help" -> do
       outputStrLn "Commands:"
       outputStrLn "  :q, :quit, :exit - Exit the REPL"
@@ -379,10 +468,10 @@ replLoop opts state = do
       replLoop opts state
     Just ":reset" -> do
       outputStrLn "Environment reset."
-      replLoop opts state { environment = [] }
+      replLoop opts state {environment = []}
     Just ":history" -> do
       outputStrLn "Input history:"
-      forM_ (zip [1..] (reverse $ history state)) $ \(i, input) ->
+      forM_ (zip [1 ..] (reverse $ history state)) $ \(i, input) ->
         outputStrLn $ show (i :: Int) ++ ": " ++ T.unpack input
       replLoop opts state
     Just ":env" -> do
@@ -391,7 +480,7 @@ replLoop opts state = do
         outputStrLn $ T.unpack def
       replLoop opts state
     Just ":debug" -> do
-      let newOpts = opts { debug = not debugMode }
+      let newOpts = opts {debug = not debugMode}
       outputStrLn $ "Debug mode " ++ (if debug newOpts then "enabled" else "disabled")
       replLoop newOpts state
     Just input
@@ -427,7 +516,7 @@ replLoop opts state = do
               outputStrLn err
               replLoop opts state
             Right val -> case val of
-              VNoop -> replLoop opts state  -- Don't print anything for VNoop
+              VNoop -> replLoop opts state -- Don't print anything for VNoop
               _ -> do
                 outputStrLn $ valueToString val
                 replLoop opts state
@@ -435,27 +524,29 @@ replLoop opts state = do
 -- Helper function to determine if input contains a definition
 updateState :: T.Text -> ReplState -> ReplState
 updateState input state
-  | isMacroOrFunctionDef input = state { environment = environment state ++ [input] }
+  | isMacroOrFunctionDef input = state {environment = environment state ++ [input]}
   | otherwise = state
 
 -- Check if the input is a macro or function definition that should be preserved
 isMacroOrFunctionDef :: T.Text -> Bool
 isMacroOrFunctionDef input =
   let stripped = T.stripStart input
-  in T.isPrefixOf "macro " stripped || T.isPrefixOf "fn " stripped
+   in T.isPrefixOf "macro " stripped || T.isPrefixOf "fn " stripped
 
 -- Handle execution errors without using ScopedTypeVariables
 runProgramWithErrorHandling :: FilePath -> IO ExitCode
 runProgramWithErrorHandling exePath = do
-  result <- catch
-    (do
-      callProcess exePath []
-      return ExitSuccess)
-    (\e -> do
-       let _ = e :: SomeException  -- Type annotation in binding position is allowed
-       return (ExitFailure 1))
+  result <-
+    catch
+      ( do
+          callProcess exePath []
+          return ExitSuccess
+      )
+      ( \e -> do
+          let _ = e :: SomeException -- Type annotation in binding position is allowed
+          return (ExitFailure 1)
+      )
   return result
-
 
 --------------------------------------------------------------------------------
 -- Main Function
@@ -468,14 +559,14 @@ main = do
   -- Configure output based on debug flag
   let debugMode = debug opts
       -- Optional debug message for when running in debug mode
-      debugMsg = when debugMode $
-                   putStrLn "Debug mode enabled. Showing detailed compilation information."
+      debugMsg =
+        when debugMode $
+          putStrLn "Debug mode enabled. Showing detailed compilation information."
 
   case cmd opts of
     Repl -> do
       debugMsg
       runRepl opts
-
     Run -> case sourceFile opts of
       Nothing -> putStrLn "Error: Source file required for 'run' command" >> exitFailure
       Just srcFile -> do
@@ -497,7 +588,6 @@ main = do
             unless (keepTmpdir opts) $ do
               when debugMode $ putStrLn $ "Cleaning up build directory: " ++ buildDir
               removeDirectoryRecursive buildDir
-
     Compile {output = out} -> case sourceFile opts of
       Nothing -> putStrLn "Error: Source file required for 'compile' command" >> exitFailure
       Just srcFile -> do
