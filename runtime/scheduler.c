@@ -15,7 +15,6 @@
 /* Forward declarations */
 static void *thread_main(void *arg);
 static void scheduler_init(void);
-static void check_gc_cooperation(void);
 
 /* Number of worker threads to spawn. */
 #define NUM_THREADS 4
@@ -80,36 +79,6 @@ struct thunk *dequeue_thunk(void) {
     return thnk;
 }
 
-/* Check if GC needs this thread to pause (stop-the-world cooperation) */
-static void check_gc_cooperation(void) {
-    thread_context_t *ctx = get_current_thread_context();
-
-    if (!ctx) return;
-
-    /* Quick check without locking to avoid mutex overhead */
-    if (__atomic_load_n(&gc_global_state.stop_the_world, __ATOMIC_ACQUIRE)) {
-        /* Acquire GC mutex to cooperate with collection */
-        pthread_mutex_lock(&gc_global_state.gc_mutex);
-
-        if (gc_global_state.stop_the_world) {
-            /* Increment waiting threads count */
-            gc_global_state.gc_threads_waiting++;
-            DEBUG_FPRINTF(stderr, "Thread %d stopping for GC\n", ctx->thread_index);
-
-            /* Wait for GC to complete */
-            ctx->in_gc = 1; /* true */
-            while (gc_global_state.stop_the_world) {
-                pthread_cond_wait(&gc_global_state.gc_cond, &gc_global_state.gc_mutex);
-            }
-            ctx->in_gc = 0; /* false */
-
-            DEBUG_FPRINTF(stderr, "Thread %d resuming after GC\n", ctx->thread_index);
-        }
-
-        pthread_mutex_unlock(&gc_global_state.gc_mutex);
-    }
-}
-
 /* Worker thread main function */
 static void *thread_main(void *arg) {
     int thread_index = *((int*)arg);
@@ -128,8 +97,8 @@ static void *thread_main(void *arg) {
 
     /* Main worker loop */
     while (scheduler_running) {
-        /* Cooperate with GC if needed */
-        check_gc_cooperation();
+/* Cooperate with GC if needed */
+        gc_check_pause_for_collection();
 
         /* Try to get a thunk to execute */
         pthread_mutex_lock(&work_queue_mutex);
@@ -141,7 +110,7 @@ static void *thread_main(void *arg) {
             /* After waking up, check if we need to cooperate with GC */
             if (__atomic_load_n(&gc_global_state.stop_the_world, __ATOMIC_ACQUIRE)) {
                 pthread_mutex_unlock(&work_queue_mutex);
-                check_gc_cooperation();
+                gc_check_pause_for_collection();
                 pthread_mutex_lock(&work_queue_mutex);
             }
         }

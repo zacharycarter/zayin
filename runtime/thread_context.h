@@ -55,6 +55,9 @@ void thread_context_init(int thread_index);
 // Clean up a thread context
 void thread_context_cleanup(void);
 
+// Get thread context by thread id
+thread_context_t *get_thread_context(int thread_index);
+
 // Get the current thread context, initializing if needed
 thread_context_t *get_current_thread_context(void);
 

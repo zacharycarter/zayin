@@ -271,6 +271,9 @@ static void gc_destroy_heap(gc_heap_t *heap) {
 
 /* Allocate memory from a heap */
 static void *gc_heap_allocate(gc_heap_t *heap, size_t size) {
+    /* Check if we need to pause for collection */
+    gc_check_pause_for_collection();
+
     thread_context_t *ctx;
     struct gc_context *gc_ctx;
     gc_block_t **prev_ptr, *block, *new_block;
@@ -542,6 +545,9 @@ static bool gc_try_allocate_tlab(thread_context_t *ctx, size_t min_size) {
 
 /* Allocate memory for an object */
 void *gc_malloc(size_t size) {
+    /* Check if we need to pause for collection */
+    gc_check_pause_for_collection();
+
     thread_context_t *ctx = get_current_thread_context();
 
     /* Try to allocate in the nursery first (via TLAB) */
@@ -689,10 +695,13 @@ void gc_minor(struct gc_context *ctx, struct thunk *thnk) {
     thread_ctx->gc_state.collections++;
 }
 
+/* Nursery collection implementation */
 /* Actual nursery collection implementation */
 static void gc_collect_nursery(struct gc_context *ctx, bool evacuate_all) {
     thread_context_t *thread_ctx;
     void *temp;
+    size_t used_size = 0;
+    uint64_t start_time = get_current_time_ms();
 
     thread_ctx = ctx->thread_ctx;
     if (!thread_ctx) {
@@ -700,10 +709,36 @@ static void gc_collect_nursery(struct gc_context *ctx, bool evacuate_all) {
         ctx->thread_ctx = thread_ctx;
     }
 
+    DEBUG_FPRINTF(stderr, "Thread %d: Starting nursery collection\n",
+                 thread_ctx->thread_index);
+
+    // Calculate currently used nursery space
+    if (thread_ctx->gc_state.tlab_current) {
+        used_size = (char*)thread_ctx->gc_state.tlab_current -
+                   (char*)thread_ctx->gc_state.nursery->from_space;
+        DEBUG_FPRINTF(stderr, "Thread %d: Nursery usage before collection: %zu bytes\n",
+                     thread_ctx->thread_index, used_size);
+    }
+
+    // Reset the updated pointers map and queues
+    hash_table_ptr_map_free(ctx->updated_pointers);
+    ctx->updated_pointers = hash_table_ptr_map_new();
+
+    // Free the existing queues and create new ones
+    queue_gc_grey_nodes_free(&ctx->grey_nodes);
+    ctx->grey_nodes = queue_gc_grey_nodes_new(10);
+
+    queue_ptr_toupdate_pair_free(&ctx->pointers_toupdate);
+    ctx->pointers_toupdate = queue_ptr_toupdate_pair_new(10);
+
     /* Swap from-space and to-space */
     temp = thread_ctx->gc_state.nursery->from_space;
     thread_ctx->gc_state.nursery->from_space = thread_ctx->gc_state.nursery->to_space;
     thread_ctx->gc_state.nursery->to_space = temp;
+
+    // Clear the new from-space (was to-space before swap)
+    memset(thread_ctx->gc_state.nursery->from_space, 0,
+          thread_ctx->gc_state.nursery->space_size);
 
     /* Reset TLAB pointers */
     thread_ctx->gc_state.tlab_start = thread_ctx->gc_state.nursery->from_space;
@@ -711,11 +746,76 @@ static void gc_collect_nursery(struct gc_context *ctx, bool evacuate_all) {
     thread_ctx->gc_state.tlab_end =
         (char*)thread_ctx->gc_state.nursery->from_space + thread_ctx->gc_state.tlab_size;
 
-    /* TODO: Implement copying collection from to-space to from-space */
-    /* This requires tracing all roots and copying live objects */
+    // Mark all roots (this will populate the grey queue)
+    gc_mark_roots(ctx);
 
-    /* For now, we just reset the nursery as a simple implementation */
-    memset(thread_ctx->gc_state.nursery->to_space, 0, thread_ctx->gc_state.nursery->space_size);
+    // Now trace all live objects from roots (copying collection)
+    while (queue_gc_grey_nodes_len(&ctx->grey_nodes) > 0) {
+        struct obj *obj = queue_gc_grey_nodes_dequeue(&ctx->grey_nodes);
+        gc_mark_obj(ctx, obj);
+    }
+
+    // Process all pending pointer updates
+    while (queue_ptr_toupdate_pair_len(&ctx->pointers_toupdate) > 0) {
+        struct ptr_toupdate_pair update = queue_ptr_toupdate_pair_dequeue(&ctx->pointers_toupdate);
+
+        struct obj **maybe_copied = hash_table_ptr_map_lookup(
+            ctx->updated_pointers, (size_t)update.on_stack);
+
+        if (maybe_copied != NULL) {
+            *update.toupdate = *maybe_copied;
+        } else if (update.on_stack != NULL) {
+            // This object hasn't been copied yet, so copy it now
+            struct obj *on_heap = gc_toheap(ctx, update.on_stack);
+            hash_table_ptr_map_insert(ctx->updated_pointers,
+                                     (size_t)update.on_stack, on_heap);
+            *update.toupdate = on_heap;
+        }
+    }
+
+    // Calculate new used size and update statistics
+    size_t new_used_size = (char*)thread_ctx->gc_state.tlab_current -
+                          (char*)thread_ctx->gc_state.nursery->from_space;
+
+    // Update statistics
+    thread_ctx->gc_state.collections++;
+    thread_ctx->gc_state.bytes_promoted += (used_size - new_used_size);
+
+    uint64_t end_time = get_current_time_ms();
+    DEBUG_FPRINTF(stderr, "Thread %d: Nursery collection completed in %llu ms\n",
+                 thread_ctx->thread_index, (unsigned long long)(end_time - start_time));
+    DEBUG_FPRINTF(stderr, "Thread %d: Nursery usage after collection: %zu bytes\n",
+                 thread_ctx->thread_index, new_used_size);
+    DEBUG_FPRINTF(stderr, "Thread %d: Promoted %zu bytes to older generation\n",
+                 thread_ctx->thread_index, used_size - new_used_size);
+}
+
+/* Helper to get object size based on type */
+static size_t get_object_size(struct obj *obj) {
+    switch (obj->tag) {
+        case OBJ_CLOSURE:
+            return sizeof(struct closure_obj);
+        case ENV_OBJ: {
+            struct env_obj *env = (struct env_obj*)obj;
+            return sizeof(struct env_obj) + env->len * sizeof(struct obj*);
+        }
+        case OBJ_INT:
+            return sizeof(struct int_obj);
+        case OBJ_BOOL:
+            return sizeof(struct bool_obj);
+        case OBJ_STR: {
+            struct string_obj *str = (struct string_obj*)obj;
+            return sizeof(struct string_obj) + str->len;
+        }
+        case OBJ_CONS:
+            return sizeof(struct cons_obj);
+        case OBJ_CELL:
+            return sizeof(struct cell_obj);
+        case OBJ_HT:
+            return sizeof(struct ht_obj);
+        default:
+            return 0; /* Unknown object type */
+    }
 }
 
 /* Run a major GC (collect thread-local mature heap) */
@@ -723,6 +823,11 @@ static void gc_collect_local_heap(struct gc_context *ctx) {
     thread_context_t *thread_ctx;
     uint64_t start_time, end_time;
     struct obj *obj;
+    gc_segment_t *segment;
+    gc_block_t *free_list = NULL, *prev_block = NULL;
+    void *segment_start, *segment_end;
+    size_t freed_bytes = 0;
+    size_t live_bytes = 0;
 
     thread_ctx = ctx->thread_ctx;
     if (!thread_ctx) {
@@ -755,20 +860,83 @@ static void gc_collect_local_heap(struct gc_context *ctx) {
         gc_mark_obj(ctx, obj);
     }
 
-    /* Sweep phase: Free unmarked objects */
-    /* TODO: Implement sweep phase for mark-sweep collection */
-
-    /* Reset the free list to prepare for sweep */
+    /* Sweep phase: Free unmarked objects and rebuild the free list */
     thread_ctx->gc_state.local_mature->free_list = NULL;
 
-    /* TODO: Iterate through all segments and all objects, freeing unmarked ones
-       and rebuilding the free list */
+    /* Iterate through all segments */
+    for (segment = thread_ctx->gc_state.local_mature->segments; segment != NULL; segment = segment->next) {
+        segment_start = segment->start;
+        segment_end = (char*)segment_start + segment->size;
+
+        /* Adjust alignment to object boundaries */
+        uintptr_t addr = (uintptr_t)segment_start;
+        addr = (addr + 7) & ~7; /* Align to 8 bytes */
+
+        /* Iterate through the segment looking for objects */
+        while (addr < (uintptr_t)segment_end) {
+            obj = (struct obj*)addr;
+
+            /* Skip areas that are not valid objects */
+            if (addr + sizeof(struct obj) > (uintptr_t)segment_end ||
+                obj->tag < 1 || obj->tag > LAST_OBJ_TYPE) {
+                /* Move to next potential object */
+                addr += 8;
+                continue;
+            }
+
+            size_t obj_size = get_object_size(obj);
+            if (obj_size == 0 || addr + obj_size > (uintptr_t)segment_end) {
+                /* Invalid object size, skip */
+                addr += 8;
+                continue;
+            }
+
+            /* Check if object is marked */
+            if (obj->mark == BLACK) {
+                /* Object is live */
+                live_bytes += obj_size;
+                /* Move to next object */
+                addr += obj_size;
+                /* Round up to 8-byte alignment */
+                addr = (addr + 7) & ~7;
+            } else {
+                /* Object is garbage, create a free block */
+                gc_block_t *block = (gc_block_t*)addr;
+                block->size = obj_size;
+                block->next = NULL;
+
+                /* Free the object by calling its free function if needed */
+                gc_func_map[obj->tag].free(obj);
+
+                /* Add to free list */
+                if (prev_block) {
+                    prev_block->next = block;
+                } else {
+                    free_list = block;
+                }
+                prev_block = block;
+
+                freed_bytes += obj_size;
+                addr += obj_size;
+                /* Round up to 8-byte alignment */
+                addr = (addr + 7) & ~7;
+            }
+        }
+    }
+
+    /* Set the new free list */
+    thread_ctx->gc_state.local_mature->free_list = free_list;
+
+    /* Update heap usage statistics */
+    thread_ctx->gc_state.local_mature->allocated_size -= freed_bytes;
 
     /* Update statistics */
     end_time = get_current_time_ms();
 
     DEBUG_FPRINTF(stderr, "Thread %d: Local heap collection completed in %llu ms\n",
                  thread_ctx->thread_index, (unsigned long long)(end_time - start_time));
+    DEBUG_FPRINTF(stderr, "Thread %d: Freed %zu bytes, live data: %zu bytes\n",
+                 thread_ctx->thread_index, freed_bytes, live_bytes);
 
     /* Mark that we're no longer in GC */
     thread_ctx->in_gc = 0; /* false */
@@ -778,6 +946,14 @@ static void gc_collect_local_heap(struct gc_context *ctx) {
 static void gc_collect_shared_heap(void) {
     uint64_t start_time, end_time;
     int threads_to_wait_for;
+    struct gc_context *temp_ctx;
+    gc_segment_t *segment;
+    gc_block_t *free_list = NULL, *prev_block = NULL;
+    void *segment_start, *segment_end;
+    struct obj *obj;
+    size_t freed_bytes = 0;
+    size_t live_bytes = 0;
+    int i;
 
     DEBUG_FPRINTF(stderr, "Starting shared heap collection\n");
 
@@ -811,9 +987,10 @@ static void gc_collect_shared_heap(void) {
     /* Wait for all threads to stop */
     threads_to_wait_for = gc_global_state.active_threads;
     while (gc_global_state.gc_threads_waiting < threads_to_wait_for) {
-        /* TODO: Implement thread stopping mechanism */
-        /* For now, assume threads will cooperate and stop when requested */
+        /* Wait a bit for threads to notice the stop-the-world flag */
+        pthread_mutex_unlock(&gc_global_state.gc_mutex);
         usleep(1000); /* 1ms sleep */
+        pthread_mutex_lock(&gc_global_state.gc_mutex);
     }
 
     /* Track GC start time */
@@ -823,16 +1000,99 @@ static void gc_collect_shared_heap(void) {
     memset(gc_global_state.shared_heap->mark_bits, 0,
           gc_global_state.shared_heap->num_mark_bits / 8 + 1);
 
-    /* TODO: Implement mark phase for shared heap */
-    /* This requires tracing all roots from all threads */
+    /* Create a temporary GC context for marking */
+    temp_ctx = gc_make_context();
 
-    /* TODO: Implement sweep phase for shared heap */
+    /* Mark phase: Mark all roots from all active threads */
+    for (i = 0; i < gc_global_state.num_threads; i++) {
+        thread_context_t *thread_ctx = get_thread_context(i);
+        if (thread_ctx) {
+            /* Set the thread context in our temporary GC context */
+            temp_ctx->thread_ctx = thread_ctx;
 
-    /* Reset the free list to prepare for sweep */
+            /* Mark all roots from this thread */
+            gc_mark_roots(temp_ctx);
+        }
+    }
+
+    /* Process all grey objects until no more remain */
+    while (queue_gc_grey_nodes_len(&temp_ctx->grey_nodes) > 0) {
+        obj = queue_gc_grey_nodes_dequeue(&temp_ctx->grey_nodes);
+        gc_mark_obj(temp_ctx, obj);
+    }
+
+    /* Sweep phase: Free unmarked objects and rebuild the free list */
     gc_global_state.shared_heap->free_list = NULL;
 
-    /* TODO: Iterate through all segments and all objects, freeing unmarked ones
-       and rebuilding the free list */
+    /* Iterate through all segments in the shared heap */
+    for (segment = gc_global_state.shared_heap->segments; segment != NULL; segment = segment->next) {
+        segment_start = segment->start;
+        segment_end = (char*)segment_start + segment->size;
+
+        /* Adjust alignment to object boundaries */
+        uintptr_t addr = (uintptr_t)segment_start;
+        addr = (addr + 7) & ~7; /* Align to 8 bytes */
+
+        /* Iterate through the segment looking for objects */
+        while (addr < (uintptr_t)segment_end) {
+            obj = (struct obj*)addr;
+
+            /* Skip areas that are not valid objects */
+            if (addr + sizeof(struct obj) > (uintptr_t)segment_end ||
+                obj->tag < 1 || obj->tag > LAST_OBJ_TYPE) {
+                /* Move to next potential object */
+                addr += 8;
+                continue;
+            }
+
+            size_t obj_size = get_object_size(obj);
+            if (obj_size == 0 || addr + obj_size > (uintptr_t)segment_end) {
+                /* Invalid object size, skip */
+                addr += 8;
+                continue;
+            }
+
+            /* Check if object is marked */
+            if (obj->mark == BLACK) {
+                /* Object is live */
+                live_bytes += obj_size;
+                /* Move to next object */
+                addr += obj_size;
+                /* Round up to 8-byte alignment */
+                addr = (addr + 7) & ~7;
+            } else {
+                /* Object is garbage, create a free block */
+                gc_block_t *block = (gc_block_t*)addr;
+                block->size = obj_size;
+                block->next = NULL;
+
+                /* Free the object by calling its free function if needed */
+                gc_func_map[obj->tag].free(obj);
+
+                /* Add to free list */
+                if (prev_block) {
+                    prev_block->next = block;
+                } else {
+                    free_list = block;
+                }
+                prev_block = block;
+
+                freed_bytes += obj_size;
+                addr += obj_size;
+                /* Round up to 8-byte alignment */
+                addr = (addr + 7) & ~7;
+            }
+        }
+    }
+
+    /* Set the new free list */
+    gc_global_state.shared_heap->free_list = free_list;
+
+    /* Update heap usage statistics */
+    gc_global_state.shared_heap->allocated_size -= freed_bytes;
+
+    /* Free the temporary GC context */
+    gc_free_context(temp_ctx);
 
     /* Update statistics */
     end_time = get_current_time_ms();
@@ -841,6 +1101,8 @@ static void gc_collect_shared_heap(void) {
 
     DEBUG_FPRINTF(stderr, "Shared heap collection completed in %llu ms\n",
                  (unsigned long long)(end_time - start_time));
+    DEBUG_FPRINTF(stderr, "Freed %zu bytes, live data: %zu bytes\n",
+                 freed_bytes, live_bytes);
 
     /* End stop-the-world phase */
     gc_global_state.stop_the_world = false;
@@ -855,6 +1117,42 @@ static void gc_collect_shared_heap(void) {
     gc_global_state.shared_heap->in_collection = false;
     pthread_mutex_unlock(&gc_global_state.shared_heap->mutex);
 }
+
+/* Thread stopping mechanism - allows threads to check flag and pause execution */
+void gc_check_pause_for_collection(void) {
+    thread_context_t *ctx = get_current_thread_context();
+
+    if (!ctx) return;
+
+    /* Quick check without locking to avoid mutex overhead */
+    if (__atomic_load_n(&gc_global_state.stop_the_world, __ATOMIC_ACQUIRE)) {
+        /* We need to pause for collection */
+        pthread_mutex_lock(&gc_global_state.gc_mutex);
+
+        if (gc_global_state.stop_the_world) {
+            /* Increment waiting threads count */
+            gc_global_state.gc_threads_waiting++;
+
+            DEBUG_FPRINTF(stderr, "Thread %d stopping for GC\n", ctx->thread_index);
+
+            /* Mark that this thread is in GC pause */
+            ctx->in_gc = true;
+
+            /* Wait for collection to complete */
+            while (gc_global_state.stop_the_world) {
+                pthread_cond_wait(&gc_global_state.gc_cond, &gc_global_state.gc_mutex);
+            }
+
+            /* GC is done, we can continue */
+            ctx->in_gc = false;
+
+            DEBUG_FPRINTF(stderr, "Thread %d resuming after GC\n", ctx->thread_index);
+        }
+
+        pthread_mutex_unlock(&gc_global_state.gc_mutex);
+    }
+}
+
 
 /* Run a full GC (collect all threads and shared heap) */
 void gc_full(gc_flags_t flags) {
@@ -875,16 +1173,26 @@ void gc_full(gc_flags_t flags) {
     /* Wait for all threads to acknowledge */
     threads_to_wait_for = gc_global_state.active_threads;
     while (gc_global_state.gc_threads_waiting < threads_to_wait_for) {
-        /* TODO: Implement thread stopping mechanism */
-        /* For now, assume threads will cooperate and stop */
-        usleep(1000); /* 1ms sleep */
+        /* Use a condition variable instead of busy waiting */
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_nsec += 1000000; /* 1ms */
+        if (timeout.tv_nsec >= 1000000000) {
+            timeout.tv_sec++;
+            timeout.tv_nsec -= 1000000000;
+        }
+
+        /* Wait with timeout to check periodically */
+        pthread_cond_timedwait(&gc_global_state.gc_cond, &gc_global_state.gc_mutex, &timeout);
+
+        /* Log that we're waiting */
+        DEBUG_FPRINTF(stderr, "GC waiting for threads: %d/%d stopped\n",
+                     gc_global_state.gc_threads_waiting, threads_to_wait_for);
     }
 
     /* Collect nurseries for all threads */
     for (i = 0; i < gc_global_state.num_threads; i++) {
-        /* TODO: Access thread contexts for all threads, not just the current one */
-        /* For now, we only handle the current thread */
-        ctx = get_current_thread_context();
+        ctx = get_thread_context(i);
         if (ctx && ctx->thread_index == i) {
             gc_collect_nursery(ctx->gc_state.gc_ctx, true);
 
@@ -900,7 +1208,109 @@ void gc_full(gc_flags_t flags) {
     memset(gc_global_state.shared_heap->mark_bits, 0,
           gc_global_state.shared_heap->num_mark_bits / 8 + 1);
 
-    /* TODO: Implement mark and sweep for shared heap */
+    /* Create a temporary GC context for shared heap collection */
+    struct gc_context *shared_ctx = gc_make_context();
+    gc_segment_t *segment;
+    gc_block_t *free_list = NULL, *prev_block = NULL;
+    void *segment_start, *segment_end;
+    struct obj *obj;
+    size_t freed_bytes = 0;
+    size_t live_bytes = 0;
+
+    /* Mark phase: Mark all roots from all active threads */
+    for (i = 0; i < gc_global_state.num_threads; i++) {
+        thread_context_t *thread_ctx = get_thread_context(i);
+        if (thread_ctx) {
+            /* Set the thread context in our temporary GC context */
+            shared_ctx->thread_ctx = thread_ctx;
+
+            /* Mark all roots from this thread */
+            gc_mark_roots(shared_ctx);
+        }
+    }
+
+    /* Process all grey objects until no more remain */
+    while (queue_gc_grey_nodes_len(&shared_ctx->grey_nodes) > 0) {
+        obj = queue_gc_grey_nodes_dequeue(&shared_ctx->grey_nodes);
+        gc_mark_obj(shared_ctx, obj);
+    }
+
+    /* Sweep phase: Free unmarked objects and rebuild the free list */
+    gc_global_state.shared_heap->free_list = NULL;
+
+    /* Iterate through all segments in the shared heap */
+    for (segment = gc_global_state.shared_heap->segments; segment != NULL; segment = segment->next) {
+        segment_start = segment->start;
+        segment_end = (char*)segment_start + segment->size;
+
+        /* Adjust alignment to object boundaries */
+        uintptr_t addr = (uintptr_t)segment_start;
+        addr = (addr + 7) & ~7; /* Align to 8 bytes */
+
+        /* Iterate through the segment looking for objects */
+        while (addr < (uintptr_t)segment_end) {
+            obj = (struct obj*)addr;
+
+            /* Skip areas that are not valid objects */
+            if (addr + sizeof(struct obj) > (uintptr_t)segment_end ||
+                obj->tag < 1 || obj->tag > LAST_OBJ_TYPE) {
+                /* Move to next potential object */
+                addr += 8;
+                continue;
+            }
+
+            size_t obj_size = get_object_size(obj);
+            if (obj_size == 0 || addr + obj_size > (uintptr_t)segment_end) {
+                /* Invalid object size, skip */
+                addr += 8;
+                continue;
+            }
+
+            /* Check if object is marked */
+            if (obj->mark == BLACK) {
+                /* Object is live */
+                live_bytes += obj_size;
+                /* Move to next object */
+                addr += obj_size;
+                /* Round up to 8-byte alignment */
+                addr = (addr + 7) & ~7;
+            } else {
+                /* Object is garbage, create a free block */
+                gc_block_t *block = (gc_block_t*)addr;
+                block->size = obj_size;
+                block->next = NULL;
+
+                /* Free the object by calling its free function if needed */
+                gc_func_map[obj->tag].free(obj);
+
+                /* Add to free list */
+                if (prev_block) {
+                    prev_block->next = block;
+                } else {
+                    free_list = block;
+                }
+                prev_block = block;
+
+                freed_bytes += obj_size;
+                addr += obj_size;
+                /* Round up to 8-byte alignment */
+                addr = (addr + 7) & ~7;
+            }
+        }
+    }
+
+    /* Set the new free list */
+    gc_global_state.shared_heap->free_list = free_list;
+
+    /* Update heap usage statistics */
+    gc_global_state.shared_heap->allocated_size -= freed_bytes;
+
+    /* Free the temporary GC context */
+    gc_free_context(shared_ctx);
+
+    /* Log statistics */
+    DEBUG_FPRINTF(stderr, "Shared heap: Freed %zu bytes, live data: %zu bytes\n",
+                 freed_bytes, live_bytes);
 
     /* End stop-the-world phase */
     gc_global_state.stop_the_world = false;
@@ -1007,6 +1417,9 @@ void gc_free(void *ptr) {
 /* This part of the code is kept from the original implementation */
 /* It handles copying objects to the heap */
 struct obj *gc_toheap(struct gc_context *ctx, struct obj *obj) {
+  /* Check if we need to pause for collection */
+  gc_check_pause_for_collection();
+
   if (!obj) {
     return NULL;
   }

@@ -193,6 +193,9 @@ void gc_mark_roots(struct gc_context *ctx);
 /* Write barrier for inter-generational or inter-thread references */
 void gc_write_barrier(struct obj *obj, struct obj **field_ptr, struct obj *new_value);
 
+/* Thread stopping mechanism - allows threads to check flag and pause execution */
+void gc_check_pause_for_collection(void);
+
 /* Various helper functions */
 void gc_heap_maintain(void);
 void gc_free_noop(struct obj *);
