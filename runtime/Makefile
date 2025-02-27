@@ -53,6 +53,13 @@ CK_BUILD_DIR = $(CK_DIR)/out
 CK_STATIC_LIB = $(CK_BUILD_DIR)/lib/libck.a
 CK_INCLUDE = $(CK_BUILD_DIR)/include
 
+# libtommath
+LTM_DIR = $(DEPS_ROOT)/libtommath
+LTM_REPO = https://github.com/libtom/libtommath.git
+LTM_BUILD_DIR = $(LTM_DIR)/out/release
+LTM_STATIC_LIB = $(LTM_BUILD_DIR)/libtommath.a
+LTM_INCLUDE = $(LTM_DIR)
+
 # SANITIZE variable controls the sanitizer mode
 SANITIZE ?=
 
@@ -72,6 +79,7 @@ SRCS = gc.c base.c builtin.c bit_array.c
 ALL_CFLAGS = $(CFLAGS) $(SAN_FLAGS)
 MIMALLOC_CFLAGS = -I$(MIMALLOC_INCLUDE)
 CK_CFLAGS = -I$(CK_INCLUDE)
+LTM_CFLAGS = -I$(LTM_INCLUDE)
 
 TESTS = test_queue
 
@@ -141,12 +149,43 @@ $(CK_STATIC_LIB):
 	)
 
 # =============================================================
-# Object file rules - depend on mimalloc being built first
+# LibTomMath build target - with shared caching
+# =============================================================
+.PHONY: libtommath
+
+libtommath: $(LTM_STATIC_LIB)
+
+$(LTM_STATIC_LIB):
+	$(call log,Setting up libtommath)
+	$(call log,Checking if libtommath is already built...)
+	$(if $(wildcard $(TLTM_STATIC_LIB)),\
+		$(call log,libtommath already built at $(LTM_STATIC_LIB) ✅),\
+		$(call log,libtommath needs to be built);\
+		mkdir -p $(DEPS_ROOT);\
+		$(if $(wildcard $(LTM_DIR)),\
+			$(call log,libtommath already cloned, proceeding with build),\
+			$(call log,Cloning libtommath to shared location...);\
+			git clone $(LTM_REPO) $(LTM_DIR));\
+		$(call log,Creating build directory $(LTM_BUILD_DIR));\
+		mkdir -p $(LTM_BUILD_DIR);\
+		$(call log,Configuring libtommath with cmake...);\
+		cd $(LTM_BUILD_DIR) && \
+		cmake $(LTM_DIR) -DCMAKE_BUILD_TYPE=Release \
+			$(CMAKE_EXTRA_FLAGS);\
+		$(call log,Building libtommath...);\
+		cd $(LTM_BUILD_DIR) && $(MAKE);\
+		touch $(LTM_STATIC_LIB);\
+		$(call log,libtommath built successfully at $(LTM_STATIC_LIB) ✅)\
+	)
+
+# =============================================================
+# Object file rules
+# Depend on mimalloc, ck and libtommath being built first
 # =============================================================
 
-%.o: %.c | mimalloc ck
+%.o: %.c | mimalloc ck libtommath
 	$(call log,Building $@)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $(CK_CFLAGS) -c $< -o $@)
+	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $(CK_CFLAGS) $(LTM_CFLAGS) -c $< -o $@)
 
 # =============================================================
 # Main executable
@@ -154,7 +193,7 @@ $(CK_STATIC_LIB):
 
 compiled_result: compiled_result.c gc.o base.o builtin.o bit_array.o
 	$(call log,Building compiled_result)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $(CK_CFLAGS) $^ $(MIMALLOC_STATIC_LIB) $(CK_STATIC_LIB) -o $@)
+	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $(CK_CFLAGS) $(LTM_CFLAGS )$^ $(MIMALLOC_STATIC_LIB) $(CK_STATIC_LIB) $(LTM_STATIC_LIB) -o $@)
 
 # =============================================================
 # Test targets
@@ -162,7 +201,7 @@ compiled_result: compiled_result.c gc.o base.o builtin.o bit_array.o
 
 test_queue: test_queue.c | mimalloc ck
 	$(call log,Building test_queue)
-	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $(CK_CFLAGS) $< $(MIMALLOC_STATIC_LIB) $(CK_STATIC_LIB) -o $@)
+	$(call log_cmd,$(CC) $(ALL_CFLAGS) $(MIMALLOC_CFLAGS) $(CK_CFLAGS) $(LTM_CFLAGS) $< $(MIMALLOC_STATIC_LIB) $(CK_STATIC_LIB) $(LTM_STATIC_LIB) -o $@)
 
 # Note that test_base.c is not found, so removing it from the test targets
 .PHONY: test
@@ -191,6 +230,7 @@ show-flags:
 	$(call log,ALL_CFLAGS: $(ALL_CFLAGS))
 	$(call log,MIMALLOC_CFLAGS: $(MIMALLOC_CFLAGS))
 	$(call log,CK_CFLAGS: $(CK_CFLAGS))
+	$(call log,LTM_CFLAGS: $(LTM_CFLAGS))
 	$(call log,SANITIZE: $(SANITIZE))
 	$(call log,SAN_FLAGS: $(SAN_FLAGS))
 	$(call log,DEPS_ROOT: $(DEPS_ROOT))
@@ -216,6 +256,11 @@ clean-mimalloc:
 clean-ck:
 	$(call log,Cleaning ck build directory)
 	-rm -rf $(MIMALLOC_BUILD_DIR)
+
+
+clean-libtommath:
+	$(call log,Cleaning libtommath build directory)
+	-rm -rf $(LTM_BUILD_DIR)
 
 clean-all: clean
 	$(call log,Cleaning all shared dependencies)

@@ -1,0 +1,1019 @@
+diff --git a/src/Zayin/Codegen.hs b/src/Zayin/Codegen.hs
+index 0f83b0a..1d28d48 100644
+--- a/src/Zayin/Codegen.hs
++++ b/src/Zayin/Codegen.hs
+@@ -9,7 +9,8 @@ module Zayin.Codegen
+   )
+ where
+ 
+-import Control.Monad (forM_, when)
++import Control.Applicative ((<|>))
++import Control.Monad (forM, forM_, void, when)
+ import Control.Monad.IO.Class
+ import Control.Monad.Logger
+ import Control.Monad.State
+@@ -18,7 +19,7 @@ import Data.Foldable (traverse_)
+ import Data.HashMap.Strict (HashMap)
+ import qualified Data.HashMap.Strict as HashMap
+ import qualified Data.Map as Map
+-import Data.Maybe (fromMaybe)
++import Data.Maybe (fromMaybe, mapMaybe)
+ import qualified Data.Set as Set
+ import qualified Data.Text as T
+ import Zayin.LiftedExpr
+@@ -28,6 +29,8 @@ data CType
+   = TVoid
+   | TPtr CType
+   | TStruct T.Text
++  | TPrim T.Text  -- For basic types like int, char, etc.
++  | TArray Int CType  -- For array types
+   deriving (Show, Eq)
+ 
+ data CExpr
+@@ -37,9 +40,12 @@ data CExpr
+   | ELitBool Bool
+   | EBinOp T.Text CExpr CExpr
+   | EPreUnOp T.Text CExpr
+-  | EArrow CExpr T.Text
++  | EArrow CExpr T.Text         -- For pointer member access (p->member)
++  | EMember CExpr T.Text        -- For direct member access (obj.member)
++  | EIndex CExpr CExpr          -- For array indexing (arr[idx])
+   | ECast CExpr CType
+-  | EMacroCall T.Text [CExpr]
++  | EMacroCall String [CExpr]
++  | ETernary CExpr CExpr CExpr  -- condition ? then : else
+   | ENull
+   deriving (Show, Eq)
+ 
+@@ -51,27 +57,10 @@ data CStmt
+   deriving (Show, Eq)
+ 
+ data CDecl
+-  = DStruct
+-      { dName :: T.Text,
+-        dMembers :: [(T.Text, CType)]
+-      }
+-  | DFunProto
+-      { dName :: T.Text,
+-        dRetType :: CType,
+-        dParams :: [(T.Text, CType)],
+-        dNoreturn :: Bool
+-      }
+-  | DFun
+-      { dName :: T.Text,
+-        dRetType :: CType,
+-        dParams :: [(T.Text, CType)],
+-        dBody :: [CStmt]
+-      }
+-  | DVar
+-      { dName :: T.Text,
+-        dType :: CType,
+-        dInit :: Maybe CExpr
+-      }
++  = DStruct {dName :: T.Text, dMembers :: [(T.Text, CType)]}
++  | DFunProto {dName :: T.Text, dRetType :: CType, dParams :: [(T.Text, CType)], dNoreturn :: Bool, dStatic :: Bool}
++  | DFun {dName :: T.Text, dRetType :: CType, dParams :: [(T.Text, CType)], dBody :: [CStmt], dComment :: Maybe T.Text, dStatic :: Bool}
++  | DVar {dName :: T.Text, dType :: CType, dInit :: Maybe CExpr}
+   deriving (Show, Eq)
+ 
+ data CodegenCtx = CodegenCtx
+@@ -81,11 +70,73 @@ data CodegenCtx = CodegenCtx
+     ctxStmts :: [CStmt],
+     ctxLambdas :: HashMap Int LiftedLambda,
+     ctxLambdaEnvs :: HashMap Int T.Text,
+-    ctxDebugMode :: Bool -- Added debug flag to context
++    ctxDebugMode :: Bool, -- Added debug flag to context
++    ctxUsedArities :: Set.Set Int,
++    ctxContinuations :: HashMap Int Int
+   }
+ 
+ initialCtx :: Bool -> HashMap Int LiftedLambda -> CodegenCtx
+-initialCtx debugMode lambdas = CodegenCtx 0 [] [] [] lambdas HashMap.empty debugMode
++initialCtx debugMode lambdas = CodegenCtx 0 [] [] [] lambdas HashMap.empty debugMode Set.empty (buildContinuationMap lambdas)
++
++buildContinuationMap :: HashMap Int LiftedLambda -> HashMap Int Int
++buildContinuationMap lambdas =
++  let -- First pass: Find explicit continuations in lambda bodies
++      explicitContinuations =
++        HashMap.fromList $ mapMaybe findExplicitContinuation $ HashMap.toList lambdas
++
++      -- Second pass: For lambdas without explicit continuations, use heuristics
++      allContinuations =
++        foldr addHeuristicContinuation explicitContinuations $
++        filter (\(id, _) -> not $ HashMap.member id explicitContinuations) $
++        HashMap.toList lambdas
++  in
++      allContinuations
++  where
++    findExplicitContinuation (id, lambda) =
++      case findContinuationInBody id (body lambda) of
++        Just contId -> Just (id, contId)
++        Nothing -> Nothing
++
++    -- Heuristic: If lambda ID n doesn't have an explicit continuation,
++    -- assume it's lambda ID n+1 if that exists
++    addHeuristicContinuation (id, _) contMap =
++      if HashMap.member (id + 1) lambdas
++        then HashMap.insert id (id + 1) contMap
++        else contMap  -- Keep the map unchanged if no reasonable heuristic
++
++debugCallGraph :: HashMap Int Int -> Bool -> Codegen ()
++debugCallGraph continuationMap debugMode = when debugMode $ do
++  logDebugN "== Call Graph Analysis =="
++  forM_ (HashMap.toList continuationMap) $ \(from, to) ->
++    logDebugN $ "Lambda " <> T.pack (show from) <> " continues to Lambda " <> T.pack (show to)
++  logDebugN "=========================="
++
++
++-- Function to find the continuation ID in a lambda body by analyzing its structure
++findContinuationInBody :: Int -> LExpr -> Maybe Int
++findContinuationInBody currentId expr = case expr of
++  -- Direct lambda calls - highest priority
++  CallOne (Lifted nextId) _ -> Just nextId
++  CallTwo (Lifted nextId) _ _ -> Just nextId
++
++  -- Continuation argument passing - common in CPS
++  CallOne _ (Lifted nextId) -> Just nextId
++  CallTwo _ _ (Lifted nextId) -> Just nextId
++
++  -- Look for return_direct calls - these are explicit continuations
++  SetThen _ _ nextExpr -> findContinuationInBody currentId nextExpr
++
++  -- For if expressions, check both branches with preference for the "then" branch
++  If _ thenExpr elseExpr ->
++    findContinuationInBody currentId thenExpr <|>
++    findContinuationInBody currentId elseExpr
++
++  -- Special case for sequence of operations
++  CallOne (Var _) (CallTwo (Lifted nextId) _ _) -> Just nextId
++
++  -- For other expressions, we don't find a continuation
++  _ -> Nothing
++
+ 
+ type Codegen a = LoggingT (StateT CodegenCtx IO) a
+ 
+@@ -107,6 +158,76 @@ genVar = do
+   varId <- genVarId
+   return $ "var_" <> T.pack (show varId)
+ 
++-- Mangle a Scheme identifier to a valid C identifier
++mangle :: T.Text -> T.Text
++mangle name =
++  let
++    -- Replace special characters with C-safe alternatives
++    replace c
++      | c == '-' = "_"  -- Common in Scheme identifiers
++      | c == '?' = "_QMARK_"
++      | c == '!' = "_BANG_"
++      | c == '<' = "_LT_"
++      | c == '>' = "_GT_"
++      | c == '=' = "_EQ_"
++      | c == '+' = "_PLUS_"
++      | c == '*' = "_STAR_"
++      | c == '/' = "_SLASH_"
++      | c == '%' = "_PERCENT_"
++      | c == '&' = "_AMPERSAND_"
++      | c == ':' = "_COLON_"
++      | c == '.' = "_DOT_"
++      | c == '$' = "_DOLLAR_"
++      | c == '@' = "_AT_"
++      | c == '#' = "_HASH_"
++      | c == '~' = "_TILDE_"
++      | c == '^' = "_CARET_"
++      | c == '`' = "_BACKTICK_"
++      | c == '\'' = "_QUOTE_"
++      | c == '\"' = "_DQUOTE_"
++      | c == '\\' = "_BACKSLASH_"
++      | c == '|' = "_PIPE_"
++      | otherwise = T.singleton c
++
++    -- Replace each character
++    replaced = T.concatMap replace name
++
++    -- Ensure the name doesn't start with a digit (not valid in C)
++    prefixed = if T.null replaced
++               then "var"  -- Empty names aren't valid
++               else if isDigit (T.head replaced)
++                    then "r_" <> replaced  -- Prefix with r_ if starts with digit
++                    else replaced
++
++    -- Add prefix for Scheme special forms and lambda variables
++    special = if T.isPrefixOf "k$" prefixed
++              then "k_" <> T.drop 2 prefixed  -- continuation variables
++              else if T.isPrefixOf "self$" prefixed
++                   then "self_" <> T.drop 5 prefixed  -- self/closure variables
++                   else prefixed
++  in
++    special
++  where
++    isDigit c = c >= '0' && c <= '9'
++
++-- Mangle a global variable name
++mangleGlobal :: T.Text -> T.Text
++mangleGlobal name =
++  let base = mangle name
++  in "global_" <> base  -- Add prefix to avoid conflicts with local variables
++
++markArity :: Int -> Codegen ()
++markArity arity =
++  when (arity >= 0 && arity <= 10000) $ -- Maximum arity check
++    lift $ modify $ \ctx ->
++      ctx { ctxUsedArities = Set.insert arity (ctxUsedArities ctx) }
++
++markDefaultArities :: Codegen ()
++markDefaultArities = do
++  markArity 0
++  markArity 1
++  markArity 2
++
+ addProto :: CDecl -> Codegen ()
+ addProto proto = lift $ modify $ \ctx ->
+   ctx {ctxProtos = proto : ctxProtos ctx}
+@@ -123,10 +244,10 @@ clearStmts :: Codegen ()
+ clearStmts = lift $ modify $ \ctx ->
+   ctx {ctxStmts = []}
+ 
++-- A function to name free variables
+ nameForFreeVar :: T.Text -> T.Text
+ nameForFreeVar name =
+-  let sanitized = T.map (\c -> if isAlphaNum c then c else '_') name
+-   in "v_" <> sanitized
++  "v_" <> mangle name  -- Prefix with v_ for variables
+ 
+ withStmtScope :: Codegen a -> Codegen (a, [CStmt])
+ withStmtScope action = do
+@@ -152,7 +273,7 @@ withStmtScope action = do
+   return (result, reverse newStmts)
+ 
+ objectType :: CType
+-objectType = TPtr (TStruct "obj")
++objectType = TPtr (TStruct "object")
+ 
+ envStruct :: LiftedLambda -> Codegen CDecl
+ envStruct lambda = do
+@@ -214,27 +335,23 @@ makeEnvCode lambda parentEnv = do
+ generateClosure :: LiftedLambda -> CExpr -> Codegen CExpr
+ generateClosure lambda currentEnv = do
+   logDebugWhen $ "Generating closure for lambda: " <> T.pack (show $ lambdaId lambda)
+-  (closureExpr, newStmts) <- withStmtScope $ do
+-    envExpr <- makeEnvCode lambda currentEnv
+ 
+-    let initName = case length (params lambda) of
+-          1 -> "OBJECT_CLOSURE_ONE_NEW"
+-          2 -> "OBJECT_CLOSURE_TWO_NEW"
+-          n -> error $ "closure had " ++ show n ++ " parameters"
++  -- Create a variable name for the closure
++  varName <- genVar
+ 
+-    varName <- genVar
+-    addStmt $
+-      SExpr $
+-        EMacroCall
+-          initName
+-          [ EVar varName,
+-            EVar $ "lambda_" <> T.pack (show $ lambdaId lambda),
+-            envExpr
+-          ]
+-    return $ EVar varName
++  -- Generate function name in Cyclone format
++  let lambdaName = "__lambda_" <> T.pack (show $ lambdaId lambda)
++
++  -- In Cyclone's style, use mclosure0
++  addStmt $ SExpr $ EMacroCall "mclosure0" [EVar varName, EVar lambdaName]
+ 
+-  traverse_ addStmt newStmts
+-  return closureExpr
++  -- Set number of arguments if needed
++  when (not (null (params lambda))) $ do
++    addStmt $ SExpr $ EBinOp "="
++                           (EMember (EVar varName) "num_args")  -- var.num_args (not var->num_args)
++                           (ELitInt $ fromIntegral $ length $ params lambda)
++
++  return $ EVar varName
+ 
+ generateEnvCast :: LiftedLambda -> CExpr -> CExpr
+ generateEnvCast lambda expr =
+@@ -273,101 +390,242 @@ mapExceptLastM f (x : xs@(_ : _)) = do
+ generateFunc :: LiftedLambda -> Codegen ()
+ generateFunc lambda = do
+   logDebugWhen $ "=== generateFunc for lambda: " <> T.pack (show (lambdaId lambda)) <> " ==="
+-  -- Compute the "captured" parameters (those not marked unused)
+-  paramNames <-
+-    mapM
+-      ( \p -> do
+-          pn <- genVar
+-          return ((nameForFreeVar p), pn)
+-      )
+-      (params lambda)
+-
+-  paramNamesToTypes <-
+-    mapM
+-      ( \(_, n) -> do
+-          return (n, objectType)
+-      )
+-      paramNames
+ 
+-  let captured = Set.fromList (fmap (\(o, n) -> o) (filter (\(o, n) -> (not (T.isPrefixOf "v__unused" o))) paramNames))
+-      freeVarNames = Set.fromList (fmap nameForFreeVar (Set.toList (freeVars lambda)))
+-      allowedSet = Set.union (Set.union freeVarNames captured) (Set.fromList ["env"])
+-      envObjType = TPtr (TStruct "env_obj")
+-      allParams = paramNamesToTypes ++ [("env_in", envObjType)]
+-  logDebugWhen $
+-    "generateFunc for lambda "
+-      <> T.pack (show (lambdaId lambda))
+-      <> ": captured = "
+-      <> T.pack (show (Set.toList captured))
+-      <> ", allowedSet = "
+-      <> T.pack (show (Set.toList allowedSet))
+-      <> ", params = "
+-      <> T.pack (show (params lambda))
+-      <> ", paramNames = "
+-      <> T.pack (show paramNames)
+-      <> ", paramNamesToTypes = "
+-      <> T.pack (show paramNamesToTypes)
+-      <> ", allParams= "
+-      <> T.pack (show allParams)
++  -- Add prototype in Cyclone format
+   addProto
+     DFunProto
+-      { dName = "lambda_" <> T.pack (show (lambdaId lambda)),
++      { dName = "__lambda_" <> T.pack (show (lambdaId lambda)),
+         dRetType = TVoid,
+-        dParams = allParams,
+-        dNoreturn = True
++        dParams = [("data", TPtr TVoid),         -- void *data
++                  ("clo", TStruct "object"), -- object _
++                  ("argc", TPrim "int"),         -- int argc
++                  ("args", TPtr (TStruct "object"))], -- object *args
++        dNoreturn = False,
++        dStatic = True  -- Add static modifier
+       }
+-  envVarName <- genVar -- Generate a fresh variable name before entering the scope
++
++  -- Generate function body
+   (bodyExpr, bodyStmts) <- withStmtScope $ do
+-    let envMove =
++    -- Access arguments based on pattern matching against the type of lambda
++    case (params lambda) of
++      [] -> do
++        -- No parameters, just generate the body
++        void $ generateBodyAndReturn lambda (EVar "data")
++
++      [param] -> do
++        -- One parameter - using array indexing syntax
++        addStmt $
+           SDecl $
+             DVar
+-              { dName = envVarName,
+-                dType = TPtr (TStruct ("env_" <> T.pack (show (lambdaId lambda)))),
+-                dInit = Just $ generateEnvCast lambda (EVar "env_in")
++              { dName = mangle param,
++                dType = TStruct "object",
++                dInit = Just $ EIndex (EVar "args") (ELitInt 0) -- args[0] syntax
+               }
+-    addStmt envMove
++        void $ generateBodyAndReturn lambda (EVar "data")
+ 
+-    -- Add parameter cell initialization
+-    forM_ paramNames $ \(dv, iv) -> do
+-      -- Skip unused parameters
+-      when (dv `Set.member` allowedSet) $ do
+-        tmpVar <- genVar
+-
+-        -- Create new cell object
++      [param1, param2] -> do
++        -- Two parameters
+         addStmt $
+-          SExpr $
+-            EMacroCall
+-              "OBJECT_CELL_OBJ_NEW"
+-              [ EVar tmpVar,
+-                EVar iv
+-              ]
+-
+-        -- Assign to environment
++          SDecl $
++            DVar
++              { dName = mangle param1,
++                dType = TStruct "object",
++                dInit = Just $ EIndex (EVar "args") (ELitInt 0) -- args[0]
++              }
+         addStmt $
+-          SExpr $
+-            EBinOp
+-              "="
+-              (EArrow (EVar envVarName) dv)
+-              (EVar tmpVar)
+-
+-    -- Generate the lambda body using the new environment variable.
+-    expr <- doCodegen (body lambda) (EVar envVarName)
+-    addStmt $ SExpr expr
+-    addStmt $ SExpr $ EMacroCall "__builtin_unreachable" []
+-    return expr
+-  -- Filter out any assignments in the generated body that copy fields not in allowedSet.
+-  filteredStmts <- filterEnvAssignments bodyStmts allowedSet
+-  -- Record the environment variable for this lambda.
+-  lift $ modify $ \ctx ->
+-    ctx {ctxLambdaEnvs = HashMap.insert (lambdaId lambda) envVarName (ctxLambdaEnvs ctx)}
++          SDecl $
++            DVar
++              { dName = mangle param2,
++                dType = TPtr (TStruct "object"),
++                dInit = Just $ EIndex (EVar "args") (ELitInt 1) -- args[1]
++              }
++        void $ generateBodyAndReturn lambda (EVar "data")
++
++      _ -> do
++        -- More parameters (unlikely in simple examples)
++        void $ generateBodyAndReturn lambda (EVar "data")
++
++    -- Return empty expression since we've already added returns
++    return $ ELitInt 0
++
++  -- Add the function definition with comments matching Cyclone's style
++  let paramComment = formatParamComment (params lambda)
+   addDecl
+     DFun
+-      { dName = "lambda_" <> T.pack (show (lambdaId lambda)),
++      { dName = "__lambda_" <> T.pack (show (lambdaId lambda)),
+         dRetType = TVoid,
+-        dParams = allParams,
+-        dBody = filteredStmts
++        dParams = [("data", TPtr TVoid),         -- void *data
++                  ("_", TStruct "object"),       -- object _
++                  ("argc", TPrim "int"),         -- int argc
++                  ("args", TPtr (TStruct "object"))], -- object *args
++        dBody = bodyStmts,
++        dComment = Just paramComment,  -- Add the parameter comment
++        dStatic = True  -- Add static modifier
+       }
+ 
++-- Format parameter comment in Cyclone style
++formatParamComment :: [T.Text] -> T.Text
++formatParamComment [] = "closure _"
++formatParamComment [p] = "closure _,object " <> p
++formatParamComment params =
++  "closure _," <> T.intercalate "," (map (\p -> "object " <> p) params)
++
++-- Generate body expression and add appropriate return statement
++generateBodyAndReturn :: LiftedLambda -> CExpr -> Codegen CExpr
++generateBodyAndReturn lambda env = do
++  case body lambda of
++    -- Direct function call with integer literal
++    Lit (LInt n) ->
++      -- Handle simple integer return like Cyclone does
++      do
++        nextLambdaId <- getNextLambdaId lambda
++        addStmt $ SExpr $ EMacroCall "return_direct1"
++          [EVar "data",
++           EVar ("__lambda_" <> T.pack (show nextLambdaId)),
++           EMacroCall "obj_int2obj" [ELitInt n]]
++        return $ ELitInt n
++
++    -- Call to a built-in function - simplify this case
++    CallOne (BuiltinIdent name) arg -> do
++      -- Get next lambda ID directly
++      nextLambdaId <- getNextLambdaId lambda
++
++      -- Generate code for the argument
++      argExpr <- doCodegen arg env
++
++      -- Return directly to next lambda with the result of built-in call
++      -- This is more similar to Cyclone's approach
++      addStmt $ SExpr $ EMacroCall "return_direct1"
++        [EVar "data",
++         EVar ("__lambda_" <> T.pack (show nextLambdaId)),
++         EMacroCall (T.unpack name) [env, argExpr]]
++
++      return $ ELitInt 0  -- Return value doesn't matter here
++
++    -- Function call with two arguments - simplify similarly
++    CallTwo fn arg1 arg2 -> do
++      nextLambdaId <- getNextLambdaId lambda
++
++      -- For arithmetic operations like +
++      case fn of
++        BuiltinIdent "zyn_sum" -> do
++          arg1Expr <- doCodegen arg1 env
++          arg2Expr <- doCodegen arg2 env
++
++          -- Create a temporary array for arguments
++          tmpArrayVar <- genVar
++          addStmt $ SDecl $ DVar
++            { dName = tmpArrayVar,
++              dType = TArray 1 (TStruct "object"),
++              dInit = Nothing
++            }
++
++          -- Set the first (and only) argument in the array
++          addStmt $ SExpr $ EBinOp "="
++            (EIndex (EVar tmpArrayVar) (ELitInt 0))
++            arg1Expr
++
++          -- Direct return with the sum result
++          addStmt $ SExpr $ EMacroCall "return_direct1"
++            [EVar "data",
++             EVar ("__lambda_" <> T.pack (show nextLambdaId)),
++             EMacroCall "zyn_sum" [env, EVar tmpArrayVar, ELitInt 2, arg1Expr, arg2Expr]]
++
++          return $ ELitInt 0
++
++        BuiltinIdent "+" -> do
++          -- Similar to zyn_sum case
++          arg1Expr <- doCodegen arg1 env
++          arg2Expr <- doCodegen arg2 env
++
++          -- Create a temporary array for arguments
++          tmpArrayVar <- genVar
++          addStmt $ SDecl $ DVar
++            { dName = tmpArrayVar,
++              dType = TArray 1 (TStruct "object"),
++              dInit = Nothing
++            }
++
++          -- Set the first (and only) argument in the array
++          addStmt $ SExpr $ EBinOp "="
++            (EIndex (EVar tmpArrayVar) (ELitInt 0))
++            arg1Expr
++
++          addStmt $ SExpr $ EMacroCall "return_direct1"
++            [EVar "data",
++             EVar ("__lambda_" <> T.pack (show nextLambdaId)),
++             EMacroCall "zyn_sum" [env, EVar tmpArrayVar, ELitInt 2, arg1Expr, arg2Expr]]
++
++          return $ ELitInt 0
++
++        -- General case - simplify similarly
++        _ -> do
++          fnExpr <- doCodegen fn env
++          arg1Expr <- doCodegen arg1 env
++          arg2Expr <- doCodegen arg2 env
++
++          -- Create a temporary array for arguments
++          tmpArrayVar <- genVar
++          addStmt $ SDecl $ DVar
++            { dName = tmpArrayVar,
++              dType = TArray 2 (TStruct "object"),
++              dInit = Nothing
++            }
++
++          -- Set the arguments in the array
++          addStmt $ SExpr $ EBinOp "="
++            (EIndex (EVar tmpArrayVar) (ELitInt 0))
++            arg1Expr
++          addStmt $ SExpr $ EBinOp "="
++            (EIndex (EVar tmpArrayVar) (ELitInt 1))
++            arg2Expr
++
++          addStmt $ SExpr $ EMacroCall "return_direct1"
++            [EVar "data",
++             EVar ("__lambda_" <> T.pack (show nextLambdaId)),
++             EMacroCall "zyn_apply" [env, fnExpr, ELitInt 2, EVar tmpArrayVar]]
++
++          return $ ELitInt 0
++
++    -- Default case - generate expression and return directly
++    _ -> do
++      expr <- doCodegen (body lambda) env
++      nextLambdaId <- getNextLambdaId lambda
++      addStmt $ SExpr $ EMacroCall "return_direct1" [env, EVar ("__lambda_" <> T.pack (show nextLambdaId)), expr]
++      return expr
++
++
++-- Helper function to determine the ID of the next lambda in the continuation chain
++getNextLambdaId :: LiftedLambda -> Codegen Int
++getNextLambdaId lambda = do
++  let currentId = lambdaId lambda
++  ctx <- lift get
++
++  -- Look up the continuation in our map
++  case HashMap.lookup currentId (ctxContinuations ctx) of
++    Just nextId -> do
++      -- Found a continuation in our graph
++      logDebugWhen $ "Next lambda ID for " <> T.pack (show currentId)
++                   <> " found in call graph: " <> T.pack (show nextId)
++      return nextId
++
++    Nothing -> do
++      -- Fall back to a heuristic based on lambda ID sequence
++      let nextIdGuess = currentId + 1
++          maxId = maximum $ 0 : HashMap.keys (ctxLambdas ctx)
++
++      if nextIdGuess <= maxId && HashMap.member nextIdGuess (ctxLambdas ctx)
++        then do
++          logDebugWhen $ "Warning: No continuation found for lambda " <> T.pack (show currentId)
++                      <> ", using heuristic next ID: " <> T.pack (show nextIdGuess)
++          return nextIdGuess
++        else do
++          -- If we're at the end, use the first lambda as a reasonable default
++          -- This covers the case of recursive functions that return to the beginning
++          logDebugWhen $ "Warning: No continuation found for lambda " <> T.pack (show currentId)
++                      <> ", using default exit continuation"
++          return 0  -- Default to 0, typically reserved for exit/halt
++
+ builtinIdentCodegen :: T.Text -> Codegen CExpr
+ builtinIdentCodegen ident = do
+   let (numParams, runtimeName) = case ident of
+@@ -422,150 +680,290 @@ builtinIdentCodegen ident = do
+ 
+ doCodegen :: LExpr -> CExpr -> Codegen CExpr
+ doCodegen expr currentEnv = do
+-  logDebugWhen $ "doCodegen processing expression: " <> T.pack (show expr)
+   case expr of
+-    Var name -> do
+-      logDebugWhen $ "Processing variable: " <> name
+-      return $
+-        EArrow
+-          ( ECast
+-              (EArrow currentEnv (nameForFreeVar name))
+-              (TPtr $ TStruct "cell_obj")
+-          )
+-          "val"
+-    Lit lit -> do
+-      logDebugWhen $ "Processing literal: " <> T.pack (show lit)
++    Var name ->
++      return $ EVar $ mangle name
++
++    Lit lit ->
+       case lit of
+-        LString s -> do
+-          dest <- genVar
+-          addStmt $
+-            SExpr $
+-              EMacroCall
+-                "OBJECT_STRING_OBJ_NEW"
+-                [EVar dest, ELitStr s]
+-          return $ EVar dest
+-        LInt i -> do
+-          dest <- genVar
+-          addStmt $
+-            SExpr $
+-              EMacroCall
+-                "OBJECT_INT_OBJ_NEW"
+-                [EVar dest, ELitInt i]
+-          return $ EVar dest
+-        LBool True -> do
+-          dest <- genVar
+-          addStmt $
+-            SExpr $
+-              EMacroCall
+-                "OBJECT_BOOL_OBJ_NEW"
+-                [EVar dest, ELitBool True]
+-          return $ EVar dest
+-        LBool False -> do
+-          dest <- genVar
+-          addStmt $
+-            SExpr $
+-              EMacroCall
+-                "OBJECT_BOOL_OBJ_NEW"
+-                [EVar dest, ELitBool False]
+-          return $ EVar dest
+-        LNil -> return ENull
+-    BuiltinIdent ident -> builtinIdentCodegen ident
+-    SetThen var val cont -> do
+-      -- First do environment setup for the value if it's a closure
+-      valExpr <- doCodegen val currentEnv
+-      let resolvedName = nameForFreeVar var
+-      -- Get the cell ready
+-      cellVar <- genVar
+-      addStmt $
+-        SExpr $
+-          EMacroCall
+-            "OBJECT_CELL_OBJ_NEW"
+-            [ EVar cellVar,
+-              valExpr
+-            ]
+-      -- Do the set using the cell we created
+-      let setStmt =
+-            SExpr $
+-              EBinOp
+-                "="
+-                (EArrow currentEnv resolvedName)
+-                (EVar cellVar)
+-      addStmt setStmt
+-      -- Process continuation
+-      doCodegen cont currentEnv
++        LInt n -> return $ EMacroCall "obj_int2obj" [ELitInt n]
++        LString s -> return $ EMacroCall "zyn_make_string" [currentEnv, ELitStr s, ELitInt $ fromIntegral $ T.length s]
++        LBool True -> return $ EVar "boolean_t"
++        LBool False -> return $ EVar "boolean_f"
++        LNil -> return $ EVar "NULL"
++
+     Lifted id -> do
+       logDebugWhen $ "Processing Lifted: " <> T.pack (show id)
+       ctx <- get
+       case HashMap.lookup id (ctxLambdas ctx) of
+         Just lambda -> generateClosure lambda currentEnv
+         Nothing -> error $ "Unknown lambda id: " ++ show id
+-    If cond thenExpr elseExpr -> do
+-      logDebugWhen $ "=== If ==="
+-      logDebugWhen $ "  If cond:  " <> T.pack (show cond)
+-      logDebugWhen $ "  If thenExpr:  " <> T.pack (show thenExpr)
+-      logDebugWhen $ "  If elseExpr:  " <> T.pack (show elseExpr)
+ 
+-      condExpr <- doCodegen cond currentEnv
+-      thenFinal <- doCodegen thenExpr currentEnv
+-      elseFinal <- doCodegen elseExpr currentEnv
++    BuiltinIdent name ->
++      -- Return the builtin function name directly
++      return $ EVar name
+ 
++    CallOne fn arg -> do
++      -- Optimize for common patterns in Cyclone-style code
++      case fn of
++        -- Handle builtin functions specially
++        BuiltinIdent name -> do
++          -- Create continuation closure
++          contVarName <- genVar
++          addStmt $ SExpr $ EMacroCall "mclosure0" [EVar contVarName, EVar "__lambda_3"]
++
++          -- Generate argument
++          argExpr <- doCodegen arg currentEnv
++
++          -- Call the builtin with continuation
++          resultVarName <- genVar
++          addStmt $
++            SDecl $
++              DVar
++                { dName = resultVarName,
++                  dType = TPtr (TStruct "object"),
++                  dInit = Just $ EMacroCall (T.unpack name) [currentEnv, EVar contVarName, ELitInt 1, argExpr]
++                }
++
++          return $ EVar resultVarName
++
++        -- For lifted lambdas (closure calls)
++        Lifted id -> do
++          argExpr <- doCodegen arg currentEnv
++          lambdaName <- genVar
++
++          -- Here we'd need to look up the function name
++          addStmt $ SExpr $ EMacroCall "mclosure0" [EVar lambdaName, EVar ("__lambda_" <> T.pack (show id))]
++
++          -- For simple return
++          return $ EVar lambdaName
++
++        -- General case
++        _ -> do
++          fnExpr <- doCodegen fn currentEnv
++          argExpr <- doCodegen arg currentEnv
++
++          -- Create a temporary array for arguments
++          tmpArrayVar <- genVar
++          addStmt $ SDecl $ DVar
++            { dName = tmpArrayVar,
++              dType = TArray 1 (TStruct "object"),
++              dInit = Nothing
++            }
++
++          -- Set the argument in the array
++          addStmt $ SExpr $ EBinOp "="
++            (EIndex (EVar tmpArrayVar) (ELitInt 0))
++            argExpr
++
++          -- Create a temporary result variable
++          resultVarName <- genVar
++          addStmt $
++            SDecl $
++              DVar
++                { dName = resultVarName,
++                  dType = TPtr (TStruct "object"),
++                  dInit = Just $ EMacroCall "zyn_apply" [currentEnv, fnExpr, ELitInt 1, EVar tmpArrayVar]
++                }
++
++          return $ EVar resultVarName
++
++    CallTwo fn arg1 arg2 -> do
++      -- Special case for arithmetic operators
++      case fn of
++        BuiltinIdent "zyn_sum" -> do
++          -- Handle addition in Cyclone style
++          arg1Expr <- doCodegen arg1 currentEnv
++          arg2Expr <- doCodegen arg2 currentEnv
++
++          -- Create continuation closure
++          contVarName <- genVar
++          addStmt $ SExpr $ EMacroCall "mclosure0" [EVar contVarName, EVar "__lambda_3"]
++
++          -- Create a temporary array for arguments
++          tmpArrayVar <- genVar
++          addStmt $ SDecl $ DVar
++            { dName = tmpArrayVar,
++              dType = TArray 2 (TStruct "object"),
++              dInit = Nothing
++            }
++
++          -- Set the arguments in the array
++          addStmt $ SExpr $ EBinOp "="
++            (EIndex (EVar tmpArrayVar) (ELitInt 0))
++            arg1Expr
++          addStmt $ SExpr $ EBinOp "="
++            (EIndex (EVar tmpArrayVar) (ELitInt 1))
++            arg2Expr
++
++          -- Call zyn_sum with the array of arguments
++          resultVarName <- genVar
++          addStmt $
++            SDecl $
++              DVar
++                { dName = resultVarName,
++                  dType = TPtr (TStruct "object"),
++                  dInit = Just $ EMacroCall "zyn_sum" [currentEnv, EVar contVarName, ELitInt 2, EVar tmpArrayVar]
++                }
++
++          return $ EVar resultVarName
++
++        BuiltinIdent "+" -> do
++          -- Handle addition in Cyclone style
++          arg1Expr <- doCodegen arg1 currentEnv
++          arg2Expr <- doCodegen arg2 currentEnv
++
++          -- Create continuation closure
++          contVarName <- genVar
++          addStmt $ SExpr $ EMacroCall "mclosure0" [EVar contVarName, EVar "__lambda_3"]
++
++          -- Create a temporary array for arguments
++          tmpArrayVar <- genVar
++          addStmt $ SDecl $ DVar
++            { dName = tmpArrayVar,
++              dType = TArray 2 (TStruct "object"),
++              dInit = Nothing
++            }
++
++          -- Set the arguments in the array
++          addStmt $ SExpr $ EBinOp "="
++            (EIndex (EVar tmpArrayVar) (ELitInt 0))
++            arg1Expr
++          addStmt $ SExpr $ EBinOp "="
++            (EIndex (EVar tmpArrayVar) (ELitInt 1))
++            arg2Expr
++
++          -- Call zyn_sum with the array of arguments
++          resultVarName <- genVar
++          addStmt $
++            SDecl $
++              DVar
++                { dName = resultVarName,
++                  dType = TPtr (TStruct "object"),
++                  dInit = Just $ EMacroCall "zyn_sum" [currentEnv, EVar contVarName, ELitInt 2, EVar tmpArrayVar]
++                }
++
++          return $ EVar resultVarName
++
++        -- General case for two-argument functions
++        _ -> do
++          fnExpr <- doCodegen fn currentEnv
++          arg1Expr <- doCodegen arg1 currentEnv
++          arg2Expr <- doCodegen arg2 currentEnv
++
++          -- Create a temporary array for arguments
++          tmpArrayVar <- genVar
++          addStmt $ SDecl $ DVar
++            { dName = tmpArrayVar,
++              dType = TArray 2 (TStruct "object"),
++              dInit = Nothing
++            }
++
++          -- Set the arguments in the array
++          addStmt $ SExpr $ EBinOp "="
++            (EIndex (EVar tmpArrayVar) (ELitInt 0))
++            arg1Expr
++          addStmt $ SExpr $ EBinOp "="
++            (EIndex (EVar tmpArrayVar) (ELitInt 1))
++            arg2Expr
++
++          -- Create a temporary result variable
++          resultVarName <- genVar
++          addStmt $
++            SDecl $
++              DVar
++                { dName = resultVarName,
++                  dType = TPtr (TStruct "object"),
++                  dInit = Just $ EMacroCall "zyn_apply" [currentEnv, fnExpr, ELitInt 2, EVar tmpArrayVar]
++                }
++
++          return $ EVar resultVarName
++
++    -- Handle other expression types
++    SetThen var valueExpr nextExpr -> do
++      valueExprResult <- doCodegen valueExpr currentEnv
++      addStmt $ SExpr $ EBinOp "=" (EVar $ mangle var) valueExprResult
++      doCodegen nextExpr currentEnv
++
++    If condExpr thenExpr elseExpr -> do
++      condExprResult <- doCodegen condExpr currentEnv
++      thenResult <- genVar
++      elseResult <- genVar
++
++      -- Generate the then branch
++      thenExprResult <- doCodegen thenExpr currentEnv
++      addStmt $
++        SDecl $
++          DVar
++            { dName = thenResult,
++              dType = TPtr (TStruct "object"),
++              dInit = Just thenExprResult
++            }
++
++      -- Generate the else branch
++      elseExprResult <- doCodegen elseExpr currentEnv
+       addStmt $
+-          SIf
+-              (EMacroCall "obj_is_truthy" [condExpr])
+-              (SBlock [SExpr thenFinal])
+-              (SBlock [SExpr elseFinal])
+-
+-      logDebugWhen $ "  If condFinal:  " <> T.pack (show condExpr)
+-      logDebugWhen $ "  If thenFinal:  " <> T.pack (show thenFinal)
+-      logDebugWhen $ "  If elseFinal:  " <> T.pack (show elseFinal)
+-
+-      return $ ELitInt 0
+-    CallOne f arg -> do
+-      fExpr <- doCodegen f currentEnv
+-      argExpr <- doCodegen arg currentEnv
+-      return $ EMacroCall "call_closure_one" [fExpr, argExpr]
+-    CallTwo f arg1 arg2 -> do
+-      logDebugWhen $ "=== CallTwo:  " <> T.pack (show f) <> " ==="
+-      logDebugWhen $ "  CallTwo currentEnv:  " <> T.pack (show currentEnv)
+-      logDebugWhen $ "  CallTwo arg1:  " <> T.pack (show arg1)
+-      logDebugWhen $ "  CallTwo arg2:  " <> T.pack (show arg2)
+-      fExpr <- doCodegen f currentEnv
+-      logDebugWhen $ "  CallTwo fExpr:  " <> T.pack (show fExpr)
+-      arg1Expr <- doCodegen arg1 currentEnv
+-      logDebugWhen $ "  CallTwo arg1Expr:  " <> T.pack (show arg1Expr)
+-      arg2Expr <- doCodegen arg2 currentEnv
+-      logDebugWhen $ "  CallTwo arg2Expr:  " <> T.pack (show arg2Expr)
+-      return $ EMacroCall "call_closure_two" [fExpr, arg1Expr, arg2Expr]
++        SDecl $
++          DVar
++            { dName = elseResult,
++              dType = TPtr (TStruct "object"),
++              dInit = Just elseExprResult
++            }
++
++      -- Return the conditional result
++      resultVarName <- genVar
++      addStmt $
++        SDecl $
++          DVar
++            { dName = resultVarName,
++              dType = TPtr (TStruct "object"),
++              dInit = Just $ ETernary (EBinOp "!=" condExprResult (EVar "boolean_f"))
++                                      (EVar thenResult)
++                                      (EVar elseResult)
++            }
++
++      return $ EVar resultVarName
+ 
+ -- Updated codegen to take debug flag
+-codegen :: Bool -> LExpr -> HashMap Int LiftedLambda -> IO ([CStmt], [CDecl], [CDecl])
++codegen :: Bool -> LExpr -> HashMap Int LiftedLambda -> IO ([CStmt], [CDecl], [CDecl], Set.Set Int)
+ codegen debugMode expr lambdas = do
++
++  -- Initialize context with our continuations map
+   let ctx = initialCtx debugMode lambdas
++
+   (finalExpr, finalCtx) <-
+     runStateT
+       ( runStderrLoggingT $ do
+           logDebugWhen $ "Starting codegen with lambdas: " <> T.pack (show (HashMap.keys lambdas))
++
++          -- Log the call graph for debugging
++          when debugMode $ debugCallGraph (ctxContinuations ctx) debugMode
++
++          -- Process all lambdas
+           traverse_
+             ( \l -> do
+                 logDebugWhen $ "Processing lambda " <> T.pack (show (lambdaId l))
+-                -- Do not union in any extra free–variables from the parent.
+                 struct <- envStruct l
+                 addProto struct
+                 generateFunc l
+             )
+             (HashMap.elems lambdas)
++
+           logDebugWhen "Starting main doCodegen"
+-          (expr', mainStmts) <- withStmtScope $ do
++
++          -- For the entry point, we'll just directly call the first lambda
++          (expr', _) <- withStmtScope $ do
+             result <- doCodegen expr (EVar "env")
+-            addStmt $ SExpr result
+             return result
+-          logDebugWhen $ "Completed main doCodegen with " <> T.pack (show (length mainStmts)) <> " statements"
+-          traverse_ addStmt mainStmts
++
+           return expr'
+       )
+       ctx
++
+   return
+-    ( reverse $ ctxStmts finalCtx,
++    ( [],  -- Empty root statements
+       reverse $ ctxProtos finalCtx,
+-      reverse $ ctxDecls finalCtx
++      reverse $ ctxDecls finalCtx,
++      (ctxUsedArities finalCtx)
+     )
++

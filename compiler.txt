@@ -1,0 +1,4570 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TemplateHaskell #-}
+
+module Main where
+
+import Control.Exception (SomeException, catch, finally)
+import Control.Monad (unless, when, void)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Logger (LoggingT, logDebugN, logErrorN, logInfoN, runStderrLoggingT)
+import Control.Monad.State
+import qualified Data.ByteString as BS
+import Data.FileEmbed (embedFile, makeRelativeToProject)
+import Data.Foldable (forM_, traverse_)
+import Data.HashMap.Strict (toList)
+import Data.Semigroup ((<>))
+import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
+import Options.Applicative
+import System.Console.ANSI
+import System.Console.Haskeline
+import System.Directory (copyFile, removeDirectoryRecursive, createDirectoryIfMissing)
+import System.Environment (getEnvironment)
+import System.Exit (ExitCode (..), exitFailure)
+import System.FilePath ((</>))
+import System.IO (hPutStrLn, stderr, stdout)
+import System.IO.Temp (createTempDirectory)
+import System.Process (ProcessHandle, StdStream (..), callProcess, createProcess, cwd, proc, std_err, std_out, waitForProcess)
+
+-- Import your own modules
+import Zayin.AST
+import Zayin.AST.Pretty
+import Zayin.BoundExpr.Pretty
+import Zayin.CExport (generateC)
+import qualified Zayin.CPS as CPS
+import Zayin.Codegen (codegen)
+import Zayin.FlatExpr (liftLambdas)
+import Zayin.FlatExpr.Pretty (renderFExpr)
+import Zayin.Interpreter (emptyEnv, emptyLambdaMap, interpretWithEnv, valueToString, Environment(..), LambdaMap(..), Value(..))
+import Zayin.LiftedExpr.Pretty (renderLExpr, renderLiftedLambda)
+import Zayin.Literals
+import Zayin.Macros (expandMacros)
+import Zayin.Parser (parseProgram, parseWithDebug)
+import Zayin.Transforms (toFExprM)
+
+--------------------------------------------------------------------------------
+-- Command-line Options
+--------------------------------------------------------------------------------
+
+data Cmd = Run | Compile {output :: FilePath} | Repl
+  deriving (Show)
+
+data Options = Options
+  { cmd :: Cmd,
+    sourceFile :: Maybe FilePath, -- optional for REPL mode
+    debug :: Bool,
+    keepTmpdir :: Bool,
+    sanitize :: Bool
+  }
+  deriving (Show)
+
+cmdParser :: Parser Cmd
+cmdParser =
+  subparser
+    ( command
+        "run"
+        ( info
+            (pure Run)
+            (progDesc "Run the program")
+        )
+        <> command
+          "compile"
+          ( info
+              ( Compile
+                  <$> strOption
+                    ( long "output"
+                        <> short 'o'
+                        <> metavar "OUTPUT"
+                        <> value "a.out"
+                        <> help "Output binary file"
+                    )
+              )
+              (progDesc "Compile the program")
+          )
+        <> command
+          "repl"
+          ( info
+              (pure Repl)
+              (progDesc "Start interactive REPL")
+          )
+    )
+
+optionsParser :: Parser Options
+optionsParser =
+  Options
+    <$> cmdParser
+    <*> optional (argument
+                   str
+                   (metavar "SOURCE" <> help "Input source file (.zyn)"))
+    <*> switch (long "debug" <> help "Enable debug output")
+    <*> switch (long "keep-tmpdir" <> help "Keep temporary build directory")
+    <*> switch (long "sanitize" <> help "Build with ASAN sanitizer")
+
+optsInfo :: ParserInfo Options
+optsInfo =
+  info
+    (optionsParser <**> helper)
+    ( fullDesc
+        <> progDesc "Compile, run, or start REPL for Zayin programs"
+        <> header "zayin - A Zayin compiler and REPL"
+    )
+
+-- | Runtime files embedded at compile time
+runtimeFiles :: [(FilePath, BS.ByteString)]
+runtimeFiles =
+  [ ("base.h", $(makeRelativeToProject "runtime/base.h" >>= embedFile)),
+    ("base.c", $(makeRelativeToProject "runtime/base.c" >>= embedFile)),
+    ("runtime_main.h", $(makeRelativeToProject "runtime/runtime_main.h" >>= embedFile)),
+    ("builtin.h", $(makeRelativeToProject "runtime/builtin.h" >>= embedFile)),
+    ("builtin.c", $(makeRelativeToProject "runtime/builtin.c" >>= embedFile)),
+    ("bit_array.h", $(makeRelativeToProject "runtime/bit_array.h" >>= embedFile)),
+    ("bit_array.c", $(makeRelativeToProject "runtime/bit_array.c" >>= embedFile)),
+    ("common.h", $(makeRelativeToProject "runtime/common.h" >>= embedFile)),
+    ("gc.h", $(makeRelativeToProject "runtime/gc.h" >>= embedFile)),
+    ("gc.c", $(makeRelativeToProject "runtime/gc.c" >>= embedFile)),
+    ("hash_table.h", $(makeRelativeToProject "runtime/hash_table.h" >>= embedFile)),
+    ("queue.h", $(makeRelativeToProject "runtime/queue.h" >>= embedFile)),
+    ("test_queue.c", $(makeRelativeToProject "runtime/test_queue.c" >>= embedFile)),
+    ("vec.h", $(makeRelativeToProject "runtime/vec.h" >>= embedFile)),
+    ("bignum.h", $(makeRelativeToProject "runtime/bignum.h" >>= embedFile)),
+    ("ck_ht_hash.h", $(makeRelativeToProject "runtime/ck_ht_hash.h" >>= embedFile)),
+    ("Makefile", $(makeRelativeToProject "runtime/Makefile" >>= embedFile))
+  ]
+
+--------------------------------------------------------------------------------
+-- Compiler Pipeline
+--------------------------------------------------------------------------------
+
+-- Create a persistent build directory for the REPL
+createReplBuildDir :: IO FilePath
+createReplBuildDir = do
+  -- Create a build directory in the current directory
+  let buildDir = ".zayin_repl"
+  createDirectoryIfMissing True buildDir
+
+  -- Copy runtime files
+  forM_ runtimeFiles $ \(path, contents) -> do
+    let fullPath = buildDir </> path
+    BS.writeFile fullPath contents
+
+  return buildDir
+
+copyBinary :: FilePath -> FilePath -> IO ()
+copyBinary tmpDir outputPath =
+  copyFile (tmpDir </> "compiled_result") outputPath `catch` handler
+  where
+    handler :: SomeException -> IO ()
+    handler e = error "failed copying compiled binary"
+
+invokeMake :: FilePath -> Bool -> Bool -> IO (Either String String)
+invokeMake tmpDir sanitize debugMode = do
+  when debugMode $ putStrLn $ "\n=== Executing make in: " ++ tmpDir ++ " ==="
+
+  let args = if sanitize then ["SANITIZE=asan"] else []
+
+  (_, mout, merr, ph) <- createProcess
+    (proc "make" args) {
+      cwd = Just tmpDir,
+      std_out = CreatePipe,
+      std_err = CreatePipe
+    }
+
+  -- Log command execution only in debug mode
+  when debugMode $ putStrLn $ "Executing: make " ++ unwords args
+
+  exitCode <- waitForProcess ph
+  stdout <- maybe (return "") TIO.hGetContents mout
+  stderr <- maybe (return "") TIO.hGetContents merr
+
+  -- Log outputs only in debug mode
+  when debugMode $ do
+    putStrLn $ "\nMake stdout:\n" ++ T.unpack stdout
+    putStrLn $ "\nMake stderr:\n" ++ T.unpack stderr
+    putStrLn $ "\nMake exit code: " ++ show exitCode
+
+  case exitCode of
+    ExitSuccess ->
+      if debugMode
+        then return $ Right $ T.unpack stdout
+        else return $ Right ""  -- Empty string when not in debug mode, since we don't need the output
+    ExitFailure code ->
+      return $ Left $ "Make failed with exit code: " ++ show code ++
+                     (if debugMode
+                       then "\nstdout: " ++ T.unpack stdout ++ "\nstderr: " ++ T.unpack stderr
+                       else "")  -- Simplified error message when not in debug mode
+
+insertSourceIntoBuildDir :: FilePath -> T.Text -> IO ()
+insertSourceIntoBuildDir tmpDir source = do
+  let tmpPath = tmpDir </> "compiled_result.c"
+  TIO.writeFile tmpPath source
+
+generateBuildDir :: IO FilePath
+generateBuildDir = do
+  tmpDir <- createTempDirectory "." "zayin"
+  forM_ runtimeFiles $ \(path, contents) -> do
+    let fullPath = tmpDir </> path
+    BS.writeFile fullPath contents
+  return tmpDir
+
+generateProgramSource :: T.Text -> T.Text
+generateProgramSource src =
+  T.concat
+    [ T.unlines
+        [ "#include <mimalloc.h>",
+          "#include <stdlib.h>",
+          "#include <string.h>",
+          "#include <unistd.h>",
+          "#include \"base.h\"",
+          "#include \"builtin.h\"",
+          "#include \"runtime_main.h\""
+        ],
+      src,
+      T.unlines
+        [ "int main(void) {",
+          "    mi_version();",
+          "    struct closure_obj initial_closure = object_closure_one_new(main_lambda, NULL);",
+          "    struct thunk initial_thunk = {",
+          "        .closr = &initial_closure,",
+          "        .one = {NULL},",
+          "    };",
+          "",
+          "    struct thunk *thnk_heap = mi_malloc(sizeof(struct thunk));",
+          "    memcpy(thnk_heap, &initial_thunk, sizeof(struct thunk));",
+          "    zayin_start(thnk_heap);",
+          "}"
+        ]
+    ]
+
+generateProgramSource' :: T.Text -> T.Text
+generateProgramSource' src =
+  T.concat
+    [ T.unlines
+        [ "#include <mimalloc.h>",
+          "#include <stdlib.h>",
+          "#include <string.h>",
+          "#include <unistd.h>",
+          "#include \"base.h\"",
+          "#include \"builtin.h\""
+        ],
+      src,
+      T.unlines
+        [ "int main(void) {",
+          "    mi_version();",
+          "    gc_thread_data *thd;",
+          "    long stack_size = global_stack_size = STACK_SIZE;",
+          "    long heap_size = global_heap_size = HEAP_SIZE;",
+          "    mclosure0(clos_exit,&zyn_exit);",
+          "    mclosure0(entry_pt,&c_entry_pt);",
+          "    gc_initialize();",
+          "    thd = mi_malloc(sizeof(gc_thread_data));",
+          "    gc_thread_data_init(thd, 0, (char *) &stack_size, stack_size);",
+          "    thd->gc_cont = &entry_pt;",
+          "    thd->gc_args[0] = &clos_halt;",
+          "    thd->gc_num_args = 1;",
+          "    thd->thread_id = pthread_self();",
+          "    gc_add_mutator(thd);",
+          "    Cyc_heap_init(heap_size);",
+          "    thd->thread_state = ZYN_THREAD_STATE_RUNNABLE;",
+          "    zyn_start_trampoline(thd);",
+          "    return 0;",
+          "}"
+        ]
+    ]
+
+--------------------------------------------------------------------------------
+-- Compilation Function
+--------------------------------------------------------------------------------
+
+type CompilationM = LoggingT IO
+
+runCompilation :: CompilationM a -> IO a
+runCompilation = runStderrLoggingT
+
+compileSource :: Options -> FilePath -> T.Text -> Bool -> IO (Either String FilePath)
+compileSource opts buildDir src isRepl = runCompilation $ do
+   -- Possibly transform the source for REPL
+  let debugMode = debug opts
+
+  when debugMode $ logInfoN $ "\nSource being compiled:\n" <> src
+
+  -- Parse the source with debug flag
+  parsedEither <- liftIO $ parseWithDebug debugMode src
+  parsedAST <- case parsedEither of
+    Right ast -> do
+      when debugMode $ do
+        logInfoN $ "\nParsed input program into AST:\n" <> T.pack (show ast)
+        logInfoN $ "\nPrettified AST: " <> T.pack (renderExpr ast)
+      return ast
+    Left err -> do
+      logErrorN $ "Program parsing failed: " <> T.pack err
+      liftIO exitFailure
+
+  -- Macro expansion
+  expandedExpr <- case expandMacros parsedAST of
+    Right e -> do
+      when debugMode $
+        logInfoN $ "\nExpanded AST after macro processing:" <> T.pack (renderExpr e)
+      return e
+    Left err -> do
+      logErrorN $ "Macro expansion failed: " <> T.pack err
+      liftIO exitFailure
+
+  -- Rest of the processing pipeline - Updated to use runFresh and pass the debugMode flag
+  let initial = Gen id
+
+  -- Use runFresh instead of runState for toBoundExprM with debug flag
+  (boundExpr, state1) <- liftIO $ runFresh (toBoundExprM debugMode expandedExpr) initial
+  when debugMode $
+    logInfoN $ "\nBound Expression: " <> T.pack (renderBExpr boundExpr)
+
+  let k = CPS.BuiltinIdent "exit"
+
+  -- Updated to use runFresh for toFExprM with debug flag
+  (fExpr, _) <- liftIO $ runFresh (toFExprM debugMode boundExpr k) state1
+
+  when debugMode $
+    logInfoN $ "\nAfter CPS conversion: " <> T.pack (renderFExpr fExpr)
+
+  -- Updated to pass debug flag to liftLambdas
+  let (e, lambdas) = liftLambdas debugMode fExpr
+  when debugMode $ do
+    logInfoN $ "\nFinal expr before codegen:" <> T.pack (renderLExpr e)
+    traverse_
+      ( \(k', v) -> do
+          logInfoN $ "Lambda " <> T.pack (show k') <> ":"
+          logDebugN $ T.pack (renderLiftedLambda v)
+      )
+      (toList lambdas)
+
+  -- Updated to pass debug flag to codegen
+  (rootStmts, protos, decls) <- liftIO $ codegen debugMode e lambdas
+  when debugMode $ do
+    logInfoN $ "\nCodegen Context:"
+    traverse_ (\s -> logInfoN $ "\nRoot statement: " <> T.pack (show s)) rootStmts
+    traverse_ (\p -> logInfoN $ "\nProto: " <> T.pack (show p)) protos
+    traverse_ (\d -> logInfoN $ "\nDecl: " <> T.pack (show d)) decls
+
+  -- Generate C code
+  let fullSource = generateC rootStmts protos decls
+      -- fullSource = generateProgramSource cCode
+
+  when debugMode $
+    logInfoN $ "\nGenerated C Code: " <> fullSource
+
+  -- Write C code
+  liftIO $ insertSourceIntoBuildDir buildDir fullSource
+  makeResult <- liftIO $ invokeMake buildDir (sanitize opts) debugMode  -- Pass debug flag to invokeMake
+
+  case makeResult of
+    Left errMsg -> do
+      logErrorN $ "\nFailed compiling generated C code: " <> T.pack errMsg
+      return $ Left $ "Compilation failed: " ++ errMsg
+    Right stdoutStr -> do
+      when debugMode $ logInfoN "\nCompilation result:"
+      when debugMode $ logDebugN (T.pack stdoutStr)
+      return $ Right $ buildDir </> "compiled_result"
+
+--------------------------------------------------------------------------------
+-- REPL Implementation
+--------------------------------------------------------------------------------
+
+-- Display the banner, adapting to terminal capabilities
+displayZayinBanner :: IO ()
+displayZayinBanner = do
+  -- Check if terminal supports colors and if colors are not disabled
+  noColor <- (elem "NOCOLOR" . map fst) <$> getEnvironment
+  supportsANSI <- hSupportsANSI stdout
+
+  if supportsANSI && not noColor
+    then displayColorBanner
+    else displaySimpleBanner
+
+-- Colored version
+displayColorBanner :: IO ()
+displayColorBanner = do
+  setSGR [SetColor Foreground Vivid Blue]
+  putStrLn zayinLogo
+  setSGR [SetColor Foreground Vivid White]
+  setSGR [Reset]
+  putStrLn ""
+
+-- Simple version without colors
+displaySimpleBanner :: IO ()
+displaySimpleBanner = do
+  putStrLn zayinLogo
+  putStrLn ""
+
+-- The scaled-down logo
+zayinLogo :: String
+zayinLogo = unlines
+  [ "                                                    "
+  , "                                                    "
+  , "                                                    "
+  , "                     .-.                            "
+  , "                   .-@@*.                           "
+  , "                   .#@@@@@@@@@@#+.                  "
+  , "                   :@@@@@@@@@@@@@@-.                "
+  , "                   .#@@@@@@@@@@@@@+.                "
+  , "                    .#@@@@@@@@@@@@+.                "
+  , "                       ...*@-:...                   "
+  , "                         -@%.                       "
+  , "                        .%@-                        "
+  , "                        :@@:                        "
+  , "                       .#@@-                        "
+  , "                       .@@@#.                       "
+  , "                       .@@@@.                       "
+  , "                       .@@@@=.                      "
+  , "                       .%@@@*.                      "
+  , "                        +@@@%:                      "
+  , "                        .@@@@-                      "
+  , "                        .@@@@-                      "
+  , "                        .%@@@-                      "
+  , "                        .%@@%:                      "
+  , "                        .@@@:                       "
+  , "                       .=+:                         "
+  , "                                                    "
+  , "                                                    "
+  , "                                                    "
+  ]
+
+data ReplState = ReplState
+  { buildDir :: FilePath
+  , history :: [T.Text]  -- Previous inputs
+  , environment :: [T.Text]  -- Definitions (macros, functions) to persist
+  , interpreterEnv :: Environment
+  , lambdaMap :: LambdaMap
+  }
+
+runRepl :: Options -> IO ()
+runRepl opts = do
+  -- Create persistent build directory for the REPL
+  dir <- createReplBuildDir
+
+  let debugMode = debug opts
+  when debugMode $ putStrLn $ "REPL build directory: " ++ dir
+
+  -- Set up initial state
+  let initialState = ReplState
+        { buildDir = dir
+        , history = []
+        , environment = []
+        , interpreterEnv = emptyEnv
+        , lambdaMap = emptyLambdaMap
+        }
+
+  displayZayinBanner
+  putStrLn "Zayin REPL v0.1"
+  putStrLn "Type expressions to evaluate, :help for commands"
+  when debugMode $ putStrLn "[Debug mode enabled]"
+
+  -- Run REPL loop using Haskeline for history and editing
+  finally (runInputT defaultSettings (replLoop opts initialState)) $ do
+    -- Cleanup on exit
+    unless (keepTmpdir opts) $ do
+      when debugMode $ putStrLn $ "Cleaning up REPL build directory: " ++ dir
+      removeDirectoryRecursive dir
+    putStrLn "Goodbye!"
+
+replLoop :: Options -> ReplState -> InputT IO ()
+replLoop opts state = do
+  let debugMode = debug opts
+  minput <- getInputLine "zayin> "
+  case minput of
+    -- Handle commands the same as before (no changes needed for :q, :help, etc.)
+
+    -- Update the :reset command to clear the environment
+    Just ":reset" -> do
+      outputStrLn "Environment reset."
+      replLoop opts state { environment = [], interpreterEnv = emptyEnv }
+
+    -- Update the :env command to show environment content
+    Just ":env" -> do
+      outputStrLn "Current environment:"
+      forM_ (environment state) $ \def ->
+        outputStrLn $ T.unpack def
+      replLoop opts state
+
+    -- Handle normal expressions
+    Just input
+      | T.null (T.strip (T.pack input)) -> replLoop opts state
+      | otherwise -> do
+          let inputText = T.pack input
+
+          -- Update history
+          let stateWithHistory = state { history = inputText : history state }
+
+          -- If it's a function/macro definition, also update the textual environment
+          let updatedState = if isMacroOrFunctionDef inputText
+                            then stateWithHistory { environment = environment stateWithHistory ++ [inputText] }
+                            else stateWithHistory
+
+          -- Run through the pipeline using existing approach
+          result <- liftIO $ do
+            parsedEither <- parseWithDebug debugMode inputText
+            case parsedEither of
+              Left err -> return $ Left $ "Parse error: " ++ err
+              Right ast ->
+                case expandMacros ast of
+                  Left err -> return $ Left $ "Macro error: " ++ err
+                  Right expandedAst -> do
+                    -- Create a fresh generator
+                    (boundExpr, state1) <- runFresh (toBoundExprM debugMode expandedAst) (Gen id)
+                    let k = CPS.BuiltinIdent "exit"
+                    -- Get flat expression from bound expression
+                    (fExpr, _) <- runFresh (toFExprM debugMode boundExpr k) state1
+                    -- Lift lambdas
+                    let (lexpr, lambdas) = liftLambdas debugMode fExpr
+
+                    -- Pass the current environment to interpret and get new environment back
+                    interpretWithEnv lexpr (lambdaMap updatedState) True  (interpreterEnv updatedState)
+
+          case result of
+            Left err -> do
+              outputStrLn err
+              replLoop opts updatedState  -- Keep the same state on error
+            Right (val, newEnv, newLambdaMap) -> do  -- Extract the lambda map too
+              -- Store both the updated environment and lambda map
+              let finalState = updatedState {
+                    interpreterEnv = newEnv,
+                    lambdaMap = newLambdaMap  -- Update lambda map
+                  }
+
+              -- Only print the result if it's not VNoop
+              case val of
+                VNoop -> replLoop opts finalState
+                _ -> do
+                  outputStrLn $ valueToString val
+                  replLoop opts finalState
+
+-- Helper function to determine if input contains a definition
+updateState :: T.Text -> ReplState -> ReplState
+updateState input state
+  | isMacroOrFunctionDef input = state { environment = environment state ++ [input] }
+  | otherwise = state
+
+-- Check if the input is a macro or function definition that should be preserved
+isMacroOrFunctionDef :: T.Text -> Bool
+isMacroOrFunctionDef input =
+  let stripped = T.stripStart input
+  in T.isPrefixOf "macro " stripped || T.isPrefixOf "fn " stripped
+
+-- Handle execution errors without using ScopedTypeVariables
+runProgramWithErrorHandling :: FilePath -> IO ExitCode
+runProgramWithErrorHandling exePath = do
+  result <- catch
+    (do
+      callProcess exePath []
+      return ExitSuccess)
+    (\e -> do
+       let _ = e :: SomeException  -- Type annotation in binding position is allowed
+       return (ExitFailure 1))
+  return result
+
+
+--------------------------------------------------------------------------------
+-- Main Function
+--------------------------------------------------------------------------------
+
+main :: IO ()
+main = do
+  opts <- execParser optsInfo
+
+  -- Configure output based on debug flag
+  let debugMode = debug opts
+      -- Optional debug message for when running in debug mode
+      debugMsg = when debugMode $
+                   putStrLn "Debug mode enabled. Showing detailed compilation information."
+
+  case cmd opts of
+    Repl -> do
+      debugMsg
+      runRepl opts
+
+    Run -> case sourceFile opts of
+      Nothing -> putStrLn "Error: Source file required for 'run' command" >> exitFailure
+      Just srcFile -> do
+        debugMsg
+        src <- TIO.readFile srcFile
+        buildDir <- generateBuildDir
+
+        when debugMode $ putStrLn $ "Created build directory: " ++ buildDir
+
+        result <- compileSource opts buildDir src False
+        case result of
+          Left err -> putStrLn ("Compilation failed: " ++ err) >> exitFailure
+          Right exePath -> do
+            when debugMode $ putStrLn $ "Running compiled program: " ++ exePath
+            -- Run the compiled program
+            callProcess exePath []
+
+            -- Cleanup
+            unless (keepTmpdir opts) $ do
+              when debugMode $ putStrLn $ "Cleaning up build directory: " ++ buildDir
+              removeDirectoryRecursive buildDir
+
+    Compile {output = out} -> case sourceFile opts of
+      Nothing -> putStrLn "Error: Source file required for 'compile' command" >> exitFailure
+      Just srcFile -> do
+        debugMsg
+        src <- TIO.readFile srcFile
+        buildDir <- generateBuildDir
+
+        when debugMode $ putStrLn $ "Created build directory: " ++ buildDir
+
+        result <- compileSource opts buildDir src False
+        case result of
+          Left err -> putStrLn ("Compilation failed: " ++ err) >> exitFailure
+          Right exePath -> do
+            -- Copy the binary to the output location
+            copyBinary buildDir out
+            putStrLn $ "Compiled binary written to " ++ out
+
+            -- Cleanup
+            unless (keepTmpdir opts) $ do
+              when debugMode $ putStrLn $ "Cleaning up build directory: " ++ buildDir
+              removeDirectoryRecursive buildDir
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
+
+module Zayin.AST
+  ( Expr (..),
+    Fresh,
+    Gen (..),
+    ExprBody (..),
+    ExprBodyExpr (..),
+    freshName,
+    toBoundExprM,
+    logDebugM,
+    runFresh,
+  )
+where
+
+import Control.Monad (foldM, when)
+import Control.Monad.Logger
+import Control.Monad.State
+import qualified Data.Map as Map
+import qualified Data.Text as T
+import qualified Zayin.BoundExpr as BE
+import Zayin.Literals (Literal (..))
+
+-- Core data types
+data Expr
+  = EVar T.Text
+  | ELit Literal
+  | EBuiltinIdent T.Text
+  | EIf Expr Expr Expr
+  | ESet T.Text Expr
+  | ELet [(T.Text, Expr)] ExprBody
+  | ELam [T.Text] ExprBody
+  | EApp Expr [Expr]
+  deriving (Show, Eq)
+
+data ExprBodyExpr
+  = Def T.Text Expr
+  | Expr Expr
+  deriving (Show, Eq)
+
+data ExprBody = ExprBody
+  { bodyExprs :: [ExprBodyExpr],
+    finalExpr :: Expr
+  }
+  deriving (Show, Eq)
+
+data Gen = Gen (Int -> Int)
+
+-- Update Fresh monad to include logging capabilities
+type Fresh a = LoggingT (StateT Gen IO) a
+
+-- Run the Fresh monad computations with logging to stderr
+runFresh :: Fresh a -> Gen -> IO (a, Gen)
+runFresh action gen = runStateT (runStderrLoggingT action) gen
+
+-- Conditionally log debug messages with proper formatting
+logDebugM :: (Show a) => Bool -> String -> a -> Fresh a
+logDebugM debugMode prefix x = do
+  when debugMode $
+    logDebugN $ T.pack $ prefix ++ ": " ++ show x
+  return x
+
+-- Explicit debug logging for each stage
+logStage :: Bool -> String -> Fresh a -> Fresh a
+logStage debugMode stage action = do
+  when debugMode $
+    logDebugN $ T.pack $ "=== Starting " ++ stage ++ " ==="
+  result <- action
+  when debugMode $
+    logDebugN $ T.pack $ "=== Completed " ++ stage ++ " ==="
+  return result
+
+freshName :: T.Text -> Fresh T.Text
+freshName prefix = do
+  (Gen f) <- get
+  let (g1, g2) = (Gen (\x -> f (2 * x)), Gen (\x -> f (2 * x + 1)))
+  put g2
+  return $ prefix <> "$" <> T.pack (show (f 0))
+
+rewrite :: Bool -> (Expr -> Fresh Expr) -> Expr -> Fresh Expr
+rewrite debugMode f expr = do
+  logDebugM debugMode "rewrite before" expr
+  processed <- case expr of
+    EVar {} -> return expr
+    ELit {} -> return expr
+    EBuiltinIdent {} -> return expr
+    EIf c t e -> do
+      logDebugM debugMode "rewriting if condition" c
+      c' <- rewrite debugMode f c
+      t' <- rewrite debugMode f t
+      e' <- rewrite debugMode f e
+      return $ EIf c' t' e'
+    ESet n e -> do
+      logDebugM debugMode "rewriting set" (n, e)
+      e' <- rewrite debugMode f e
+      let result = ESet n e'
+      logDebugM debugMode "set after rewrite" result
+      return result
+    ELet bs body -> do
+      logDebugM debugMode "rewriting let bindings" bs
+      bs' <-
+        mapM
+          ( \(n, e) -> do
+              e' <- rewrite debugMode f e
+              return (n, e')
+          )
+          bs
+      body' <- rewriteBody debugMode f body
+      return $ ELet bs' body'
+    ELam ps body -> do
+      logDebugM debugMode "rewriting lambda body" body
+      body' <- rewriteBody debugMode f body
+      return $ ELam ps body'
+    EApp fun args -> do
+      logDebugM debugMode "rewriting application" (fun, args)
+      fun' <- rewrite debugMode f fun
+      args' <- mapM (rewrite debugMode f) args
+      return $ EApp fun' args'
+  result <- f processed
+  logDebugM debugMode "rewrite after" result
+  return result
+
+rewriteBody :: Bool -> (Expr -> Fresh Expr) -> ExprBody -> Fresh ExprBody
+rewriteBody debugMode f (ExprBody exprs final) = do
+  logDebugM debugMode "rewriting body exprs" exprs
+  exprs' <-
+    mapM
+      ( \case
+          Def n e -> do
+            logDebugM debugMode "rewriting define" (n, e)
+            e' <- rewrite debugMode f e
+            return $ Def n e'
+          Expr e -> do
+            logDebugM debugMode "rewriting body expr" e
+            e' <- rewrite debugMode f e
+            return $ Expr e'
+      )
+      exprs
+  final' <- rewrite debugMode f final
+  let result = ExprBody exprs' final'
+  logDebugM debugMode "rewriteBody result" result
+  return result
+
+pullDefines :: Bool -> ExprBody -> Fresh ExprBody
+pullDefines debugMode (ExprBody exprs final) = do
+  logDebugM debugMode "pullDefines input" exprs
+
+  -- Transform defines into sets and collect names
+  let (defines, bodyExprs) =
+        foldr
+          ( \expr (defs, body) ->
+              case expr of
+                Def name e ->
+                  let setExpr = Expr (ESet name e)
+                   in (name : defs, setExpr : body)
+                other -> (defs, other : body)
+          )
+          ([], [])
+          exprs
+
+  -- Log the defines we found (moved outside of foldr)
+  when debugMode $
+    mapM_ (\def -> logDebugN $ T.pack $ "converted define to set: " ++ show def) defines
+
+  logDebugM debugMode "Defines found" defines
+  logDebugM debugMode "Body with sets" bodyExprs
+
+  -- Create let bindings and wrap body
+  let letBindings = [(name, ELit LNil) | name <- defines]
+  let bodyWithSets = ExprBody bodyExprs final
+  let result = ExprBody [] (ELet letBindings bodyWithSets)
+
+  logDebugM debugMode "pullDefines result" result
+  return result
+
+liftDefines :: Bool -> Expr -> Fresh Expr
+liftDefines debugMode expr = do
+  when debugMode $
+    logDebugN "=== Starting liftDefines ==="
+  result <-
+    rewrite
+      debugMode
+      ( \case
+          ELet bindings body -> do
+            logDebugM debugMode "lifting defines in let" body
+            body' <- pullDefines debugMode body
+            return $ ELet bindings body'
+          ELam params body -> do
+            logDebugM debugMode "lifting defines in lambda" body
+            body' <- pullDefines debugMode body
+            return $ ELam params body'
+          e -> return e
+      )
+      expr
+  when debugMode $
+    logDebugN "=== Completed liftDefines ==="
+  return result
+
+removeLet :: Bool -> Expr -> Fresh Expr
+removeLet debugMode expr = do
+  when debugMode $
+    logDebugN "=== Starting removeLet ==="
+  result <-
+    rewrite
+      debugMode
+      ( \case
+          ELet bindings body -> do
+            logDebugM debugMode "removing let" (bindings, body)
+            let (names, exprs) = unzip bindings
+            let result = EApp (ELam names body) exprs
+            logDebugM debugMode "let removal result" result
+            return result
+          e -> return e
+      )
+      expr
+  when debugMode $
+    logDebugN "=== Completed removeLet ==="
+  return result
+
+toBoundExprM :: Bool -> Expr -> Fresh BE.BExpr
+toBoundExprM debugMode expr = logStage debugMode "toBoundExprM" $ do
+  logDebugM debugMode "initial expr" expr
+  expr' <- liftDefines debugMode expr
+  logDebugM debugMode "after define lifting" expr'
+  expr'' <- removeLet debugMode expr'
+  logDebugM debugMode "after let removal" expr''
+  toBoundExprInner debugMode expr'' Map.empty
+
+toBoundExprInner :: Bool -> Expr -> Map.Map T.Text T.Text -> Fresh BE.BExpr
+toBoundExprInner debugMode expr env = do
+  logDebugM debugMode "toBoundExprInner" (expr, env)
+  case expr of
+    EVar name -> do
+      let boundName = Map.findWithDefault name name env
+      return $ BE.Var boundName
+    ELit lit ->
+      return $ BE.Lit lit
+    EBuiltinIdent name ->
+      return $ BE.BuiltinIdent name
+    EIf cond t f -> do
+      c' <- toBoundExprInner debugMode cond env
+      t' <- toBoundExprInner debugMode t env
+      f' <- toBoundExprInner debugMode f env
+      return $ BE.If c' t' f'
+    ESet name val -> do
+      logDebugM debugMode "converting set" (name, val)
+      -- Use the bound name from the environment if it exists, otherwise generate fresh
+      let boundName = Map.findWithDefault name name env
+      val' <- toBoundExprInner debugMode val env
+      let result = BE.Set boundName val'
+      logDebugM debugMode "set conversion result" result
+      return result
+    ELam params body -> do
+      -- First generate fresh names for all parameters
+      freshParams <-
+        mapM
+          ( \p -> do
+              fresh <- freshName p
+              return (p, fresh)
+          )
+          params
+
+      -- Create new environment with all fresh parameter names
+      let paramEnv = foldr (\(p, fresh) e -> Map.insert p fresh e) env freshParams
+
+      -- Process the body expressions
+      result <- case (bodyExprs body, params) of
+        ([], []) -> do
+          unused <- freshName "_unused"
+          body' <- toBoundExprInner debugMode (finalExpr body) env
+          return $ BE.Lam unused body'
+        (exprs, _) -> do
+          let processExprs [] final = toBoundExprInner debugMode final paramEnv
+              processExprs (Expr e : rest) final = do
+                unused <- freshName "_unused"
+                e' <- toBoundExprInner debugMode e paramEnv
+                final' <- processExprs rest final
+                return $ BE.App (BE.Lam unused final') e'
+              processExprs (Def n e : rest) final = do
+                -- Use the bound name from paramEnv if it exists
+                let boundName = Map.findWithDefault n n paramEnv
+                e' <- toBoundExprInner debugMode e paramEnv
+                final' <- processExprs rest final
+                return $ BE.App (BE.Lam boundName final') e'
+
+          body' <- processExprs (bodyExprs body) (finalExpr body)
+          -- Use the fresh names we generated earlier
+          return $
+            foldr
+              (\(_, fresh) acc -> BE.Lam fresh acc)
+              body'
+              freshParams
+      return result
+    EApp f [] -> do
+      f' <- toBoundExprInner debugMode f env
+      return $ BE.App f' (BE.Lit LNil)
+    EApp f (a : as) -> do
+      f' <- toBoundExprInner debugMode f env
+      a' <- toBoundExprInner debugMode a env
+      foldM (\acc e -> BE.App acc <$> toBoundExprInner debugMode e env) (BE.App f' a') as
+    ELet _ _ ->
+      error "Let expressions should have been removed"
+{-# LANGUAGE OverloadedStrings #-}
+
+module Zayin.AST.Pretty (renderExpr) where
+
+import Data.Text (Text)
+import qualified Data.Text as T
+import Prettyprinter
+import Prettyprinter.Render.String (renderString)
+import Zayin.AST
+import Zayin.Literals (Literal (..))
+
+-- | Pretty printing instance for our Literal.
+instance Pretty Literal where
+  pretty lit = case lit of
+    LInt i -> pretty i
+    LString s -> dquotes (pretty s)
+    LBool b -> pretty b
+    LNil -> "nil"
+
+-- extend as needed for other literal types
+
+-- | Pretty printing for our Expr type.
+instance Pretty Expr where
+  pretty expr = case expr of
+    EVar s ->
+      pretty s
+    ELit lit ->
+      pretty lit
+    EBuiltinIdent s ->
+      pretty s
+    EIf cond t f ->
+      parens ("if" <+> pretty cond <+> pretty t <+> pretty f)
+    ESet name e ->
+      parens ("set!" <+> pretty name <+> pretty e)
+    ELet bindings body ->
+      parens
+        ( "let"
+            <+> parens (hsep (map prettyBinding bindings))
+            <> line
+            <> pretty body
+        )
+      where
+        prettyBinding (n, e) = parens (pretty n <+> pretty e)
+    ELam params body ->
+      parens
+        ( "lambda"
+            <+> parens (hsep (map pretty params))
+            <> line
+            <> pretty body
+        )
+    EApp f args ->
+      parens (pretty f <+> hsep (map pretty args))
+
+-- | Pretty printing for an expression body.
+instance Pretty ExprBody where
+  pretty (ExprBody exprs final) =
+    vcat (map pretty exprs) <> line <> pretty final
+
+-- | Pretty printing for expressions inside an expression body.
+instance Pretty ExprBodyExpr where
+  pretty (Def name e) =
+    parens ("define" <+> pretty name <+> pretty e)
+  pretty (Expr e) = pretty e
+
+-- | A helper to render an Expr as a String.
+renderExpr :: Expr -> String
+renderExpr = renderString . layoutPretty defaultLayoutOptions . pretty
+module Zayin.BoundExpr (BExpr (..)) where
+
+import qualified Data.Text as T
+import Zayin.Literals (Literal)
+
+data BExpr
+  = Var T.Text
+  | Lit Literal
+  | BuiltinIdent T.Text
+  | If BExpr BExpr BExpr
+  | Set T.Text BExpr
+  | Lam T.Text BExpr
+  | App BExpr BExpr
+  deriving (Show, Eq)
+{-# LANGUAGE OverloadedStrings #-}
+
+module Zayin.BoundExpr.Pretty (renderBExpr) where
+
+import Data.Text (Text)
+import Prettyprinter
+import Prettyprinter.Render.String (renderString)
+import Zayin.BoundExpr
+import Zayin.Literals (Literal (..))
+
+instance Pretty Literal where
+  pretty lit = case lit of
+    LInt i -> pretty i
+    LString s -> dquotes (pretty s)
+    LBool b -> pretty b
+    LNil -> "nil"
+
+instance Pretty BExpr where
+  pretty expr = case expr of
+    Var s -> pretty s
+    Lit lit -> pretty lit
+    BuiltinIdent s -> pretty s
+    Set name e ->
+      parens $ "set!" <+> pretty name <+> pretty e
+    Lam param body ->
+      parens $ "lambda" <+> parens (pretty param) <+> pretty body
+    If c t f ->
+      parens $ "if" <+> pretty c <+> pretty t <+> pretty f
+    App f a ->
+      parens $ pretty f <+> pretty a
+
+-- | Render a BExpr as a String.
+renderBExpr :: BExpr -> String
+renderBExpr = renderString . layoutPretty defaultLayoutOptions . pretty
+{-# LANGUAGE OverloadedStrings #-}
+
+module Zayin.CExport (generateC) where
+
+import Control.Monad (forM_)
+import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
+import Debug.Trace (trace)
+import Zayin.Codegen (CDecl (..), CExpr (..), CStmt (..), CType (..))
+import qualified Data.Vector as V
+import qualified Data.Vector.Mutable as MV
+import Data.IORef
+import System.IO.Unsafe (unsafePerformIO)
+
+-- Macro generation support
+maxCallArgs :: Int
+maxCallArgs = 10000
+
+callArity :: IORef (V.Vector Bool)
+callArity = unsafePerformIO $ newIORef $ V.replicate (maxCallArgs + 1) False
+
+-- Set arity flag - exposed for other modules to use
+setCallArity :: Int -> IO ()
+setCallArity arity
+  | arity < 0 || arity > maxCallArgs =
+      error $ "Only support up to " ++ show maxCallArgs ++ " arguments. Received: " ++ show arity
+  | otherwise = do
+      vec <- readIORef callArity
+      writeIORef callArity $ V.modify (\v -> MV.write v arity True) vec
+
+-- Macro generation functions
+macroArrayAssign :: Int -> T.Text -> T.Text -> T.Text
+macroArrayAssign n prefix assign
+  | n <= 0 = T.empty
+  | otherwise = T.concat [
+      macroArrayAssign (n - 1) prefix assign,
+      prefix,
+      T.pack $ "[" ++ show (n - 1) ++ "] = ",
+      assign,
+      T.pack $ show n ++ ";"
+    ]
+
+macroNPrefix :: Int -> T.Text -> T.Text
+macroNPrefix n prefix
+  | n <= 0 = T.empty
+  | otherwise = T.concat [
+      macroNPrefix (n - 1) prefix,
+      prefix,
+      T.pack $ show n
+    ]
+
+macroCloscall :: Int -> T.Text
+macroCloscall numArgs =
+  let args = macroNPrefix numArgs (T.pack ",a")
+      n = T.pack $ show numArgs
+      wrap s = if numArgs > 0 then s else T.empty
+  in T.concat [
+     T.pack "#define closcall", n, T.pack "(td, clo, buf) \\\n",
+     wrap $ T.concat [
+       T.pack "if (obj_is_not_closure(clo)) { \\\n",
+       T.pack "   zyn_apply(td, clo, ", n, T.pack ", buf ); \\\n",
+       T.pack "}"
+     ],
+     wrap $ T.pack " else { \\\n",
+     T.pack "   ((clo)->fn)(td, clo, ", n, T.pack ", buf); \\\n",
+     wrap $ T.pack ";\\\n}",
+     T.pack "\n"
+  ]
+
+macroReturnCloscall :: Int -> T.Text
+macroReturnCloscall numArgs =
+  let args = macroNPrefix numArgs (T.pack ",a")
+      n = T.pack $ show numArgs
+      arryAssign = macroArrayAssign numArgs (T.pack "buf") (T.pack "a")
+  in T.concat [
+     T.pack "#define return_closcall", n, T.pack "(td, clo", args, T.pack ") { \\\n",
+     T.pack " char top; \\\n",
+     T.pack " object buf[", n, T.pack "]; ", arryAssign, T.pack " \\\n",
+     T.pack " if (stack_overflow(&top, (((gc_thread_data *)data)->stack_limit))) { \\\n",
+     T.pack "     GC(td, clo, buf, ", n, T.pack "); \\\n",
+     T.pack "     return; \\\n",
+     T.pack " } else {\\\n",
+     T.pack "     closcall", n, T.pack "(td, (closure) (clo), buf); \\\n",
+     T.pack "     return;\\\n",
+     T.pack " } \\\n",
+     T.pack "}\n"
+  ]
+
+macroContinueOrGc :: Int -> T.Text
+macroContinueOrGc numArgs =
+  let args = macroNPrefix numArgs (T.pack ",a")
+      n = T.pack $ show numArgs
+      arryAssign = macroArrayAssign numArgs (T.pack "buf") (T.pack "a")
+  in T.concat [
+     T.pack "#define continue_or_gc", n, T.pack "(td, clo", args, T.pack ") { \\\n",
+     T.pack " char *top = alloca(sizeof(char)); \\\n",
+     T.pack " if (stack_overflow(top, (((gc_thread_data *)data)->stack_limit))) { \\\n",
+     T.pack "     object buf[", n, T.pack "]; ", arryAssign, T.pack " \\\n",
+     T.pack "     GC(td, clo, buf, ", n, T.pack "); \\\n",
+     T.pack "     return; \\\n",
+     T.pack " } else {\\\n",
+     T.pack "     continue;\\\n",
+     T.pack " } \\\n",
+     T.pack "}\n"
+  ]
+
+macroReturnDirect :: Int -> T.Text
+macroReturnDirect numArgs =
+  let args = macroNPrefix numArgs (T.pack ",a")
+      n = T.pack $ show numArgs
+      arryAssign = macroArrayAssign numArgs (T.pack "buf") (T.pack "a")
+  in T.concat [
+     T.pack "#define return_direct", n, T.pack "(td, _fn", args, T.pack ") { \\\n",
+     T.pack " char top; \\\n",
+     T.pack " object buf[", n, T.pack "]; ", arryAssign, T.pack " \\\n",
+     T.pack " if (stack_overflow(&top, (((gc_thread_data *)data)->stack_limit))) { \\\n",
+     T.pack "     mclosure0(c1, (function_type) _fn); \\\n",
+     T.pack "     GC(td, &c1, buf, ", n, T.pack "); \\\n",
+     T.pack "     return; \\\n",
+     T.pack " } else { \\\n",
+     T.pack "     (_fn)(td, (closure)_fn, ", n, T.pack ", buf); \\\n",
+     T.pack " }}\n"
+  ]
+
+macroReturnDirectWithClosure :: Int -> T.Text
+macroReturnDirectWithClosure numArgs =
+  let args = macroNPrefix numArgs (T.pack ",a")
+      n = T.pack $ show numArgs
+      arryAssign = macroArrayAssign numArgs (T.pack "buf") (T.pack "a")
+  in T.concat [
+     T.pack "#define return_direct_with_clo", n, T.pack "(td, clo, _fn", args, T.pack ") { \\\n",
+     T.pack " char top; \\\n",
+     T.pack " object buf[", n, T.pack "]; ", arryAssign, T.pack " \\\n",
+     T.pack " if (stack_overflow(&top, (((gc_thread_data *)data)->stack_limit))) { \\\n",
+     T.pack "     GC(td, clo, buf, ", n, T.pack "); \\\n",
+     T.pack "     return; \\\n",
+     T.pack " } else { \\\n",
+     T.pack "     (_fn)(td, (closure)(clo), ", n, T.pack ", buf); \\\n",
+     T.pack " }}\n"
+  ]
+
+macroReturnDirectWithObject :: Int -> T.Text
+macroReturnDirectWithObject numArgs =
+  let args = macroNPrefix numArgs (T.pack ",a")
+      n = T.pack $ show numArgs
+      arryAssign = macroArrayAssign numArgs (T.pack "buf") (T.pack "a")
+  in T.concat [
+     T.pack "#define return_direct_with_obj", n, T.pack "(td, clo, _clo_fn, _fn", args, T.pack ") { \\\n",
+     T.pack " char top; \\\n",
+     T.pack " object buf[", n, T.pack "]; ", arryAssign, T.pack " \\\n",
+     T.pack " if (stack_overflow(&top, (((gc_thread_data *)data)->stack_limit))) { \\\n",
+     T.pack "     mclosure1(c1, (function_type) _clo_fn, clo); \\\n",
+     T.pack "     GC(td, (closure)(&c1), buf, ", n, T.pack "); \\\n",
+     T.pack "     return; \\\n",
+     T.pack " } else { \\\n",
+     T.pack "     (_fn)(td, (closure)(clo), ", n, T.pack ", buf); \\\n",
+     T.pack " }}\n"
+  ]
+
+-- Generate all macros for a specific arity
+generateArityMacros :: Bool -> Int -> T.Text -> IO T.Text
+generateArityMacros optimizeWellKnownLambdas arity acc
+  | arity > maxCallArgs = return acc
+  | otherwise = do
+      vec <- readIORef callArity
+      let shouldEmit = arity == 0 || arity == 1 || arity == 2 || (arity < V.length vec && V.unsafeIndex vec arity)
+
+      let newAcc = if shouldEmit
+            then T.concat
+              [ acc
+              , macroCloscall arity
+              , macroReturnCloscall arity
+              , macroContinueOrGc arity
+              , macroReturnDirect arity
+              , macroReturnDirectWithClosure arity
+              , if optimizeWellKnownLambdas
+                  then macroReturnDirectWithObject arity
+                  else T.empty
+              ]
+            else acc
+
+      -- Continue with the next arity
+      generateArityMacros optimizeWellKnownLambdas (arity + 1) newAcc
+
+-- Main function to generate all macros
+generateAllMacros :: Bool -> IO T.Text
+generateAllMacros optimizeWellKnownLambdas =
+  generateArityMacros optimizeWellKnownLambdas 0 T.empty
+
+-- The rest of your existing ToC instances and other code...
+
+class ToC a where
+  toC :: a -> T.Text
+
+instance ToC CExpr where
+  -- Your existing implementation...
+
+instance ToC CStmt where
+  -- Your existing implementation...
+
+instance ToC CDecl where
+  -- Your existing implementation...
+
+-- Filter out assignments that copy from input_env in the main lambda.
+filterMainLambdaAssignments :: [CStmt] -> [CStmt]
+filterMainLambdaAssignments = filter (not . isInputEnvCopy)
+  where
+    isInputEnvCopy (SExpr (EBinOp "=" _ rhs)) =
+      case rhs of
+        EArrow (EVar v) _ -> v == "env"
+        _ -> False
+    isInputEnvCopy _ = False
+
+-- Format the C code for Cyclone-compatible includes
+formatCIncludes :: T.Text -> T.Text
+formatCIncludes macros = T.unlines
+  [ macros, -- Include the generated macros
+    "#include <mimalloc.h>",
+    "#include <stdlib.h>",
+    "#include <string.h>",
+    "#include <unistd.h>",
+    "#include \"base.h\"",
+    "#include \"runtime_main.h\""
+  ]
+
+-- Generate the main entry point function for Cyclone
+generateMainEntryPoint :: T.Text
+generateMainEntryPoint = T.unlines
+  [ "static void c_entry_pt_first_lambda(void *data, object clo, int argc, object *args);"
+  , "static void c_entry_pt(void *data, object clo, int argc, object *args) {"
+  , "  zyn_set_globals_changed((gc_thread_data *)data);"
+  , "  mclosure0(c_done, c_entry_pt_first_lambda);"
+  , "  object buf[1]; buf[0] = &c_done;"
+  , "  (c_done.fn)(data, &c_done, 1, buf);"
+  , "}"
+  , ""
+  , "int main(int argc, char **argv, char **envp)"
+  , "{"
+  , "  gc_thread_data *thd;"
+  , "  long stack_size = global_stack_size = STACK_SIZE;"
+  , "  long heap_size = global_heap_size = HEAP_SIZE;"
+  , "  init_polyfills();"
+  , "  mclosure0(clos_halt, &zyn_exit);"
+  , "  mclosure0(entry_pt, &c_entry_pt);"
+  , "  _cyc_argc = argc;"
+  , "  _cyc_argv = argv;"
+  , "  set_env_variables(envp);"
+  , "  gc_initialize();"
+  , "  thd = malloc(sizeof(gc_thread_data));"
+  , "  gc_thread_data_init(thd, 0, (char *) &stack_size, stack_size);"
+  , "  thd->gc_cont = &entry_pt;"
+  , "  thd->gc_args[0] = &clos_halt;"
+  , "  thd->gc_num_args = 1;"
+  , "  thd->thread_id = pthread_self();"
+  , "  gc_add_mutator(thd);"
+  , "  zyn_heap_init(heap_size);"
+  , "  thd->thread_state = ZYN_THREAD_STATE_RUNNABLE;"
+  , "  zyn_start_trampoline(thd);"
+  , "  return 0;"
+  , "}"
+  ]
+
+generateC :: [CStmt] -> [CDecl] -> [CDecl] -> T.Text
+generateC rootStmts protos decls =
+  -- Generate macros based on collected arities
+  let macrosText = unsafePerformIO $ generateAllMacros True -- True for optimizeWellKnownLambdas
+  in
+  T.concat
+    [ formatCIncludes macrosText,
+      T.unlines (map toC protos),
+      T.unlines (map toC decls),
+      "static void c_entry_pt_first_lambda(void *data, object clo, int argc, object *args) {\n",
+      "  return_direct0(data, __lambda_0);\n",
+      ";\n}\n",
+      generateMainEntryPoint
+    ]
+{-# LANGUAGE OverloadedStrings #-}
+
+module Zayin.CPS (AExp (..), CExp (..)) where
+
+import qualified Data.Text as T
+import Zayin.Literals (Literal)
+
+data CExp
+  = If AExp CExp CExp
+  | SetThen T.Text AExp CExp
+  | Call1 AExp AExp
+  | Call2 AExp AExp AExp
+  deriving (Show, Eq)
+
+data AExp
+  = Lam2 T.Text T.Text CExp
+  | Lam1 T.Text CExp
+  | Var T.Text
+  | BuiltinIdent T.Text
+  | Lit Literal
+  deriving (Show, Eq)
+{-# LANGUAGE OverloadedStrings #-}
+
+module Zayin.Codegen
+  ( CDecl (..),
+    CExpr (..),
+    CStmt (..),
+    CType (..),
+    codegen,
+  )
+where
+
+import Control.Monad (forM, forM_, void, when)
+import Control.Monad.IO.Class
+import Control.Monad.Logger
+import Control.Monad.State
+import Data.Char (isAlphaNum)
+import Data.Foldable (traverse_)
+import Data.HashMap.Strict (HashMap)
+import qualified Data.HashMap.Strict as HashMap
+import qualified Data.Map as Map
+import Data.Maybe (fromMaybe)
+import qualified Data.Set as Set
+import qualified Data.Text as T
+import Zayin.LiftedExpr
+import Zayin.Literals
+
+data CType
+  = TVoid
+  | TPtr CType
+  | TStruct T.Text
+  | TPrim T.Text  -- For basic types like int, char, etc.
+  | TArray Int CType  -- For array types
+  deriving (Show, Eq)
+
+data CExpr
+  = EVar T.Text
+  | ELitInt Integer
+  | ELitStr T.Text
+  | ELitBool Bool
+  | EBinOp T.Text CExpr CExpr
+  | EPreUnOp T.Text CExpr
+  | EArrow CExpr T.Text         -- For pointer member access (p->member)
+  | EMember CExpr T.Text        -- For direct member access (obj.member)
+  | EIndex CExpr CExpr          -- For array indexing (arr[idx])
+  | ECast CExpr CType
+  | EMacroCall String [CExpr]
+  | ETernary CExpr CExpr CExpr  -- condition ? then : else
+  | ENull
+  deriving (Show, Eq)
+
+data CStmt
+  = SExpr CExpr
+  | SDecl CDecl
+  | SIf CExpr CStmt CStmt
+  | SBlock [CStmt]
+  deriving (Show, Eq)
+
+data CDecl
+  = DStruct {dName :: T.Text, dMembers :: [(T.Text, CType)]}
+  | DFunProto {dName :: T.Text, dRetType :: CType, dParams :: [(T.Text, CType)], dNoreturn :: Bool, dStatic :: Bool}
+  | DFun {dName :: T.Text, dRetType :: CType, dParams :: [(T.Text, CType)], dBody :: [CStmt], dComment :: Maybe T.Text, dStatic :: Bool}
+  | DVar {dName :: T.Text, dType :: CType, dInit :: Maybe CExpr}
+  deriving (Show, Eq)
+
+data CodegenCtx = CodegenCtx
+  { ctxVarId :: Int,
+    ctxProtos :: [CDecl],
+    ctxDecls :: [CDecl],
+    ctxStmts :: [CStmt],
+    ctxLambdas :: HashMap Int LiftedLambda,
+    ctxLambdaEnvs :: HashMap Int T.Text,
+    ctxDebugMode :: Bool, -- Added debug flag to context
+    ctxUsedArities :: Set.Set Int
+  }
+
+initialCtx :: Bool -> HashMap Int LiftedLambda -> CodegenCtx
+initialCtx debugMode lambdas = CodegenCtx 0 [] [] [] lambdas HashMap.empty debugMode Set.empty
+
+type Codegen a = LoggingT (StateT CodegenCtx IO) a
+
+-- Logger helper that respects debug flag
+logDebugWhen :: T.Text -> Codegen ()
+logDebugWhen msg = do
+  debugMode <- gets ctxDebugMode
+  when debugMode $ logDebugN msg
+
+genVarId :: Codegen Int
+genVarId = do
+  ctx <- lift get
+  let varId = ctxVarId ctx
+  put ctx {ctxVarId = varId + 1}
+  return varId
+
+genVar :: Codegen T.Text
+genVar = do
+  varId <- genVarId
+  return $ "var_" <> T.pack (show varId)
+
+-- Mangle a Scheme identifier to a valid C identifier
+mangle :: T.Text -> T.Text
+mangle name =
+  let
+    -- Replace special characters with C-safe alternatives
+    replace c
+      | c == '-' = "_"  -- Common in Scheme identifiers
+      | c == '?' = "_QMARK_"
+      | c == '!' = "_BANG_"
+      | c == '<' = "_LT_"
+      | c == '>' = "_GT_"
+      | c == '=' = "_EQ_"
+      | c == '+' = "_PLUS_"
+      | c == '*' = "_STAR_"
+      | c == '/' = "_SLASH_"
+      | c == '%' = "_PERCENT_"
+      | c == '&' = "_AMPERSAND_"
+      | c == ':' = "_COLON_"
+      | c == '.' = "_DOT_"
+      | c == '$' = "_DOLLAR_"
+      | c == '@' = "_AT_"
+      | c == '#' = "_HASH_"
+      | c == '~' = "_TILDE_"
+      | c == '^' = "_CARET_"
+      | c == '`' = "_BACKTICK_"
+      | c == '\'' = "_QUOTE_"
+      | c == '\"' = "_DQUOTE_"
+      | c == '\\' = "_BACKSLASH_"
+      | c == '|' = "_PIPE_"
+      | otherwise = T.singleton c
+
+    -- Replace each character
+    replaced = T.concatMap replace name
+
+    -- Ensure the name doesn't start with a digit (not valid in C)
+    prefixed = if T.null replaced
+               then "var"  -- Empty names aren't valid
+               else if isDigit (T.head replaced)
+                    then "r_" <> replaced  -- Prefix with r_ if starts with digit
+                    else replaced
+
+    -- Add prefix for Scheme special forms and lambda variables
+    special = if T.isPrefixOf "k$" prefixed
+              then "k_" <> T.drop 2 prefixed  -- continuation variables
+              else if T.isPrefixOf "self$" prefixed
+                   then "self_" <> T.drop 5 prefixed  -- self/closure variables
+                   else prefixed
+  in
+    special
+  where
+    isDigit c = c >= '0' && c <= '9'
+
+-- Mangle a global variable name
+mangleGlobal :: T.Text -> T.Text
+mangleGlobal name =
+  let base = mangle name
+  in "global_" <> base  -- Add prefix to avoid conflicts with local variables
+
+markArity :: Int -> Codegen ()
+markArity arity =
+  when (arity >= 0 && arity <= 10000) $ -- Maximum arity check
+    lift $ modify $ \ctx ->
+      ctx { ctxUsedArities = Set.insert arity (ctxUsedArities ctx) }
+
+markDefaultArities :: Codegen ()
+markDefaultArities = do
+  markArity 0
+  markArity 1
+  markArity 2
+
+addProto :: CDecl -> Codegen ()
+addProto proto = lift $ modify $ \ctx ->
+  ctx {ctxProtos = proto : ctxProtos ctx}
+
+addDecl :: CDecl -> Codegen ()
+addDecl decl = lift $ modify $ \ctx ->
+  ctx {ctxDecls = decl : ctxDecls ctx}
+
+addStmt :: CStmt -> Codegen ()
+addStmt stmt = lift $ modify $ \ctx ->
+  ctx {ctxStmts = stmt : ctxStmts ctx}
+
+clearStmts :: Codegen ()
+clearStmts = lift $ modify $ \ctx ->
+  ctx {ctxStmts = []}
+
+-- A function to name free variables
+nameForFreeVar :: T.Text -> T.Text
+nameForFreeVar name =
+  "v_" <> mangle name  -- Prefix with v_ for variables
+
+withStmtScope :: Codegen a -> Codegen (a, [CStmt])
+withStmtScope action = do
+  logDebugWhen "=== withStmtScope ==="
+  -- Save current statements
+  oldStmts <- gets ctxStmts
+  logDebugWhen $ "oldStmts: " <> T.pack (show oldStmts)
+  -- Clear statement buffer
+  lift $ modify $ \ctx -> ctx {ctxStmts = []}
+  clearedStmts <- gets ctxStmts
+  logDebugWhen $ "cleared ctx: " <> T.pack (show clearedStmts)
+  -- Run the action
+  result <- action
+
+  -- Get the new statements
+  newStmts <- gets ctxStmts
+  logDebugWhen $ "newStmts " <> T.pack (show newStmts)
+  -- Restore old statements
+  lift $ modify $ \ctx -> ctx {ctxStmts = oldStmts}
+  restoredStmts <- gets ctxStmts
+  logDebugWhen $ "restored ctx: " <> T.pack (show restoredStmts)
+  -- Return result and statements from this scope
+  return (result, reverse newStmts)
+
+objectType :: CType
+objectType = TPtr (TStruct "object")
+
+envStruct :: LiftedLambda -> Codegen CDecl
+envStruct lambda = do
+  let captured = Set.fromList (filter (not . T.isPrefixOf "_unused") (params lambda))
+      unionFree = Set.union (freeVars lambda) captured
+      members = map (\v -> (nameForFreeVar v, objectType)) (Set.toList unionFree)
+      filtered = filter (\(name, _) -> name /= "v_") members
+  logDebugWhen $
+    "envStruct for lambda "
+      <> T.pack (show (lambdaId lambda))
+      <> ": freeVars = "
+      <> T.pack (show (Set.toList (freeVars lambda)))
+      <> ", params = "
+      <> T.pack (show (params lambda))
+      <> ", captured = "
+      <> T.pack (show (Set.toList captured))
+      <> ", union = "
+      <> T.pack (show (Set.toList unionFree))
+      <> ", filtered = "
+      <> T.pack (show filtered)
+  return $
+    DStruct
+      { dName = "env_" <> T.pack (show (lambdaId lambda)),
+        dMembers = filtered
+      }
+
+constructEnvCode :: LiftedLambda -> T.Text -> CStmt
+constructEnvCode lambda dest =
+  SExpr $
+    EMacroCall
+      "OBJECT_ENV_OBJ_NEW"
+      [ EVar dest,
+        EVar $ "struct env_" <> T.pack (show $ lambdaId lambda)
+      ]
+
+merge xs ys = concatMap (\(x, y) -> [x, y]) (zip xs ys)
+
+makeEnvCode :: LiftedLambda -> CExpr -> Codegen CExpr
+makeEnvCode lambda parentEnv = do
+  envVar <- genVar
+  addStmt $ constructEnvCode lambda envVar
+  let envAccess = generateEnvCast lambda (EVar envVar)
+      parentEnvAccess = parentEnv
+      captured = Set.fromList (filter (not . T.isPrefixOf "_unused") (params lambda))
+      toCopy = Set.union (freeVars lambda) captured
+      freeVarsList = Set.toList toCopy
+  traverse_
+    ( \var ->
+        addStmt $
+          SExpr $
+            EBinOp
+              "="
+              (EArrow envAccess (nameForFreeVar var))
+              (EArrow parentEnvAccess (nameForFreeVar var))
+    )
+    freeVarsList
+  return $ EVar envVar
+
+generateClosure :: LiftedLambda -> CExpr -> Codegen CExpr
+generateClosure lambda currentEnv = do
+  logDebugWhen $ "Generating closure for lambda: " <> T.pack (show $ lambdaId lambda)
+
+  -- Create a variable name for the closure
+  varName <- genVar
+
+  -- Generate function name in Cyclone format
+  let lambdaName = "__lambda_" <> T.pack (show $ lambdaId lambda)
+
+  -- In Cyclone's style, use mclosure0
+  addStmt $ SExpr $ EMacroCall "mclosure0" [EVar varName, EVar lambdaName]
+
+  -- Set number of arguments if needed
+  when (not (null (params lambda))) $ do
+    addStmt $ SExpr $ EBinOp "="
+                           (EMember (EVar varName) "num_args")  -- var.num_args (not var->num_args)
+                           (ELitInt $ fromIntegral $ length $ params lambda)
+
+  return $ EVar varName
+
+generateEnvCast :: LiftedLambda -> CExpr -> CExpr
+generateEnvCast lambda expr =
+  ECast
+    (EPreUnOp "&" (EArrow expr "env"))
+    (TPtr $ TStruct $ "env_" <> T.pack (show $ lambdaId lambda))
+
+-- Updated filterEnvAssignments to check debug flag from context
+filterEnvAssignments :: [CStmt] -> Set.Set T.Text -> Codegen [CStmt]
+filterEnvAssignments stmts allowedSet =
+  mapM filterStmt stmts
+  where
+    filterStmt stmt = case stmt of
+      SExpr (EBinOp "=" lhs rhs) ->
+        case lhs of
+          EArrow _ attr | not (attr `Set.member` allowedSet) -> do
+            logDebugWhen $ "=== filterEnvAssignments stmt: " <> T.pack (show stmt) <> " ==="
+            logDebugWhen $ "=== filterEnvAssignments allowedSet: " <> T.pack (show allowedSet) <> " ==="
+            return $ SExpr (ELitInt 0)
+          _ -> return stmt
+      _ -> return stmt
+
+mapExceptLast :: (a -> a) -> [a] -> [a]
+mapExceptLast _ [] = []
+mapExceptLast _ [x] = [x]
+mapExceptLast f (x : xs) = f x : mapExceptLast f xs
+
+mapExceptLastM :: (Monad m) => (T.Text -> m (T.Text, T.Text)) -> [T.Text] -> m [(T.Text, T.Text)]
+mapExceptLastM _ [] = return []
+mapExceptLastM _ [_] = return [] -- Single element case returns empty list since we don't transform the last
+mapExceptLastM f (x : xs@(_ : _)) = do
+  y <- f x
+  ys <- mapExceptLastM f xs
+  return (y : ys)
+
+generateFunc :: LiftedLambda -> Codegen ()
+generateFunc lambda = do
+  logDebugWhen $ "=== generateFunc for lambda: " <> T.pack (show (lambdaId lambda)) <> " ==="
+
+  -- Add prototype in Cyclone format
+  addProto
+    DFunProto
+      { dName = "__lambda_" <> T.pack (show (lambdaId lambda)),
+        dRetType = TVoid,
+        dParams = [("data", TPtr TVoid),         -- void *data
+                  ("clo", TStruct "object"), -- object _
+                  ("argc", TPrim "int"),         -- int argc
+                  ("args", TPtr (TStruct "object"))], -- object *args
+        dNoreturn = False,
+        dStatic = True  -- Add static modifier
+      }
+
+  -- Generate function body
+  (bodyExpr, bodyStmts) <- withStmtScope $ do
+    -- Access arguments based on pattern matching against the type of lambda
+    case (params lambda) of
+      [] -> do
+        -- No parameters, just generate the body
+        void $ generateBodyAndReturn lambda (EVar "data")
+
+      [param] -> do
+        -- One parameter - using array indexing syntax
+        addStmt $
+          SDecl $
+            DVar
+              { dName = mangle param,
+                dType = TStruct "object",
+                dInit = Just $ EIndex (EVar "args") (ELitInt 0) -- args[0] syntax
+              }
+        void $ generateBodyAndReturn lambda (EVar "data")
+
+      [param1, param2] -> do
+        -- Two parameters
+        addStmt $
+          SDecl $
+            DVar
+              { dName = mangle param1,
+                dType = TStruct "object",
+                dInit = Just $ EIndex (EVar "args") (ELitInt 0) -- args[0]
+              }
+        addStmt $
+          SDecl $
+            DVar
+              { dName = mangle param2,
+                dType = TPtr (TStruct "object"),
+                dInit = Just $ EIndex (EVar "args") (ELitInt 1) -- args[1]
+              }
+        void $ generateBodyAndReturn lambda (EVar "data")
+
+      _ -> do
+        -- More parameters (unlikely in simple examples)
+        void $ generateBodyAndReturn lambda (EVar "data")
+
+    -- Return empty expression since we've already added returns
+    return $ ELitInt 0
+
+  -- Add the function definition with comments matching Cyclone's style
+  let paramComment = formatParamComment (params lambda)
+  addDecl
+    DFun
+      { dName = "__lambda_" <> T.pack (show (lambdaId lambda)),
+        dRetType = TVoid,
+        dParams = [("data", TPtr TVoid),         -- void *data
+                  ("_", TStruct "object"),       -- object _
+                  ("argc", TPrim "int"),         -- int argc
+                  ("args", TPtr (TStruct "object"))], -- object *args
+        dBody = bodyStmts,
+        dComment = Just paramComment,  -- Add the parameter comment
+        dStatic = True  -- Add static modifier
+      }
+
+-- Format parameter comment in Cyclone style
+formatParamComment :: [T.Text] -> T.Text
+formatParamComment [] = "closure _"
+formatParamComment [p] = "closure _,object " <> p
+formatParamComment params =
+  "closure _," <> T.intercalate "," (map (\p -> "object " <> p) params)
+
+-- Generate body expression and add appropriate return statement
+generateBodyAndReturn :: LiftedLambda -> CExpr -> Codegen CExpr
+generateBodyAndReturn lambda env = do
+  case body lambda of
+    -- Direct function call with integer literal
+    Lit (LInt n) ->
+      -- Handle simple integer return like Cyclone does
+      do
+        nextLambdaId <- getNextLambdaId lambda
+        addStmt $ SExpr $ EMacroCall "return_direct1"
+          [EVar "data",
+           EVar ("__lambda_" <> T.pack (show nextLambdaId)),
+           EMacroCall "obj_int2obj" [ELitInt n]]
+        return $ ELitInt n
+
+    -- Call to a built-in function - simplify this case
+    CallOne (BuiltinIdent name) arg -> do
+      -- Get next lambda ID directly
+      nextLambdaId <- getNextLambdaId lambda
+
+      -- Generate code for the argument
+      argExpr <- doCodegen arg env
+
+      -- Return directly to next lambda with the result of built-in call
+      -- This is more similar to Cyclone's approach
+      addStmt $ SExpr $ EMacroCall "return_direct1"
+        [EVar "data",
+         EVar ("__lambda_" <> T.pack (show nextLambdaId)),
+         EMacroCall (T.unpack name) [env, argExpr]]
+
+      return $ ELitInt 0  -- Return value doesn't matter here
+
+    -- Function call with two arguments - simplify similarly
+    CallTwo fn arg1 arg2 -> do
+      nextLambdaId <- getNextLambdaId lambda
+
+      -- For arithmetic operations like +
+      case fn of
+        BuiltinIdent "zyn_sum" -> do
+          arg1Expr <- doCodegen arg1 env
+          arg2Expr <- doCodegen arg2 env
+
+          -- Direct return with the sum result
+          addStmt $ SExpr $ EMacroCall "return_direct1"
+            [EVar "data",
+             EVar ("__lambda_" <> T.pack (show nextLambdaId)),
+             EMacroCall "zyn_sum" [env, arg1Expr, arg2Expr]]
+
+          return $ ELitInt 0
+
+        BuiltinIdent "+" -> do
+          -- Similar to zyn_sum case
+          arg1Expr <- doCodegen arg1 env
+          arg2Expr <- doCodegen arg2 env
+
+          addStmt $ SExpr $ EMacroCall "return_direct1"
+            [EVar "data",
+             EVar ("__lambda_" <> T.pack (show nextLambdaId)),
+             EMacroCall "zyn_sum" [env, arg1Expr, arg2Expr]]
+
+          return $ ELitInt 0
+
+        -- General case - simplify similarly
+        _ -> do
+          fnExpr <- doCodegen fn env
+          arg1Expr <- doCodegen arg1 env
+          arg2Expr <- doCodegen arg2 env
+
+          addStmt $ SExpr $ EMacroCall "return_direct1"
+            [EVar "data",
+             EVar ("__lambda_" <> T.pack (show nextLambdaId)),
+             EMacroCall "zyn_apply" [env, fnExpr, ELitInt 2, arg1Expr, arg2Expr]]
+
+          return $ ELitInt 0
+
+    -- Default case - generate expression and return directly
+    _ -> do
+      expr <- doCodegen (body lambda) env
+      nextLambdaId <- getNextLambdaId lambda
+      addStmt $ SExpr $ EMacroCall "return_direct1" [env, EVar ("__lambda_" <> T.pack (show nextLambdaId)), expr]
+      return expr
+
+
+-- Helper function to determine the ID of the next lambda in the continuation chain
+getNextLambdaId :: LiftedLambda -> Codegen Int
+getNextLambdaId lambda = do
+  -- In a real implementation, you'd need to determine this based on
+  -- your CPS transformation or lambda lifting phase
+  return (lambdaId lambda + 1)
+
+-- Non-monadic version for direct use in patterns
+getNextLambdaId' :: LiftedLambda -> Int
+getNextLambdaId' lambda = lambdaId lambda + 1
+
+builtinIdentCodegen :: T.Text -> Codegen CExpr
+builtinIdentCodegen ident = do
+  let (numParams, runtimeName) = case ident of
+        "tostring" -> (2, "to_string_k")
+        "display" -> (2, "display_k")
+        "exit" -> (1, "exit_k")
+        "+" -> (2, "add_k")
+        "-" -> (2, "sub_k")
+        "*" -> (2, "mul_k")
+        "/" -> (2, "div_k")
+        "%" -> (2, "mod_k")
+        "^" -> (2, "xor_k")
+        "<" -> (2, "lt_k")
+        "<=" -> (2, "leq_k")
+        ">" -> (2, "gt_k")
+        ">=" -> (2, "geq_k")
+        "not" -> (2, "not_k")
+        "cons" -> (2, "cons_k")
+        "cons?" -> (2, "is_cons_k")
+        "null?" -> (2, "is_null_k")
+        "car" -> (2, "car_k")
+        "cdr" -> (2, "cdr_k")
+        "string-concat" -> (2, "string_concat_k")
+        "string-chars" -> (2, "string_chars_k")
+        "ht-new" -> (2, "ht_new_k")
+        "ht-set!" -> (2, "ht_set_k")
+        "ht-get" -> (2, "ht_get_k")
+        "ht-del!" -> (2, "ht_del_k")
+        "ht-keys" -> (2, "ht_keys_k")
+        "eq?" -> (2, "eq_k")
+        _ -> error $ "unknown builtin: " ++ T.unpack ident
+
+  let initName = case numParams of
+        1 -> "OBJECT_CLOSURE_ONE_NEW"
+        2 -> "OBJECT_CLOSURE_TWO_NEW"
+        n -> error $ "closure had " ++ show n ++ " parameters"
+
+  (varName, stmts) <- withStmtScope $ do
+    name <- genVar
+    addStmt $
+      SExpr $
+        EMacroCall
+          initName
+          [ EVar name,
+            EVar runtimeName,
+            ENull
+          ]
+    return name
+
+  traverse_ addStmt stmts
+  return $ EVar varName
+
+doCodegen :: LExpr -> CExpr -> Codegen CExpr
+doCodegen expr currentEnv = do
+  case expr of
+    Var name ->
+      return $ EVar $ mangle name
+
+    Lit lit ->
+      case lit of
+        LInt n -> return $ EMacroCall "obj_int2obj" [ELitInt n]
+        LString s -> return $ EMacroCall "zyn_make_string" [currentEnv, ELitStr s, ELitInt $ fromIntegral $ T.length s]
+        LBool True -> return $ EVar "boolean_t"
+        LBool False -> return $ EVar "boolean_f"
+        LNil -> return $ EVar "NULL"
+
+    Lifted id -> do
+      logDebugWhen $ "Processing Lifted: " <> T.pack (show id)
+      ctx <- get
+      case HashMap.lookup id (ctxLambdas ctx) of
+        Just lambda -> generateClosure lambda currentEnv
+        Nothing -> error $ "Unknown lambda id: " ++ show id
+
+    BuiltinIdent name ->
+      -- Return the builtin function name directly
+      return $ EVar name
+
+    CallOne fn arg -> do
+      -- Optimize for common patterns in Cyclone-style code
+      case fn of
+        -- Handle builtin functions specially
+        BuiltinIdent name -> do
+          -- Create continuation closure
+          contVarName <- genVar
+          addStmt $ SExpr $ EMacroCall "mclosure0" [EVar contVarName, EVar "__lambda_3"]
+
+          -- Generate argument
+          argExpr <- doCodegen arg currentEnv
+
+          -- Call the builtin with continuation
+          resultVarName <- genVar
+          addStmt $
+            SDecl $
+              DVar
+                { dName = resultVarName,
+                  dType = TPtr (TStruct "object"),
+                  dInit = Just $ EMacroCall (T.unpack name) [currentEnv, EVar contVarName, ELitInt 1, argExpr]
+                }
+
+          return $ EVar resultVarName
+
+        -- For lifted lambdas (closure calls)
+        Lifted id -> do
+          argExpr <- doCodegen arg currentEnv
+          lambdaName <- genVar
+
+          -- Here we'd need to look up the function name
+          addStmt $ SExpr $ EMacroCall "mclosure0" [EVar lambdaName, EVar ("__lambda_" <> T.pack (show id))]
+
+          -- For simple return
+          return $ EVar lambdaName
+
+        -- General case
+        _ -> do
+          fnExpr <- doCodegen fn currentEnv
+          argExpr <- doCodegen arg currentEnv
+
+          -- Create a temporary result variable
+          resultVarName <- genVar
+          addStmt $
+            SDecl $
+              DVar
+                { dName = resultVarName,
+                  dType = TPtr (TStruct "object"),
+                  dInit = Just $ EMacroCall "zyn_apply" [currentEnv, fnExpr, ELitInt 1, argExpr]
+                }
+
+          return $ EVar resultVarName
+
+    CallTwo fn arg1 arg2 -> do
+      -- Special case for arithmetic operators
+      case fn of
+        BuiltinIdent "zyn_sum" -> do
+          -- Handle addition in Cyclone style
+          arg1Expr <- doCodegen arg1 currentEnv
+          arg2Expr <- doCodegen arg2 currentEnv
+
+          -- Create continuation closure
+          contVarName <- genVar
+          addStmt $ SExpr $ EMacroCall "mclosure0" [EVar contVarName, EVar "__lambda_3"]
+
+          -- Call Cyc_sum directly
+          resultVarName <- genVar
+          addStmt $
+            SDecl $
+              DVar
+                { dName = resultVarName,
+                  dType = TPtr (TStruct "object"),
+                  dInit = Just $ EMacroCall "zyn_sum" [currentEnv, EVar contVarName, ELitInt 2, arg1Expr, arg2Expr]
+                }
+
+          return $ EVar resultVarName
+
+        BuiltinIdent "+" -> do
+          -- Handle addition in Cyclone style
+          arg1Expr <- doCodegen arg1 currentEnv
+          arg2Expr <- doCodegen arg2 currentEnv
+
+          -- Create continuation closure
+          contVarName <- genVar
+          addStmt $ SExpr $ EMacroCall "mclosure0" [EVar contVarName, EVar "__lambda_3"]
+
+          -- Call Cyc_sum directly
+          resultVarName <- genVar
+          addStmt $
+            SDecl $
+              DVar
+                { dName = resultVarName,
+                  dType = TPtr (TStruct "object"),
+                  dInit = Just $ EMacroCall "zyn_sum" [currentEnv, EVar contVarName, ELitInt 2, arg1Expr, arg2Expr]
+                }
+
+          return $ EVar resultVarName
+
+        -- General case for two-argument functions
+        _ -> do
+          fnExpr <- doCodegen fn currentEnv
+          arg1Expr <- doCodegen arg1 currentEnv
+          arg2Expr <- doCodegen arg2 currentEnv
+
+          -- Create a temporary result variable
+          resultVarName <- genVar
+          addStmt $
+            SDecl $
+              DVar
+                { dName = resultVarName,
+                  dType = TPtr (TStruct "object"),
+                  dInit = Just $ EMacroCall "zyn_apply" [currentEnv, fnExpr, ELitInt 2, arg1Expr, arg2Expr]
+                }
+
+          return $ EVar resultVarName
+
+    -- Handle other expression types
+    SetThen var valueExpr nextExpr -> do
+      valueExprResult <- doCodegen valueExpr currentEnv
+      addStmt $ SExpr $ EBinOp "=" (EVar $ mangle var) valueExprResult
+      doCodegen nextExpr currentEnv
+
+    If condExpr thenExpr elseExpr -> do
+      condExprResult <- doCodegen condExpr currentEnv
+      thenResult <- genVar
+      elseResult <- genVar
+
+      -- Generate the then branch
+      thenExprResult <- doCodegen thenExpr currentEnv
+      addStmt $
+        SDecl $
+          DVar
+            { dName = thenResult,
+              dType = TPtr (TStruct "object"),
+              dInit = Just thenExprResult
+            }
+
+      -- Generate the else branch
+      elseExprResult <- doCodegen elseExpr currentEnv
+      addStmt $
+        SDecl $
+          DVar
+            { dName = elseResult,
+              dType = TPtr (TStruct "object"),
+              dInit = Just elseExprResult
+            }
+
+      -- Return the conditional result
+      resultVarName <- genVar
+      addStmt $
+        SDecl $
+          DVar
+            { dName = resultVarName,
+              dType = TPtr (TStruct "object"),
+              dInit = Just $ ETernary (EBinOp "!=" condExprResult (EVar "boolean_f"))
+                                      (EVar thenResult)
+                                      (EVar elseResult)
+            }
+
+      return $ EVar resultVarName
+
+-- Updated codegen to take debug flag
+codegen :: Bool -> LExpr -> HashMap Int LiftedLambda -> IO ([CStmt], [CDecl], [CDecl])
+codegen debugMode expr lambdas = do
+  let ctx = initialCtx debugMode lambdas
+  (finalExpr, finalCtx) <-
+    runStateT
+      ( runStderrLoggingT $ do
+          logDebugWhen $ "Starting codegen with lambdas: " <> T.pack (show (HashMap.keys lambdas))
+          traverse_
+            ( \l -> do
+                logDebugWhen $ "Processing lambda " <> T.pack (show (lambdaId l))
+                -- Do not union in any extra free–variables from the parent.
+                struct <- envStruct l
+                addProto struct
+                generateFunc l
+            )
+            (HashMap.elems lambdas)
+          logDebugWhen "Starting main doCodegen"
+
+          -- Instead of generating complex expressions for the entry point,
+          -- just compile the main expression but don't add any statements
+          -- since we'll directly jump to the first lambda in the entry point
+          (expr', _) <- withStmtScope $ do
+            result <- doCodegen expr (EVar "env")
+            return result
+
+          -- Don't add any statements to the root - the entry point will
+          -- directly call the first lambda
+          return expr'
+      )
+      ctx
+  return
+    ( [],  -- Empty root statements - entry point will call first lambda directly
+      reverse $ ctxProtos finalCtx,
+      reverse $ ctxDecls finalCtx
+    )
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
+
+module Zayin.FlatExpr (FExpr (..), liftLambdas) where
+
+import Debug.Trace (trace)
+import Data.HashMap.Strict (HashMap)
+import qualified Data.HashMap.Strict as HashMap
+import Data.Set (Set)
+import qualified Data.Set as Set
+import qualified Data.Text as T
+import qualified Zayin.LiftedExpr as L
+import Zayin.Literals (Literal)
+
+data FExpr
+  = If FExpr FExpr FExpr
+  | LamOne T.Text FExpr
+  | LamTwo T.Text T.Text FExpr
+  | Var T.Text
+  | Lit Literal
+  | BuiltinIdent T.Text
+  | SetThen T.Text FExpr FExpr
+  | CallOne FExpr FExpr
+  | CallTwo FExpr FExpr FExpr
+  deriving (Show, Eq)
+
+data LiftingContext = LiftingContext
+  { nextId :: Int,
+    lambdas :: HashMap Int L.LiftedLambda
+  }
+
+initialContext :: LiftingContext
+initialContext = LiftingContext 0 HashMap.empty
+
+getFreshId :: LiftingContext -> (Int, LiftingContext)
+getFreshId ctx = (nextId ctx, ctx {nextId = nextId ctx + 1})
+
+addLambda :: L.LiftedLambda -> LiftingContext -> LiftingContext
+addLambda lambda ctx = ctx {lambdas = HashMap.insert (L.lambdaId lambda) lambda (lambdas ctx)}
+
+freeVars :: FExpr -> Set T.Text
+freeVars expr = case expr of
+  If c t f -> Set.unions [freeVars c, freeVars t, freeVars f]
+  LamOne p e -> Set.delete p (freeVars e)
+  LamTwo p1 p2 e -> Set.delete p1 (Set.delete p2 (freeVars e))
+  Var v -> Set.singleton v
+  Lit _ -> Set.empty
+  BuiltinIdent _ -> Set.empty
+  SetThen v e1 e2 -> Set.unions [Set.singleton v, freeVars e1, freeVars e2]
+  CallOne f x -> Set.union (freeVars f) (freeVars x)
+  CallTwo f x y -> Set.unions [freeVars f, freeVars x, freeVars y]
+
+freeVarsLExpr :: HashMap Int L.LiftedLambda -> L.LExpr -> Set T.Text
+freeVarsLExpr lambdaMap expr = case expr of
+  L.If c t f ->
+    freeVarsLExpr lambdaMap c `Set.union`
+    freeVarsLExpr lambdaMap t `Set.union`
+    freeVarsLExpr lambdaMap f
+  L.Var v -> Set.singleton v
+  L.Lit _ -> Set.empty
+  L.BuiltinIdent _ -> Set.empty
+  L.SetThen v e1 e2 ->
+    Set.unions [Set.singleton v, freeVarsLExpr lambdaMap e1, freeVarsLExpr lambdaMap e2]
+  L.CallOne f x ->
+    freeVarsLExpr lambdaMap f `Set.union` freeVarsLExpr lambdaMap x
+  L.CallTwo f x y ->
+    freeVarsLExpr lambdaMap f `Set.union`
+    freeVarsLExpr lambdaMap x `Set.union`
+    freeVarsLExpr lambdaMap y
+  L.Lifted i ->
+    case HashMap.lookup i lambdaMap of
+      Just liftedLambda -> L.freeVars liftedLambda  -- use the field from the lifted lambda record
+      Nothing -> Set.empty
+
+-- Use trace for debugging, which is safe in pure code
+debugTrace :: Bool -> String -> a -> a
+debugTrace False _ x = x
+debugTrace True msg x = trace msg x
+
+liftLambdasM :: Bool -> FExpr -> LiftingContext -> (L.LExpr, LiftingContext)
+liftLambdasM debugMode expr ctx =
+  debugTrace debugMode
+    ( "\n=== Lambda Lifting: Processing expression ===\n"
+        ++ "Expression: "
+        ++ show expr
+        ++ "\n"
+        ++ "Current context ID: "
+        ++ show (nextId ctx)
+    )
+    $ case expr of
+      LamOne param body ->
+        let (body', ctx1) = liftLambdasM debugMode body ctx
+            free = freeVarsLExpr (lambdas ctx1) body' -- Compute free vars AFTER lifting nested lambdas
+            (id, ctx2) = getFreshId ctx1
+            lambda = L.LiftedLambda id [param] free body'
+            ctx3 = addLambda lambda ctx2
+            result = (L.Lifted id, ctx3)
+         in debugTrace debugMode
+              ( "\nLifting LamOne: param="
+                  ++ show param
+                  ++ "\n"
+                  ++ "Free variables: "
+                  ++ show free
+                  ++ "\n"
+                  ++ "Assigned lambda ID: "
+                  ++ show id
+                  ++ "\n"
+                  ++ "Processed body: "
+                  ++ show body'
+                  ++ "\n"
+                  ++ "Created lambda: "
+                  ++ show lambda
+              )
+              result
+      LamTwo p1 p2 body ->
+        let (body', ctx1) = liftLambdasM debugMode body ctx
+            free = freeVarsLExpr (lambdas ctx1) body' -- Compute free vars AFTER lifting nested lambdas
+            (id, ctx2) = getFreshId ctx1
+            lambda = L.LiftedLambda id [p1, p2] free body'
+            ctx3 = addLambda lambda ctx2
+            result = (L.Lifted id, ctx3)
+         in debugTrace debugMode
+              ( "\nLifting LamTwo: params="
+                  ++ show [p1, p2]
+                  ++ "\n"
+                  ++ "Free variables: "
+                  ++ show free
+                  ++ "\n"
+                  ++ "Assigned lambda ID: "
+                  ++ show id
+                  ++ "\n"
+                  ++ "Processed body: "
+                  ++ show body'
+                  ++ "\n"
+                  ++ "Created lambda: "
+                  ++ show lambda
+              )
+              result
+      If c t f ->
+        let (c', ctx1) = liftLambdasM debugMode c ctx
+            (t', ctx2) = liftLambdasM debugMode t ctx1
+            (f', ctx3) = liftLambdasM debugMode f ctx2
+            result = (L.If c' t' f', ctx3)
+         in debugTrace debugMode
+              ( "\nProcessing If expression\n"
+                  ++ "Processed condition: "
+                  ++ show c'
+                  ++ "\n"
+                  ++ "Processed then branch: "
+                  ++ show t'
+                  ++ "\n"
+                  ++ "Processed else branch: "
+                  ++ show f'
+                  ++ "\n"
+                  ++ "Final If expression: If "
+                  ++ show c'
+                  ++ " "
+                  ++ show t'
+                  ++ " "
+                  ++ show f'
+              )
+              result
+      SetThen v e1 e2 ->
+        let (e1', ctx1) = liftLambdasM debugMode e1 ctx
+            (e2', ctx2) = liftLambdasM debugMode e2 ctx1
+            result = (L.SetThen v e1' e2', ctx2)
+         in debugTrace debugMode
+              ( "\nProcessing SetThen: var="
+                  ++ show v
+                  ++ "\n"
+                  ++ "Processed value expression: "
+                  ++ show e1'
+                  ++ "\n"
+                  ++ "Processed continuation: "
+                  ++ show e2'
+                  ++ "\n"
+                  ++ "Final SetThen: "
+                  ++ show v
+                  ++ " "
+                  ++ show e1'
+                  ++ " "
+                  ++ show e2'
+              )
+              result
+      CallOne f x -> case f of
+        BuiltinIdent i ->
+          let (x', ctx1) = liftLambdasM debugMode x ctx
+              result = (L.CallOne (L.BuiltinIdent i) x', ctx1)
+           in debugTrace debugMode
+                ( "\nProcessing CallOne (Builtin)\n"
+                    ++ "Direct builtin: "
+                    ++ show i
+                    ++ "\n"
+                    ++ "Processed argument: "
+                    ++ show x'
+                    ++ "\n"
+                    ++ "Final CallOne: BuiltinIdent "
+                    ++ show i
+                    ++ " "
+                    ++ show x'
+                )
+                result
+        _ ->
+          let (f', ctx1) = liftLambdasM debugMode f ctx
+              (x', ctx2) = liftLambdasM debugMode x ctx1
+              result = (L.CallOne f' x', ctx2)
+           in debugTrace debugMode
+                ( "\nProcessing CallOne\n"
+                    ++ "Processed function: "
+                    ++ show f'
+                    ++ "\n"
+                    ++ "Processed argument: "
+                    ++ show x'
+                    ++ "\n"
+                    ++ "Final CallOne: "
+                    ++ show f'
+                    ++ " "
+                    ++ show x'
+                )
+                result
+      CallTwo f x y -> case f of
+        BuiltinIdent i ->
+          let (x', ctx1) = liftLambdasM debugMode x ctx
+              (y', ctx2) = liftLambdasM debugMode y ctx1
+              result = (L.CallTwo (L.BuiltinIdent i) x' y', ctx2)
+           in debugTrace debugMode
+                ( "\nProcessing CallTwo (Builtin)\n"
+                    ++ "Direct builtin: "
+                    ++ show i
+                    ++ "\n"
+                    ++ "Processed first argument: "
+                    ++ show x'
+                    ++ "\n"
+                    ++ "Processed second argument: "
+                    ++ show y'
+                    ++ "\n"
+                    ++ "Final CallTwo: BuiltinIdent "
+                    ++ show i
+                    ++ " "
+                    ++ show x'
+                    ++ " "
+                    ++ show y'
+                    ++ "\n"
+                )
+                result
+        _ ->
+          let (f', ctx1) = liftLambdasM debugMode f ctx
+              (x', ctx2) = liftLambdasM debugMode x ctx1
+              (y', ctx3) = liftLambdasM debugMode y ctx2
+              result = (L.CallTwo f' x' y', ctx3)
+           in debugTrace debugMode
+                ( "\nProcessing CallTwo\n"
+                    ++ "Processed function: "
+                    ++ show f'
+                    ++ "\n"
+                    ++ "Processed first argument: "
+                    ++ show x'
+                    ++ "\n"
+                    ++ "Processed second argument: "
+                    ++ show y'
+                    ++ "\n"
+                    ++ "Final CallTwo: "
+                    ++ show f'
+                    ++ " "
+                    ++ show x'
+                    ++ " "
+                    ++ show y'
+                    ++ "\n"
+                )
+                result
+      Var v ->
+        debugTrace debugMode
+          ("\nProcessing Var: " ++ show v)
+          (L.Var v, ctx)
+      Lit l ->
+        debugTrace debugMode
+          ("\nProcessing Lit: " ++ show l)
+          (L.Lit l, ctx)
+      BuiltinIdent i ->
+        debugTrace debugMode
+          ("\nProcessing BuiltinIdent: " ++ show i)
+          (L.BuiltinIdent i, ctx)
+
+liftLambdas :: Bool -> FExpr -> (L.LExpr, HashMap Int L.LiftedLambda)
+liftLambdas debugMode expr =
+  let (lexpr, ctx) = liftLambdasM debugMode expr initialContext
+   in (lexpr, lambdas ctx)
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
+
+module Zayin.FlatExpr.Pretty (renderFExpr) where
+
+-- Import Pretty instance for Literal
+import Data.Text (Text)
+import qualified Data.Text as T
+import Prettyprinter
+import Prettyprinter.Render.String (renderString)
+import qualified Prettyprinter.Render.Terminal as ANSI
+import Zayin.AST.Pretty ()
+import Zayin.FlatExpr (FExpr (..))
+import Zayin.Literals (Literal)
+
+-- | Pretty printing for our FExpr type.
+instance Pretty FExpr where
+  pretty = \case
+    If cond t f ->
+      parens ("if" <+> pretty cond <+> pretty t <+> pretty f)
+    LamOne param body ->
+      parens ("lambda" <+> parens (pretty param) <> line <> pretty body)
+    LamTwo param1 param2 body ->
+      parens ("lambda" <+> parens (pretty param1 <+> pretty param2) <> line <> pretty body)
+    Var v ->
+      pretty v
+    Lit l ->
+      pretty l -- Uses the Literal Pretty instance from AST.Pretty
+    BuiltinIdent i ->
+      pretty i
+    SetThen var val cont ->
+      parens ("set-then!" <+> pretty var <+> pretty val <+> pretty cont)
+    CallOne f arg ->
+      parens (pretty f <+> pretty arg)
+    CallTwo f arg1 arg2 ->
+      parens (pretty f <+> pretty arg1 <+> pretty arg2)
+
+-- | A helper to render an FExpr as a String.
+renderFExpr :: FExpr -> String
+renderFExpr = renderString . layoutPretty defaultLayoutOptions . pretty
+
+-- -- | A helper to render an FExpr with ANSI colors
+-- renderFExprColored :: FExpr -> String
+-- renderFExprColored =
+--   ANSI.renderStrict . layoutPretty defaultLayoutOptions . unAnnotateS . pretty
+{-# LANGUAGE OverloadedStrings #-}
+
+module Zayin.Interpreter
+  ( interpret
+  , interpretWithEnv
+  , Value(..)
+  , Environment
+  , emptyEnv
+  , InterpreterError(..)
+  , valueToString
+  , LambdaMap       -- Export this type
+  , emptyLambdaMap  -- Export an empty lambda map
+  ) where
+
+import Control.Monad (when)
+import Control.Monad.Except
+import Control.Monad.State
+import Control.Monad.Reader
+import qualified Data.HashMap.Strict as HashMap
+import Data.List (isPrefixOf)
+import qualified Data.Map as Map
+import Data.Maybe (listToMaybe)
+import qualified Data.Text as T
+import qualified Data.Set as Set
+import System.Exit (exitWith, exitSuccess, ExitCode(..))
+
+import Zayin.AST
+import Zayin.Literals
+import Zayin.LiftedExpr
+
+-- Type alias for lambda maps
+type LambdaMap = HashMap.HashMap Int LiftedLambda
+
+-- Empty lambda map
+emptyLambdaMap :: LambdaMap
+emptyLambdaMap = HashMap.empty
+
+-- Runtime value representation
+data Value
+  = VInt Integer
+  | VString T.Text
+  | VBool Bool
+  | VNil
+  | VClosure Environment Int               -- CPS-style closure
+  | VBuiltinFunc T.Text ([Value] -> Interpreter Value)  -- Direct-style builtin
+  | VCons Value Value                      -- For list operations
+  | VNoop
+
+instance Show Value where
+  show (VInt i) = "VInt " ++ show i
+  show (VString s) = "VString " ++ show s
+  show (VBool b) = "VBool " ++ show b
+  show VNil = "VNil"
+  show VNoop = "VNoop"
+  show (VClosure _ id) = "VClosure <env> " ++ show id
+  show (VBuiltinFunc name _) = "VBuiltinFunc " ++ T.unpack name  -- Don't try to show the function
+  show (VCons car cdr) = "VCons (" ++ show car ++ ") (" ++ show cdr ++ ")"
+
+-- Error types
+data InterpreterError
+  = UnboundVariable T.Text
+  | TypeMismatch String Value
+  | UnknownLambda Int
+  | UnknownBuiltin T.Text
+  | ApplicationError String
+  deriving (Show)
+
+-- Environment maps variable names to values
+type Environment = Map.Map T.Text Value
+
+-- Interpreter monad with access to all lambda definitions
+type Interpreter a = ExceptT InterpreterError (ReaderT LambdaMap (StateT InterpreterState IO)) a
+
+-- Interpreter state
+data InterpreterState = InterpreterState
+  { globalEnv :: Environment
+  , currentEnv :: Environment
+  , replMode :: Bool
+  , lastValue :: Value
+  , debugMode :: Bool  -- Add debugging flag
+  }
+
+-- Initial empty environment
+emptyEnv :: Environment
+emptyEnv = Map.empty
+
+-- Initialize interpreter state
+initialState :: Bool -> Bool -> InterpreterState
+initialState isRepl isDebug = InterpreterState
+  { globalEnv = builtinEnv
+  , currentEnv = Map.empty
+  , replMode = isRepl
+  , lastValue = VNil
+  , debugMode = isDebug
+  }
+
+-- Helper function to find mangled variables
+findMangledVariable :: T.Text -> Environment -> Maybe Value
+findMangledVariable name env =
+  -- First try exact match
+  case Map.lookup name env of
+    Just val -> Just val
+    Nothing ->
+      -- Then try with any numeric suffix
+      let prefix = name `T.append` "$"
+          candidates = filter (\k -> prefix `T.isPrefixOf` k) (Map.keys env)
+      in case candidates of
+          [] -> Nothing
+          (k:_) -> Map.lookup k env
+
+-- Logging function for debugging
+logDebug :: String -> Interpreter ()
+logDebug msg = do
+  st <- get
+  when (debugMode st) $ liftIO $ putStrLn $ "DEBUG: " ++ msg
+
+-- Environment logging helper
+logEnv :: String -> Environment -> Interpreter ()
+logEnv label env = do
+  st <- get
+  when (debugMode st) $ do
+    liftIO $ putStrLn $ "DEBUG: " ++ label ++ " keys: " ++ show (Map.keys env)
+    liftIO $ putStrLn $ "DEBUG: " ++ label ++ " values: " ++ show (map showValueType (Map.elems env))
+  where
+    showValueType :: Value -> String
+    showValueType (VInt _) = "Int"
+    showValueType (VString _) = "String"
+    showValueType (VBool _) = "Bool"
+    showValueType VNil = "Nil"
+    showValueType (VClosure _ id) = "Closure " ++ show id
+    showValueType (VBuiltinFunc name _) = "Builtin " ++ T.unpack name
+    showValueType (VCons _ _) = "Cons"
+    showValueType VNoop = "Noop"
+
+-- Builtin function registry
+builtinEnv :: Environment
+builtinEnv = Map.fromList
+  [ ("+", makeBuiltin "+" addFunc)
+  , ("-", makeBuiltin "-" subFunc)
+  , ("*", makeBuiltin "*" mulFunc)
+  , ("/", makeBuiltin "/" divFunc)
+  , ("%", makeBuiltin "%" modFunc)
+  , ("<", makeBuiltin "<" ltFunc)
+  , ("<=", makeBuiltin "<=" leqFunc)
+  , (">", makeBuiltin ">" gtFunc)
+  , (">=", makeBuiltin ">=" geqFunc)
+  , ("not", makeBuiltin "not" notFunc)
+  , ("eq?", makeBuiltin "eq?" eqFunc)
+  , ("cons", makeBuiltin "cons" consFunc)
+  , ("car", makeBuiltin "car" carFunc)
+  , ("cdr", makeBuiltin "cdr" cdrFunc)
+  , ("cons?", makeBuiltin "cons?" isConsFunc)
+  , ("null?", makeBuiltin "null?" isNullFunc)
+  , ("display", makeBuiltin "display" displayFunc)
+  , ("tostring", makeBuiltin "tostring" toStringFunc)
+  , ("string-concat", makeBuiltin "string-concat" stringConcatFunc)
+  , ("exit", makeBuiltin "exit" exitFunc)
+  -- Add more builtins as needed
+  ]
+  where
+    makeBuiltin name func = VBuiltinFunc name func
+
+-- Execute a lifted expression
+evalExpr :: LExpr -> Environment -> Interpreter Value
+evalExpr expr env = case expr of
+  Var name -> do
+    logDebug $ "Looking up variable: " ++ T.unpack name
+    logEnv "Local environment" env
+    st <- get
+    logEnv "Global environment" (globalEnv st)
+
+    -- First check local environment with mangling-aware lookup
+    case findMangledVariable name env of
+      Just val -> do
+        logDebug $ "Found " ++ T.unpack name ++ " in local environment: " ++ show val
+        return val
+      Nothing -> do
+        -- Then check global environment with mangling-aware lookup
+        state <- get
+        case findMangledVariable name (globalEnv state) of
+          Just val -> do
+            logDebug $ "Found " ++ T.unpack name ++ " in global environment: " ++ show val
+            return val
+          Nothing -> do
+            logDebug $ "Variable not found: " ++ T.unpack name
+            throwError $ UnboundVariable name
+
+  Lit lit -> do
+    let val = case lit of
+          LInt n -> VInt n
+          LString s -> VString s
+          LBool b -> VBool b
+          LNil -> VNil
+    logDebug $ "Evaluating literal: " ++ show val
+    return val
+
+  BuiltinIdent name -> do
+    logDebug $ "Looking up builtin: " ++ T.unpack name
+    case Map.lookup name builtinEnv of
+      Just val -> do
+        logDebug $ "Found builtin: " ++ T.unpack name
+        return val
+      Nothing -> do
+        logDebug $ "Unknown builtin: " ++ T.unpack name
+        throwError $ UnknownBuiltin name
+
+  SetThen var valExpr contExpr -> do
+    logDebug $ "Setting variable: " ++ T.unpack var
+    val <- evalExpr valExpr env
+    logDebug $ "Value of " ++ T.unpack var ++ ": " ++ show val
+
+    let env' = Map.insert var val env
+    logDebug $ "Updated local environment with: " ++ T.unpack var
+
+    -- Also update the global environment
+    oldState <- get
+    logEnv "Global environment before update" (globalEnv oldState)
+
+    modify $ \s -> s { globalEnv = Map.insert var val (globalEnv s) }
+
+    newState <- get
+    logEnv "Global environment after update" (globalEnv newState)
+
+    evalExpr contExpr env'
+
+  If condExpr thenExpr elseExpr -> do
+    logDebug "Evaluating if condition"
+    condVal <- evalExpr condExpr env
+    logDebug $ "Condition result: " ++ show condVal
+    case condVal of
+      VBool False -> do
+        logDebug "Taking else branch"
+        evalExpr elseExpr env
+      VNil -> do
+        logDebug "Taking else branch (condition was nil)"
+        evalExpr elseExpr env
+      _ -> do
+        logDebug "Taking then branch"
+        evalExpr thenExpr env
+
+  Lifted lambdaId -> do
+    logDebug $ "Creating closure with lambda id: " ++ show lambdaId
+    -- Create a closure with current environment and lambda id
+    return $ VClosure env lambdaId
+
+  -- In CPS, CallOne means f(arg) where f already has its continuation
+  CallOne funcExpr argExpr -> do
+    logDebug "Evaluating function in CallOne"
+    funcVal <- evalExpr funcExpr env
+    logDebug $ "Function value: " ++ show funcVal
+    logDebug "Evaluating argument in CallOne"
+    argVal <- evalExpr argExpr env
+    logDebug $ "Argument value: " ++ show argVal
+
+    case funcVal of
+      -- For builtins, we need special handling as they're not in CPS form
+      VBuiltinFunc name impl -> do
+        logDebug $ "Calling builtin: " ++ T.unpack name
+        -- For a unary function with implicit continuation (like exit)
+        impl [argVal]
+
+      -- For user-defined closures in CPS form
+      VClosure closureEnv lambdaId -> do
+        logDebug $ "Calling closure with lambda id: " ++ show lambdaId
+        lambdas <- ask
+        case HashMap.lookup lambdaId lambdas of
+          Nothing -> do
+            logDebug $ "Unknown lambda: " ++ show lambdaId
+            throwError $ UnknownLambda lambdaId
+          Just lambda -> do
+            -- In CPS, the function already knows its continuation
+            -- So we just call it with its argument
+            logDebug "Setting up call environment"
+            let callEnv = setupCallEnv lambda closureEnv [argVal]
+            logDebug "Evaluating lambda body"
+            evalExpr (body lambda) callEnv
+
+      other -> do
+        logDebug $ "Cannot apply: " ++ valueToString other
+        throwError $ ApplicationError $ "Cannot apply: " ++ valueToString other
+
+  -- In CPS, CallTwo means f(arg, cont) - second arg is the continuation
+  CallTwo funcExpr arg1Expr contExpr -> do
+    logDebug "Evaluating function in CallTwo"
+    funcVal <- evalExpr funcExpr env
+    logDebug $ "Function value: " ++ show funcVal
+    logDebug "Evaluating arg1 in CallTwo"
+    arg1Val <- evalExpr arg1Expr env
+    logDebug $ "Arg1 value: " ++ show arg1Val
+    logDebug "Evaluating continuation in CallTwo"
+    contVal <- evalExpr contExpr env
+    logDebug $ "Continuation value: " ++ show contVal
+
+    case funcVal of
+      -- For builtins that take a continuation
+      VBuiltinFunc name impl -> do
+        logDebug $ "Calling builtin with continuation: " ++ T.unpack name
+        -- Execute the builtin
+        result <- impl [arg1Val]
+        -- Then invoke the continuation with the result
+        logDebug "Applying continuation to builtin result"
+        applyContinuation contVal result
+
+      -- For user-defined closures
+      VClosure closureEnv lambdaId -> do
+        logDebug $ "Calling closure with lambda id: " ++ show lambdaId
+        lambdas <- ask
+        case HashMap.lookup lambdaId lambdas of
+          Nothing -> do
+            logDebug $ "Unknown lambda: " ++ show lambdaId
+            throwError $ UnknownLambda lambdaId
+          Just lambda -> do
+            -- The continuation is the second parameter in CPS form
+            logDebug "Setting up call environment with continuation"
+            let callEnv = setupCallEnv lambda closureEnv [arg1Val, contVal]
+            logDebug "Evaluating lambda body"
+            evalExpr (body lambda) callEnv
+
+      other -> do
+        logDebug $ "Cannot apply: " ++ valueToString other
+        throwError $ ApplicationError $ "Cannot apply: " ++ valueToString other
+
+-- Helper to set up the environment for a function call
+setupCallEnv :: LiftedLambda -> Environment -> [Value] -> Environment
+setupCallEnv lambda closureEnv args =
+  let
+    -- Bind parameters to arguments
+    paramBindings = zip (params lambda) args
+    -- Start with an empty environment
+    emptyEnv = Map.empty
+    -- Add parameter bindings
+    paramEnv = foldr (\(p, a) e -> Map.insert p a e) emptyEnv paramBindings
+    -- Add free variables from closure
+    freeVarsEnv = foldr
+                   (\fv e ->
+                     case Map.lookup fv closureEnv of
+                       Just val -> Map.insert fv val e
+                       Nothing -> e)
+                   paramEnv
+                   (Set.toList $ freeVars lambda)
+  in
+    freeVarsEnv
+
+-- Helper to apply a continuation to a value
+applyContinuation :: Value -> Value -> Interpreter Value
+applyContinuation contVal argVal =
+  case contVal of
+    VClosure closureEnv lambdaId -> do
+      logDebug $ "Applying continuation with lambda id: " ++ show lambdaId
+      lambdas <- ask
+      case HashMap.lookup lambdaId lambdas of
+        Nothing -> do
+          logDebug $ "Unknown lambda for continuation: " ++ show lambdaId
+          throwError $ UnknownLambda lambdaId
+        Just lambda -> do
+          logDebug "Setting up continuation environment"
+          let callEnv = setupCallEnv lambda closureEnv [argVal]
+          logDebug "Evaluating continuation body"
+          evalExpr (body lambda) callEnv
+
+    VBuiltinFunc name impl -> do
+      logDebug $ "Applying builtin continuation: " ++ T.unpack name
+      impl [argVal]
+
+    other -> do
+      logDebug $ "Cannot use as continuation: " ++ valueToString other
+      throwError $ ApplicationError $ "Cannot use as continuation: " ++ valueToString other
+
+
+-- Builtin function implementations
+
+-- Numeric operations with CPS awareness
+-- Arithmetic operations with CPS awareness
+addFunc :: [Value] -> Interpreter Value
+addFunc [VInt x] =
+  -- Handle single argument case - return a function waiting for second arg
+  return $ VBuiltinFunc "+_partial" $ \args -> case args of
+    [VInt y] -> return $ VInt (x + y)
+    [y, cont@(VClosure _ _)] -> do
+      case y of
+        VInt n -> do
+          let result = VInt (x + n)
+          applyContinuation cont result
+        _ -> throwError $ TypeMismatch "Expected integer as second argument to +" y
+    _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied +: " ++ show args
+addFunc [VInt x, VInt y] = return $ VInt (x + y)
+addFunc [VInt x, contVal@(VClosure _ _)] =
+  return $ VBuiltinFunc "+" $ \[arg] -> case arg of
+    VInt y -> do
+      let result = VInt (x + y)
+      applyContinuation contVal result
+    _ -> throwError $ TypeMismatch "Expected integer as second argument to +" arg
+addFunc args@[val, cont@(VClosure _ _)] =
+  throwError $ TypeMismatch "Expected integer as first argument to +" val
+addFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to +: " ++ show args
+
+subFunc :: [Value] -> Interpreter Value
+subFunc [VInt x] =
+  return $ VBuiltinFunc "-_partial" $ \args -> case args of
+    [VInt y] -> return $ VInt (x - y)
+    [y, cont@(VClosure _ _)] -> do
+      case y of
+        VInt n -> do
+          let result = VInt (x - n)
+          applyContinuation cont result
+        _ -> throwError $ TypeMismatch "Expected integer as second argument to -" y
+    _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied -: " ++ show args
+subFunc [VInt x, VInt y] = return $ VInt (x - y)
+subFunc [VInt x, contVal@(VClosure _ _)] =
+  return $ VBuiltinFunc "-" $ \[arg] -> case arg of
+    VInt y -> do
+      let result = VInt (x - y)
+      applyContinuation contVal result
+    _ -> throwError $ TypeMismatch "Expected integer as second argument to -" arg
+subFunc args@[val, cont@(VClosure _ _)] =
+  throwError $ TypeMismatch "Expected integer as first argument to -" val
+subFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to -: " ++ show args
+
+mulFunc :: [Value] -> Interpreter Value
+mulFunc [VInt x] =
+  return $ VBuiltinFunc "*_partial" $ \args -> case args of
+    [VInt y] -> return $ VInt (x * y)
+    [y, cont@(VClosure _ _)] -> do
+      case y of
+        VInt n -> do
+          let result = VInt (x * n)
+          applyContinuation cont result
+        _ -> throwError $ TypeMismatch "Expected integer as second argument to *" y
+    _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied *: " ++ show args
+mulFunc [VInt x, VInt y] = return $ VInt (x * y)
+mulFunc [VInt x, contVal@(VClosure _ _)] =
+  return $ VBuiltinFunc "*" $ \[arg] -> case arg of
+    VInt y -> do
+      let result = VInt (x * y)
+      applyContinuation contVal result
+    _ -> throwError $ TypeMismatch "Expected integer as second argument to *" arg
+mulFunc args@[val, cont@(VClosure _ _)] =
+  throwError $ TypeMismatch "Expected integer as first argument to *" val
+mulFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to *: " ++ show args
+
+divFunc :: [Value] -> Interpreter Value
+divFunc [VInt x] =
+  return $ VBuiltinFunc "/_partial" $ \args -> case args of
+    [VInt 0] -> throwError $ ApplicationError "Division by zero"
+    [VInt y] -> return $ VInt (x `div` y)
+    [y, cont@(VClosure _ _)] -> do
+      case y of
+        VInt 0 -> throwError $ ApplicationError "Division by zero"
+        VInt n -> do
+          let result = VInt (x `div` n)
+          applyContinuation cont result
+        _ -> throwError $ TypeMismatch "Expected integer as second argument to /" y
+    _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied /: " ++ show args
+divFunc [VInt x, VInt y] | y == 0 = throwError $ ApplicationError "Division by zero"
+                         | otherwise = return $ VInt (x `div` y)
+divFunc [VInt x, contVal@(VClosure _ _)] =
+  return $ VBuiltinFunc "/" $ \[arg] -> case arg of
+    VInt 0 -> throwError $ ApplicationError "Division by zero"
+    VInt y -> do
+      let result = VInt (x `div` y)
+      applyContinuation contVal result
+    _ -> throwError $ TypeMismatch "Expected integer as second argument to /" arg
+divFunc args@[val, cont@(VClosure _ _)] =
+  throwError $ TypeMismatch "Expected integer as first argument to /" val
+divFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to /: " ++ show args
+
+modFunc :: [Value] -> Interpreter Value
+modFunc [VInt x] =
+  return $ VBuiltinFunc "%_partial" $ \args -> case args of
+    [VInt 0] -> throwError $ ApplicationError "Modulo by zero"
+    [VInt y] -> return $ VInt (x `mod` y)
+    [y, cont@(VClosure _ _)] -> do
+      case y of
+        VInt 0 -> throwError $ ApplicationError "Modulo by zero"
+        VInt n -> do
+          let result = VInt (x `mod` n)
+          applyContinuation cont result
+        _ -> throwError $ TypeMismatch "Expected integer as second argument to %" y
+    _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied %: " ++ show args
+modFunc [VInt x, VInt y] | y == 0 = throwError $ ApplicationError "Modulo by zero"
+                         | otherwise = return $ VInt (x `mod` y)
+modFunc [VInt x, contVal@(VClosure _ _)] =
+  return $ VBuiltinFunc "%" $ \[arg] -> case arg of
+    VInt 0 -> throwError $ ApplicationError "Modulo by zero"
+    VInt y -> do
+      let result = VInt (x `mod` y)
+      applyContinuation contVal result
+    _ -> throwError $ TypeMismatch "Expected integer as second argument to %" arg
+modFunc args@[val, cont@(VClosure _ _)] =
+  throwError $ TypeMismatch "Expected integer as first argument to %" val
+modFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to %: " ++ show args
+
+-- Comparison operations with CPS awareness
+ltFunc :: [Value] -> Interpreter Value
+ltFunc [VInt x] =
+  return $ VBuiltinFunc "<_partial" $ \args -> case args of
+    [VInt y] -> return $ VBool (x < y)
+    [y, cont@(VClosure _ _)] -> do
+      case y of
+        VInt n -> do
+          let result = VBool (x < n)
+          applyContinuation cont result
+        _ -> throwError $ TypeMismatch "Expected integer as second argument to <" y
+    _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied <: " ++ show args
+ltFunc [VInt x, VInt y] = return $ VBool (x < y)
+ltFunc [VInt x, contVal@(VClosure _ _)] =
+  return $ VBuiltinFunc "<" $ \[arg] -> case arg of
+    VInt y -> do
+      let result = VBool (x < y)
+      applyContinuation contVal result
+    _ -> throwError $ TypeMismatch "Expected integer as second argument to <" arg
+ltFunc args@[val, cont@(VClosure _ _)] =
+  throwError $ TypeMismatch "Expected integer as first argument to <" val
+ltFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to <: " ++ show args
+
+leqFunc :: [Value] -> Interpreter Value
+leqFunc [VInt x] =
+  return $ VBuiltinFunc "<=_partial" $ \args -> case args of
+    [VInt y] -> return $ VBool (x <= y)
+    [y, cont@(VClosure _ _)] -> do
+      case y of
+        VInt n -> do
+          let result = VBool (x <= n)
+          applyContinuation cont result
+        _ -> throwError $ TypeMismatch "Expected integer as second argument to <=" y
+    _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied <=: " ++ show args
+leqFunc [VInt x, VInt y] = return $ VBool (x <= y)
+leqFunc [VInt x, contVal@(VClosure _ _)] =
+  return $ VBuiltinFunc "<=" $ \[arg] -> case arg of
+    VInt y -> do
+      let result = VBool (x <= y)
+      applyContinuation contVal result
+    _ -> throwError $ TypeMismatch "Expected integer as second argument to <=" arg
+leqFunc args@[val, cont@(VClosure _ _)] =
+  throwError $ TypeMismatch "Expected integer as first argument to <=" val
+leqFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to <=: " ++ show args
+
+gtFunc :: [Value] -> Interpreter Value
+gtFunc [VInt x] =
+  return $ VBuiltinFunc ">_partial" $ \args -> case args of
+    [VInt y] -> return $ VBool (x > y)
+    [y, cont@(VClosure _ _)] -> do
+      case y of
+        VInt n -> do
+          let result = VBool (x > n)
+          applyContinuation cont result
+        _ -> throwError $ TypeMismatch "Expected integer as second argument to >" y
+    _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied >: " ++ show args
+gtFunc [VInt x, VInt y] = return $ VBool (x > y)
+gtFunc [VInt x, contVal@(VClosure _ _)] =
+  return $ VBuiltinFunc ">" $ \[arg] -> case arg of
+    VInt y -> do
+      let result = VBool (x > y)
+      applyContinuation contVal result
+    _ -> throwError $ TypeMismatch "Expected integer as second argument to >" arg
+gtFunc args@[val, cont@(VClosure _ _)] =
+  throwError $ TypeMismatch "Expected integer as first argument to >" val
+gtFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to >: " ++ show args
+
+geqFunc :: [Value] -> Interpreter Value
+geqFunc [VInt x] =
+  return $ VBuiltinFunc ">=_partial" $ \args -> case args of
+    [VInt y] -> return $ VBool (x >= y)
+    [y, cont@(VClosure _ _)] -> do
+      case y of
+        VInt n -> do
+          let result = VBool (x >= n)
+          applyContinuation cont result
+        _ -> throwError $ TypeMismatch "Expected integer as second argument to >=" y
+    _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied >=: " ++ show args
+geqFunc [VInt x, VInt y] = return $ VBool (x >= y)
+geqFunc [VInt x, contVal@(VClosure _ _)] =
+  return $ VBuiltinFunc ">=" $ \[arg] -> case arg of
+    VInt y -> do
+      let result = VBool (x >= y)
+      applyContinuation contVal result
+    _ -> throwError $ TypeMismatch "Expected integer as second argument to >=" arg
+geqFunc args@[val, cont@(VClosure _ _)] =
+  throwError $ TypeMismatch "Expected integer as first argument to >=" val
+geqFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to >=: " ++ show args
+
+-- Logic operations with CPS awareness
+notFunc :: [Value] -> Interpreter Value
+notFunc [VBool b] = return $ VBool (not b)
+notFunc [VNil] = return $ VBool True
+notFunc [_] = return $ VBool False
+notFunc [val, contVal@(VClosure _ _)] = do
+  result <- notFunc [val]
+  applyContinuation contVal result
+notFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to not: " ++ show args
+
+eqFunc :: [Value] -> Interpreter Value
+eqFunc [x] =
+  return $ VBuiltinFunc "eq?_partial" $ \args -> case args of
+    [y] -> return $ VBool (valueEquals x y)
+    [y, cont@(VClosure _ _)] -> do
+      let result = VBool (valueEquals x y)
+      applyContinuation cont result
+    _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied eq?: " ++ show args
+eqFunc [x, y] = return $ VBool (valueEquals x y)
+eqFunc [x, contVal@(VClosure _ _)] =
+  return $ VBuiltinFunc "eq?" $ \[arg] -> do
+    let result = VBool (valueEquals x arg)
+    applyContinuation contVal result
+eqFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to eq?: " ++ show args
+
+-- List operations with CPS awareness
+consFunc :: [Value] -> Interpreter Value
+consFunc [car] =
+  return $ VBuiltinFunc "cons_partial" $ \args -> case args of
+    [cdr] -> return $ VCons car cdr
+    [cdr, cont@(VClosure _ _)] -> do
+      let result = VCons car cdr
+      applyContinuation cont result
+    _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied cons: " ++ show args
+consFunc [car, cdr] = return $ VCons car cdr
+consFunc [car, contVal@(VClosure _ _)] =
+  return $ VBuiltinFunc "cons" $ \[arg] -> do
+    let result = VCons car arg
+    applyContinuation contVal result
+consFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to cons: " ++ show args
+
+carFunc :: [Value] -> Interpreter Value
+carFunc [VCons car _] = return car
+carFunc [VCons car _, contVal@(VClosure _ _)] =
+  applyContinuation contVal car
+carFunc [other] =
+  throwError $ TypeMismatch "Expected cons cell for car" other
+carFunc [other, _] =
+  throwError $ TypeMismatch "Expected cons cell for car" other
+carFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to car: " ++ show args
+
+cdrFunc :: [Value] -> Interpreter Value
+cdrFunc [VCons _ cdr] = return cdr
+cdrFunc [VCons _ cdr, contVal@(VClosure _ _)] =
+  applyContinuation contVal cdr
+cdrFunc [other] =
+  throwError $ TypeMismatch "Expected cons cell for cdr" other
+cdrFunc [other, _] =
+  throwError $ TypeMismatch "Expected cons cell for cdr" other
+cdrFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to cdr: " ++ show args
+
+isConsFunc :: [Value] -> Interpreter Value
+isConsFunc [VCons _ _] = return $ VBool True
+isConsFunc [_] = return $ VBool False
+isConsFunc [val, contVal@(VClosure _ _)] = do
+  result <- isConsFunc [val]
+  applyContinuation contVal result
+isConsFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to cons?: " ++ show args
+
+isNullFunc :: [Value] -> Interpreter Value
+isNullFunc [VNil] = return $ VBool True
+isNullFunc [_] = return $ VBool False
+isNullFunc [val, contVal@(VClosure _ _)] = do
+  result <- isNullFunc [val]
+  applyContinuation contVal result
+isNullFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to null?: " ++ show args
+
+-- I/O operations with CPS awareness
+displayFunc :: [Value] -> Interpreter Value
+displayFunc [val] = do
+  liftIO $ putStrLn $ valueToString val
+  state <- get
+  modify $ \s -> s { lastValue = VNoop }  -- Use VNoop to indicate nothing should be printed
+  return VNoop  -- Return VNoop to indicate no printing needed
+displayFunc [val, contVal@(VClosure _ _)] = do
+  liftIO $ putStrLn $ valueToString val
+  state <- get
+  modify $ \s -> s { lastValue = VNoop }
+  applyContinuation contVal VNoop  -- Pass VNoop to the continuation
+displayFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to display: " ++ show args
+
+toStringFunc :: [Value] -> Interpreter Value
+toStringFunc [val] = return $ VString $ T.pack $ valueToString val
+toStringFunc [val, contVal@(VClosure _ _)] = do
+  result <- toStringFunc [val]
+  applyContinuation contVal result
+toStringFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to tostring: " ++ show args
+
+-- String operations with CPS awareness
+stringConcatFunc :: [Value] -> Interpreter Value
+stringConcatFunc [VString s1] =
+  return $ VBuiltinFunc "string-concat_partial" $ \args -> case args of
+    [VString s2] -> return $ VString (s1 <> s2)
+    [s2, cont@(VClosure _ _)] -> case s2 of
+      VString s2val -> do
+        let result = VString (s1 <> s2val)
+        applyContinuation cont result
+      _ -> throwError $ TypeMismatch "Expected string as second argument" s2
+    _ -> throwError $ ApplicationError $ "Invalid arguments to partially applied string-concat: " ++ show args
+stringConcatFunc [VString s1, VString s2] =
+  return $ VString (s1 <> s2)
+stringConcatFunc [VString s1, contVal@(VClosure _ _)] =
+  return $ VBuiltinFunc "string-concat" $ \[arg] -> case arg of
+    VString s2 -> do
+      let result = VString (s1 <> s2)
+      applyContinuation contVal result
+    _ -> throwError $ TypeMismatch "Expected string as second argument to string-concat" arg
+stringConcatFunc args@[val, cont@(VClosure _ _)] =
+  throwError $ TypeMismatch "Expected string as first argument to string-concat" val
+stringConcatFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to string-concat: " ++ show args
+
+-- System operations (terminal operations - may not invoke continuation)
+exitFunc :: [Value] -> Interpreter Value
+exitFunc [val] = do
+  state <- get
+  if replMode state
+    then do
+      -- Store the value in the state and return it
+      modify $ \s -> s { lastValue = val }
+      return val
+    else liftIO $ System.Exit.exitWith $ System.Exit.ExitFailure (fromIntegral $
+      case val of
+        VInt code -> code
+        _ -> 0)
+exitFunc [] = do
+  state <- get
+  if replMode state
+    then do
+      -- Store nil in the state for empty exit call
+      modify $ \s -> s { lastValue = VNil }
+      return VNil
+    else liftIO $ System.Exit.exitSuccess
+exitFunc [VInt code, contVal@(VClosure _ _)] = do
+  state <- get
+  if replMode state
+    then do
+      -- Store the integer value before continuing
+      modify $ \s -> s { lastValue = VInt code }
+      applyContinuation contVal VNil
+    else liftIO $ System.Exit.exitWith $ System.Exit.ExitFailure (fromIntegral code)
+exitFunc [val, contVal@(VClosure _ _)] = do
+  state <- get
+  if replMode state
+    then do
+      -- Store the value before continuing
+      modify $ \s -> s { lastValue = val }
+      applyContinuation contVal VNil
+    else liftIO $ System.Exit.exitSuccess
+exitFunc args =
+  throwError $ ApplicationError $ "Invalid arguments to exit: " ++ show args
+
+-- Value equality check
+valueEquals :: Value -> Value -> Bool
+valueEquals (VInt a) (VInt b) = a == b
+valueEquals (VString a) (VString b) = a == b
+valueEquals (VBool a) (VBool b) = a == b
+valueEquals VNil VNil = True
+valueEquals (VCons a1 b1) (VCons a2 b2) = valueEquals a1 a2 && valueEquals b1 b2
+valueEquals _ _ = False
+
+-- Enhanced valueToString to support cons cells
+valueToString :: Value -> String
+valueToString (VInt i) = show i
+valueToString (VString s) = T.unpack s
+valueToString (VBool True) = "#t"
+valueToString (VBool False) = "#f"
+valueToString VNil = "nil"
+valueToString (VClosure _ _) = "<function>"
+valueToString (VBuiltinFunc name _) = "<builtin:" ++ T.unpack name ++ ">"
+valueToString (VCons car cdr) = "(" ++ valueToString car ++ " . " ++ valueToString cdr ++ ")"
+valueToString VNoop = "<no output>"
+
+-- Main interpretation function
+interpret :: LExpr -> LambdaMap -> Bool -> IO (Either InterpreterError Value)
+interpret expr lambdaMap isRepl = do
+  liftIO $ putStrLn ("DEBUG: Starting interpret with replMode = " ++ show isRepl)
+
+  (result, finalState) <- runStateT
+                            (runReaderT
+                              (runExceptT (evalExpr expr Map.empty))
+                              lambdaMap)
+                            (initialState isRepl False)
+
+  liftIO $ putStrLn ("DEBUG: interpret finished with result: " ++ either show show result)
+  liftIO $ putStrLn ("DEBUG: Final global env keys: " ++ show (Map.keys (globalEnv finalState)))
+
+  -- Return either the error or the stored last value
+  return $ case result of
+    Left err -> Left err
+    Right _ -> Right (lastValue finalState)  -- Return last value instead of result
+
+-- Updated to also return the lambda map
+interpretWithEnv :: LExpr -> LambdaMap -> Bool -> Environment -> IO (Either String (Value, Environment, LambdaMap))
+interpretWithEnv expr lambdaMap isRepl initialEnv = do
+  liftIO $ putStrLn ("DEBUG: Starting interpretWithEnv with replMode = " ++ show isRepl)
+  liftIO $ putStrLn ("DEBUG: Initial env keys: " ++ show (Map.keys initialEnv))
+  liftIO $ putStrLn ("DEBUG: Initial lambda map size: " ++ show (HashMap.size lambdaMap))
+
+  let initState = InterpreterState
+        { globalEnv = Map.union initialEnv builtinEnv  -- Use provided environment and merge with builtins
+        , currentEnv = Map.empty
+        , replMode = isRepl
+        , lastValue = VNil
+        , debugMode = True  -- Enable debug mode
+        }
+
+  liftIO $ putStrLn ("DEBUG: Initial global env keys after merging with builtins: " ++ show (Map.keys (globalEnv initState)))
+
+  (result, finalState) <- runStateT
+                            (runReaderT
+                              (runExceptT (evalExpr expr Map.empty))
+                              lambdaMap)
+                            initState
+
+  let resultMsg = case result of
+        Left err -> "Error: " ++ show err
+        Right _ -> "Success: " ++ valueToString (lastValue finalState)
+
+  liftIO $ putStrLn ("DEBUG: interpretWithEnv finished with result: " ++ resultMsg)
+  liftIO $ putStrLn ("DEBUG: Final global env keys: " ++ show (Map.keys (globalEnv finalState)))
+
+  -- Return the result value, updated environment, AND the lambda map
+  return $ case result of
+    Left err -> Left (show err)  -- Convert InterpreterError to String
+    Right _ -> Right (lastValue finalState, globalEnv finalState, lambdaMap)
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StandaloneDeriving #-}
+
+module Zayin.LiftedExpr (LExpr (..), LiftedLambda (..)) where
+
+import Data.Data (Data, Typeable)
+import Data.HashMap.Strict (HashMap)
+import Data.Set (Set)
+import qualified Data.Text as T
+import Zayin.Literals (Literal (..))
+
+deriving instance Data Literal
+
+data LExpr
+  = Var T.Text
+  | Lit Literal
+  | BuiltinIdent T.Text
+  | SetThen T.Text LExpr LExpr
+  | If LExpr LExpr LExpr
+  | Lifted Int
+  | CallOne LExpr LExpr
+  | CallTwo LExpr LExpr LExpr
+  deriving (Show, Eq, Data, Typeable)
+
+data LiftedLambda = LiftedLambda
+  { lambdaId :: Int,
+    params :: [T.Text],
+    freeVars :: Set T.Text,
+    body :: LExpr
+  }
+  deriving (Show, Eq, Data, Typeable)
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
+
+module Zayin.LiftedExpr.Pretty (renderLExpr, renderLiftedLambda) where
+
+-- Import Pretty instance for Literal
+
+import Data.Foldable (toList)
+import Data.Text (Text)
+import qualified Data.Text as T
+import Prettyprinter
+import Prettyprinter.Render.String (renderString)
+import Zayin.AST.Pretty ()
+import Zayin.LiftedExpr (LExpr (..), LiftedLambda (..))
+import Zayin.Literals (Literal)
+
+-- | Pretty printing for our LExpr type.
+instance Pretty LExpr where
+  pretty = \case
+    Var v ->
+      pretty v
+    Lit l ->
+      pretty l -- Uses the Literal Pretty instance from AST.Pretty
+    BuiltinIdent i ->
+      pretty i
+    SetThen var val cont ->
+      parens (group ("set-then!" <+> pretty var <+> pretty val <+> pretty cont))
+    If cond t f ->
+      parens (group ("if" <+> pretty cond <+> pretty t <+> pretty f))
+    Lifted lambdaId ->
+      "lifted-lambda@" <> pretty lambdaId
+    CallOne f arg ->
+      parens (group (pretty f <+> pretty arg))
+    CallTwo f arg1 arg2 ->
+      parens (group (pretty f <+> pretty arg1 <+> pretty arg2))
+
+-- | Pretty printing for LiftedLambda
+instance Pretty LiftedLambda where
+  pretty lambda =
+    vsep
+      [ "LiftedLambda" <+> pretty (lambdaId lambda),
+        indent 2 $
+          vsep
+            [ "params:" <+> hsep (map pretty (params lambda)),
+              "free:" <+> hsep (map pretty (toList (freeVars lambda))),
+              "body:" <+> pretty (body lambda)
+            ]
+      ]
+
+-- | A helper to render an LExpr as a String.
+renderLExpr :: LExpr -> String
+renderLExpr = renderString . layoutPretty defaultLayoutOptions . pretty
+
+-- | A helper to render a LiftedLambda as a String.
+renderLiftedLambda :: LiftedLambda -> String
+renderLiftedLambda = renderString . layoutPretty defaultLayoutOptions . pretty
+module Zayin.Literals (Literal (..)) where
+
+import qualified Data.Text as T
+
+data Literal
+  = LString T.Text
+  | LInt Integer
+  | LFloat Float
+  | LBool Bool
+  | LNil
+  deriving (Show, Eq)
+{-# LANGUAGE OverloadedStrings #-}
+
+module Zayin.Macros (expandMacros) where
+
+import qualified Data.Map.Strict as Map
+import qualified Data.Text as T
+import Zayin.AST
+
+-- A macro is represented by its parameter names and the template (an AST)
+data Macro = Macro
+  { macroParams :: [T.Text],
+    macroTemplate :: Expr
+  }
+  deriving (Show, Eq)
+
+type MacroEnv = Map.Map T.Text Macro
+
+-- | substitute replaces every occurrence of the identifier `param`
+-- in an expression with the substitution expression `arg`. This is a
+-- simple, non-hygienic substitution.
+substitute :: T.Text -> Expr -> Expr -> Expr
+substitute param arg expr = case expr of
+  EVar x ->
+    if x == param then arg else EVar x
+  ELit l -> ELit l
+  EBuiltinIdent x -> EBuiltinIdent x
+  EIf cond t f ->
+    EIf
+      (substitute param arg cond)
+      (substitute param arg t)
+      (substitute param arg f)
+  ESet name e ->
+    ESet name (substitute param arg e)
+  ELet bindings body ->
+    let newBindings =
+          map
+            ( \(n, e) ->
+                (n, if n == param then e else substitute param arg e)
+            )
+            bindings
+        newBody = substituteInBody param arg body
+     in ELet newBindings newBody
+  ELam ps body ->
+    if param `elem` ps
+      then ELam ps body -- do not substitute in a binding that shadows param
+      else ELam ps (substituteInBody param arg body)
+  EApp f args ->
+    EApp (substitute param arg f) (map (substitute param arg) args)
+
+substituteInBody :: T.Text -> Expr -> ExprBody -> ExprBody
+substituteInBody param arg (ExprBody exprs final) =
+  ExprBody (map subInExprBodyExpr exprs) (substitute param arg final)
+  where
+    subInExprBodyExpr (Def n e) =
+      if n == param then Def n e else Def n (substitute param arg e)
+    subInExprBodyExpr (Expr e) = Expr (substitute param arg e)
+
+-- | applyMacro takes a macro definition and a list of argument ASTs.
+-- It checks that the number of arguments matches and then performs
+-- a sequential substitution of each macro parameter in the template.
+applyMacro :: Macro -> [Expr] -> Either String Expr
+applyMacro (Macro params template) args =
+  if length params /= length args
+    then Left "Macro argument count mismatch"
+    else Right $ foldl (\acc (p, a) -> substitute p a acc) template (zip params args)
+
+-- | extractMacro examines an expression that is expected to be a macro
+-- definition and returns the macro’s name along with its transformation.
+-- We expect a macro definition to be written as:
+--
+--    (macro (macroName) (lambda (…params…) template))
+--
+-- In our AST this looks like an ELam with a single parameter (the macro name)
+-- whose body is an ELam representing the macro transformer.
+extractMacro :: Expr -> Either String (T.Text, Macro)
+extractMacro expr = case expr of
+  ELam [mName] (ExprBody _ inner) ->
+    case inner of
+      ELam macroParams (ExprBody _ macroTemplate) ->
+        Right (mName, Macro macroParams macroTemplate)
+      _ -> Left "Invalid macro definition: inner lambda expected"
+  _ -> Left "Invalid macro definition: expected lambda with one parameter"
+
+-- | processBinding looks at a let-binding. If the binding’s name is "macro",
+-- then we extract the macro (using extractMacro) and update the macro environment.
+-- Otherwise, we simply expand the binding’s expression.
+processBinding :: MacroEnv -> (T.Text, Expr) -> Either String (Maybe (T.Text, Expr), MacroEnv)
+processBinding env (name, e)
+  | name == "macro" =
+      case extractMacro e of
+        Right (macroName, macro) ->
+          -- Register the macro under the provided name and remove the definition from the output.
+          Right (Nothing, Map.insert macroName macro env)
+        Left err -> Left $ "Error in macro definition: " ++ err
+  | otherwise = do
+      e' <- expandExpr env e
+      return (Just (name, e'), env)
+
+-- | processBindings handles a list of let-bindings,
+-- updating the macro environment as needed.
+processBindings :: MacroEnv -> [(T.Text, Expr)] -> Either String ([(T.Text, Expr)], MacroEnv)
+processBindings env [] = Right ([], env)
+processBindings env (b : bs) = do
+  (maybeB, env') <- processBinding env b
+  (rest, env'') <- processBindings env' bs
+  case maybeB of
+    Just binding -> Right (binding : rest, env'')
+    Nothing -> Right (rest, env'')
+
+-- | processExprBody traverses an ExprBody, expanding all expressions
+-- and also processing any macro definitions within the body.
+processExprBody :: MacroEnv -> ExprBody -> Either String (ExprBody, MacroEnv)
+processExprBody env (ExprBody exprs final) = do
+  (newExprs, env') <- processBodyExprs env exprs
+  final' <- expandExpr env' final
+  return (ExprBody newExprs final', env')
+
+processBodyExprs :: MacroEnv -> [ExprBodyExpr] -> Either String ([ExprBodyExpr], MacroEnv)
+processBodyExprs env [] = Right ([], env)
+processBodyExprs env (x : xs) = do
+  (maybeX, env') <- processBodyExpr env x
+  (rest, env'') <- processBodyExprs env' xs
+  case maybeX of
+    Just exprBE -> Right (exprBE : rest, env'')
+    Nothing -> Right (rest, env'')
+
+-- | processBodyExpr processes a single expression inside an ExprBody.
+-- If it is a macro definition (i.e. Def "macro" ...), we update the
+-- environment and remove it from the final AST.
+processBodyExpr :: MacroEnv -> ExprBodyExpr -> Either String (Maybe ExprBodyExpr, MacroEnv)
+processBodyExpr env exprBody = case exprBody of
+  Def name e
+    | name == "macro" ->
+        case extractMacro e of
+          Right (macroName, macro) -> Right (Nothing, Map.insert macroName macro env)
+          Left err -> Left $ "Error in macro definition: " ++ err
+  Def name e -> do
+    e' <- expandExpr env e
+    return (Just (Def name e'), env)
+  Expr e -> do
+    e' <- expandExpr env e
+    return (Just (Expr e'), env)
+
+-- | expandExpr is the core recursive function. It traverses the AST,
+-- updates the macro environment where necessary, and when it sees a
+-- macro call, it applies the macro transformation.
+expandExpr :: MacroEnv -> Expr -> Either String Expr
+expandExpr env expr = case expr of
+  EVar _ -> Right expr
+  ELit _ -> Right expr
+  EBuiltinIdent _ -> Right expr
+  EIf cond t f -> do
+    cond' <- expandExpr env cond
+    t' <- expandExpr env t
+    f' <- expandExpr env f
+    Right $ EIf cond' t' f'
+  ESet name e -> do
+    e' <- expandExpr env e
+    Right $ ESet name e'
+  ELet bindings body -> do
+    (newBindings, env') <- processBindings env bindings
+    (body', env'') <- processExprBody env' body
+    Right $ ELet newBindings body'
+  ELam ps body -> do
+    (body', env') <- processExprBody env body
+    Right $ ELam ps body'
+  EApp fun args -> do
+    fun' <- expandExpr env fun
+    -- If the function is a macro (i.e. an unadorned variable bound to a macro)
+    case fun' of
+      EVar macroName ->
+        case Map.lookup macroName env of
+          Just macro -> do
+            -- Pass the raw (unevaluated) arguments to the macro transformer.
+            expanded <- applyMacro macro args
+            -- Recursively expand the result of the macro transformation.
+            expandExpr env expanded
+          Nothing -> do
+            args' <- mapM (expandExpr env) args
+            Right $ EApp fun' args'
+      _ -> do
+        fun'' <- expandExpr env fun'
+        args' <- mapM (expandExpr env) args
+        Right $ EApp fun'' args'
+
+-- | Top-level entry point for macro expansion.
+expandMacros :: Expr -> Either String Expr
+expandMacros expr = expandExpr Map.empty expr
+{-# LANGUAGE OverloadedStrings #-}
+module Zayin.Parser (parseProgram, parseWithDebug) where
+
+import Control.Monad (when)
+import Control.Monad.Logger (logDebugN, runStderrLoggingT, LoggingT)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Reader (ReaderT, runReaderT, ask)
+import Data.Char (isSpace, isDigit, isAlpha, isAlphaNum)
+import Data.Text (Text)
+import qualified Data.Text as T
+import Data.Map (Map)
+import qualified Data.Map as Map
+
+import Zayin.AST
+import Zayin.Literals (Literal(..))
+
+--------------------------------------------------------------------------------
+-- Debug Context
+--------------------------------------------------------------------------------
+
+-- Add a reader monad to track debug state
+type ParserM a = ReaderT Bool (LoggingT IO) a
+
+-- Debug log helper that only logs when debug mode is enabled
+debugLog :: Text -> ParserM ()
+debugLog msg = do
+  debugEnabled <- ask
+  when debugEnabled $ logDebugN msg
+
+--------------------------------------------------------------------------------
+-- Token Definitions and Lexer with Layout Insertion
+--------------------------------------------------------------------------------
+
+data Token
+  = TIdent Text
+  | TNumber Integer
+  | TKeyword Text
+  | TSymbol Text
+  | TString Text
+  | TNewline
+  | TIndent
+  | TDedent
+  | TEOF
+  deriving (Show, Eq)
+
+lexZayin :: Bool -> Text -> IO [Token]
+lexZayin debugMode input = runStderrLoggingT $ runReaderT lexAction debugMode
+  where
+    lexAction = do
+      debugLog "Lexing input with layout processing"
+      let rawLines = T.lines input
+      toks <- lexLines rawLines [] 0
+      return (toks ++ [TEOF])
+
+    lexLines :: [Text] -> [Int] -> Int -> ParserM [Token]
+    lexLines [] indentStack _ = return (dedentAll indentStack)
+    lexLines (l:ls) indentStack _ = do
+      let currentIndent = T.length (T.takeWhile isSpace l)
+          lineContent   = T.strip l
+      debugLog $ "Lexing line: " <> l <> " (indent " <> T.pack (show currentIndent) <> ")"
+      let (indentToks, newStack) = computeIndentTokens currentIndent indentStack
+      toksLine <- lexLineTokens lineContent
+      restToks <- lexLines ls newStack currentIndent
+      return (indentToks ++ toksLine ++ [TNewline] ++ restToks)
+
+    dedentAll :: [Int] -> [Token]
+    dedentAll []     = []
+    dedentAll (_:xs) = TDedent : dedentAll xs
+
+    computeIndentTokens :: Int -> [Int] -> ([Token], [Int])
+    computeIndentTokens cur [] = ([TIndent], [cur])
+    computeIndentTokens cur stack@(s:rest)
+      | cur > s   = ([TIndent], cur : stack)
+      | cur == s  = ([], stack)
+      | cur < s   = let (deds, newStack) = popUntil cur stack
+                    in (deds, newStack)
+
+    popUntil :: Int -> [Int] -> ([Token], [Int])
+    popUntil cur [] = ([], [])
+    popUntil cur (s:ss)
+      | cur == s  = ([], s:ss)
+      | cur < s   = let (d, ns) = popUntil cur ss in (TDedent : d, ns)
+      | otherwise = ([], s:ss)
+
+    lexLineTokens :: Text -> ParserM [Token]
+    lexLineTokens txt = do
+      let toks = tokenizeLine txt
+      debugLog $ "Tokenizing line: " <> txt <> " -> " <> T.pack (show toks)
+      return toks
+
+tokenizeLine :: Text -> [Token]
+tokenizeLine t =
+  let t' = T.stripStart t
+  in if T.null t' then [] else nextToken t'
+
+nextToken :: Text -> [Token]
+nextToken t
+  | T.null t = []
+  | otherwise =
+      let t' = T.stripStart t
+      in if T.null t' then [] else
+         case T.uncons t' of
+           Nothing -> []
+           Just (c, rest)
+             | c == '"' ->  -- Put string handling first
+                 case T.breakOn "\"" rest of
+                   (str, rest')
+                     | T.null rest' -> error "Unterminated string literal"
+                     | otherwise ->
+                         let remaining = T.drop 1 rest'  -- Skip the closing quote
+                         in TString str : nextToken remaining
+             | isDigit c ->
+                 let (num, rest') = T.span isDigit t'
+                     token = TNumber (read (T.unpack num))
+                 in token : nextToken rest'
+             | isAlpha c ->
+                 let (word, rest') = T.span isAlphaNum t'
+                     token = if isKeyword word then TKeyword word else TIdent word
+                 in token : nextToken rest'
+             | isPunctuation c ->
+                 TSymbol (T.singleton c) : nextToken rest
+             | otherwise -> nextToken rest
+
+isPunctuation :: Char -> Bool
+isPunctuation c = c `elem` ("()+-*/=,:;" :: String)
+
+isKeyword :: Text -> Bool
+isKeyword w = w `elem` ["if", "then", "else", "fn", "where", "do", "true", "false", "nil", "not"]
+
+isBuiltin :: Text -> Bool
+isBuiltin w = w `elem` ["display", "not"]
+
+--------------------------------------------------------------------------------
+-- Expression AST Transformation for Variable Renaming in Macros
+--------------------------------------------------------------------------------
+
+-- Rename variables in an expression based on a mapping
+renameVarsInExpr :: Map Text Text -> Expr -> Expr
+renameVarsInExpr varMap expr = case expr of
+  EVar name -> case Map.lookup name varMap of
+                 Just newName -> EVar newName
+                 Nothing -> EVar name
+  ELit lit -> ELit lit
+  EBuiltinIdent name -> EBuiltinIdent name
+  EIf cond thenE elseE ->
+    EIf (renameVarsInExpr varMap cond)
+        (renameVarsInExpr varMap thenE)
+        (renameVarsInExpr varMap elseE)
+  ESet name value ->
+    ESet name (renameVarsInExpr varMap value)
+  ELet bindings body ->
+    let renamedBindings = [(name, renameVarsInExpr varMap val) | (name, val) <- bindings]
+        renamedBody = renameVarsInExprBody varMap body
+    in ELet renamedBindings renamedBody
+  ELam params body ->
+    -- Don't rename variables shadowed by lambda parameters
+    let filteredMap = foldr Map.delete varMap params
+        renamedBody = renameVarsInExprBody filteredMap body
+    in ELam params renamedBody
+  EApp func args ->
+    EApp (renameVarsInExpr varMap func) (map (renameVarsInExpr varMap) args)
+
+-- Rename variables in an expression body
+renameVarsInExprBody :: Map Text Text -> ExprBody -> ExprBody
+renameVarsInExprBody varMap (ExprBody exprs finalExpr) =
+  let renamedExprs = map (renameVarsInBodyExpr varMap) exprs
+      renamedFinal = renameVarsInExpr varMap finalExpr
+  in ExprBody renamedExprs renamedFinal
+
+-- Rename variables in a body expression
+renameVarsInBodyExpr :: Map Text Text -> ExprBodyExpr -> ExprBodyExpr
+renameVarsInBodyExpr varMap bodyExpr = case bodyExpr of
+  Def name expr -> Def name (renameVarsInExpr varMap expr)
+  Expr expr -> Expr (renameVarsInExpr varMap expr)
+
+--------------------------------------------------------------------------------
+-- Parser Combinators using LoggingT IO (with layout skipping)
+--------------------------------------------------------------------------------
+
+newtype Parser a = Parser { runParser :: [Token] -> ParserM (Either String (a, [Token])) }
+
+instance Functor Parser where
+  fmap f p = Parser $ \ts -> do
+    res <- runParser p ts
+    return $ fmap (\(a, ts') -> (f a, ts')) res
+
+instance Applicative Parser where
+  pure a = Parser $ \ts -> return (Right (a, ts))
+  pf <*> pa = Parser $ \ts -> do
+    resF <- runParser pf ts
+    case resF of
+      Left err -> return (Left err)
+      Right (f, ts') -> do
+         resA <- runParser pa ts'
+         case resA of
+           Left err -> return (Left err)
+           Right (a, ts'') -> return (Right (f a, ts''))
+
+instance Monad Parser where
+  return = pure
+  p >>= f = Parser $ \ts -> do
+    res <- runParser p ts
+    case res of
+      Left err -> return (Left err)
+      Right (a, ts') -> runParser (f a) ts'
+
+infixr 3 <|>
+(<|>) :: Parser a -> Parser a -> Parser a
+p <|> q = Parser $ \ts -> do
+  res <- runParser p ts
+  case res of
+    Right _ -> return res
+    Left _  -> runParser q ts
+
+-- Consume a token (skipping layout tokens).
+consume :: (Token -> Bool) -> Parser Token
+consume pred = Parser $ \ts ->
+  let ts' = dropWhile isLayout ts
+  in case ts' of
+       (t:rest) | pred t -> do
+           debugLog $ "Consumed token: " <> T.pack (show t)
+           return (Right (t, rest))
+       (t:_) -> do
+           debugLog $ "Failed to consume token, found: " <> T.pack (show t)
+           return (Left $ "Unexpected token: " ++ show t)
+       [] -> do
+           debugLog "Failed to consume token, end of input"
+           return (Left "Unexpected end of input")
+  where
+    isLayout t = case t of
+      TIndent  -> True
+      TDedent  -> True
+      TNewline -> True
+      _        -> False
+
+-- Try to consume a token without failing if not found
+tryConsume :: (Token -> Bool) -> Parser (Maybe Token)
+tryConsume pred = Parser $ \ts ->
+  let ts' = dropWhile isLayout ts
+  in case ts' of
+       (t:rest) | pred t -> do
+           debugLog $ "Try consumed token: " <> T.pack (show t)
+           return (Right (Just t, rest))
+       _ -> return (Right (Nothing, ts))
+  where
+    isLayout t = case t of
+      TIndent  -> True
+      TDedent  -> True
+      TNewline -> True
+      _        -> False
+
+-- Helper to explicitly consume a layout token
+consumeLayout :: (Token -> Bool) -> Parser (Maybe Token)
+consumeLayout pred = Parser $ \ts ->
+  case ts of
+    (t:rest) | pred t -> do
+        debugLog $ "Consumed layout token: " <> T.pack (show t)
+        return (Right (Just t, rest))
+    _ -> return (Right (Nothing, ts))
+
+-- Helper to skip all empty lines and whitespace between statements
+skipEmptyLines :: Parser ()
+skipEmptyLines = Parser $ \ts ->
+  let ts' = dropWhile (\t -> t == TNewline || t == TIndent || t == TDedent) ts
+  in return (Right ((), ts'))
+
+-- Parse many occurrences.
+many :: Parser a -> Parser [a]
+many p = (do
+  x <- p
+  xs <- many p
+  return (x:xs)) <|> return []
+
+-- Look ahead at the next token without consuming it
+peek :: Parser (Maybe Token)
+peek = Parser $ \ts ->
+  let ts' = dropWhile isLayout ts
+  in case ts' of
+       (t:_) -> return (Right (Just t, ts))
+       []    -> return (Right (Nothing, ts))
+  where
+    isLayout t = case t of
+      TIndent  -> True
+      TDedent  -> True
+      TNewline -> True
+      _        -> False
+
+--------------------------------------------------------------------------------
+-- Top-Level Statement Parsers Producing ExprBodyExpr
+--------------------------------------------------------------------------------
+
+-- A top-level statement is a macro definition, function definition, or a plain expression.
+parseTopStmt :: Parser ExprBodyExpr
+parseTopStmt = parseMacroDef <|> parseFnDef <|> parseLetStmt <|> parseExprWithSemicolon
+  where
+    parseExprWithSemicolon = do
+      e <- parseExprList  -- Use parseExprList to handle semicolon-separated expressions
+      return (Expr e)
+
+    -- Parse a let binding as a top-level statement
+    parseLetStmt = do
+      letExpr <- parseLet
+      return (Expr letExpr)
+
+-- | Parse a macro definition of the form:
+--    macro name(param1, param2): <body>
+parseMacroDef :: Parser ExprBodyExpr
+parseMacroDef = do
+  tok <- peek
+  case tok of
+    Just (TIdent "macro") -> do
+      _ <- consume (== TIdent "macro")
+      nameToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+      let macroName = case nameToken of TIdent n -> n; _ -> ""
+      _ <- consume (== TSymbol "(")
+      params <- parseArgs
+      _ <- consume (== TSymbol ")")
+      _ <- consume (== TSymbol ":")
+
+      -- Try to parse indented block for macro body - with parameter mapping
+      bodyExpr <- parseIndentedExpr params
+
+      -- Skip any trailing newlines
+      skipEmptyLines
+
+      -- Create the macro definition AST node
+      -- First define a lambda with the macro parameters
+      let macroParamNames = map (\i -> "$" <> T.pack (show i)) [1..length params]
+      let macroImpl = ELam macroParamNames (ExprBody [] bodyExpr)
+
+      -- Wrap in a lambda that takes the macro name
+      let macroLambda = ELam [macroName] (ExprBody [] macroImpl)
+
+      -- Return as a definition bound to "macro"
+      return (Def "macro" macroLambda)
+    _ -> Parser $ \_ -> return (Left "Not a macro definition")
+
+-- Parse an indented expression (used for macro body) with parameter renaming
+parseIndentedExpr :: [Text] -> Parser Expr
+parseIndentedExpr params = Parser $ \ts -> do
+  -- We need to look for an indented expression that starts with "if not"
+  -- Find the next line after the newline
+  let skipNewlines = dropWhile (== TNewline) ts
+  case skipNewlines of
+    (TIndent:rest) -> do
+      case dropWhile isLayout rest of
+        (TKeyword "if":_) -> do
+          debugLog "Found indented if-expression for macro body"
+          -- First parse the expression normally
+          result <- runParser parseIf rest
+          case result of
+            Left err -> return (Left err)
+            Right (expr, remainingTokens) -> do
+              -- Create variable renaming map from parameters to $1, $2, etc.
+              let paramMap = Map.fromList (zip params (map (\i -> "$" <> T.pack (show i)) [1..length params]))
+              -- Rename all variables in the expression according to the mapping
+              let renamedExpr = renameVarsInExpr paramMap expr
+              debugLog $ "Renamed variables in macro body: " <> T.pack (show renamedExpr)
+              return (Right (renamedExpr, remainingTokens))
+        _ -> return (Left "Expected if-expression in macro body")
+    _ -> return (Left "Expected indented block for macro body")
+  where
+    isLayout t = case t of
+      TIndent -> True
+      TDedent -> True
+      TNewline -> True
+      _ -> False
+
+-- | Parse a function definition of the form:
+--    fn <name>(<args>): <body>
+parseFnDef :: Parser ExprBodyExpr
+parseFnDef = do
+  _ <- consume (== TKeyword "fn")
+  nameToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+  let name = case nameToken of TIdent n -> n; _ -> ""
+  _ <- consume (== TSymbol "(")
+  args <- parseArgs
+  _ <- consume (== TSymbol ")")
+  _ <- consume (== TSymbol ":")
+  bodyExpr <- parseExpr
+  -- Wrap the function body in a lambda with no definitions.
+  return (Def name (ELam args (ExprBody [] bodyExpr)))
+
+-- | Parse a comma-separated list of arguments (identifiers).
+parseArgs :: Parser [Text]
+parseArgs = (do
+  argToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+  let arg = case argToken of TIdent a -> a; _ -> ""
+  rest <- many (do
+    _ <- consume (== TSymbol ",")
+    tok <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+    return (case tok of TIdent a -> a; _ -> ""))
+  return (arg:rest)) <|> return []
+
+-- | Parse a let binding with two possible formats:
+--    1. let <name> = <expr> [, <name> = <expr>]*
+--       <body>
+--    2. let
+--       <name> = <expr>
+--       <name> = <expr>
+--       ...
+--       <body>
+parseLet :: Parser Expr
+parseLet = do
+  _ <- consume (== TIdent "let")
+
+  -- Check if we have an immediate newline (format 2)
+  mNewline <- tryConsume (== TNewline)
+
+  bindings <- case mNewline of
+    -- Format 2: Bindings on separate lines
+    Just _ -> do
+      -- Expect indentation for the bindings block
+      _ <- consumeLayout (== TIndent)
+
+      -- Parse multiple bindings, each on a separate line
+      binds <- many1 parseBindingLine
+
+      -- Expect dedentation after bindings
+      _ <- consumeLayout (== TDedent)
+
+      return binds
+
+    -- Format 1: Bindings on same line separated by commas
+    Nothing -> do
+      -- Parse the first binding
+      firstBinding <- parseBinding
+
+      -- Check for additional bindings separated by commas
+      moreBindings <- many (do
+        _ <- tryConsume (== TSymbol ",")
+        parseBinding)
+
+      -- Expect a newline after the bindings
+      _ <- consumeLayout (== TNewline)
+
+      return (firstBinding : moreBindings)
+
+  -- Parse the body expressions
+  bodyExprs <- parseMultipleTopStmts
+
+  -- Transform the body expressions into a proper body
+  case bodyExprs of
+    [] -> return (ELet bindings (ExprBody [] (ELit LNil)))
+    [Expr e] -> return (ELet bindings (ExprBody [] e))
+    _ ->
+      let (defs, exprs) = partitionDefs bodyExprs
+          finalExpr = if null exprs
+                      then ELit LNil
+                      else last exprs
+      in return (ELet bindings (ExprBody defs finalExpr))
+
+-- Helper to parse a binding on a single line with no comma
+parseBindingLine :: Parser (T.Text, Expr)
+parseBindingLine = do
+  binding <- parseBinding
+  _ <- consumeLayout (== TNewline)
+  return binding
+
+-- Helper to parse a single binding (name = expr)
+parseBinding :: Parser (T.Text, Expr)
+parseBinding = do
+  nameToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+  let name = case nameToken of TIdent n -> n; _ -> ""
+  _ <- consume (== TSymbol "=")
+  expr <- parseExpr
+  return (name, expr)
+
+-- Helper for parsing at least one occurrence of something
+many1 :: Parser a -> Parser [a]
+many1 p = do
+  x <- p
+  xs <- many p
+  return (x:xs)
+
+-- | Parse a sequence of top-level statements.
+parseProgramExprs :: Parser [ExprBodyExpr]
+parseProgramExprs = do
+  _ <- skipEmptyLines
+  result <- parseMultipleTopStmts
+  _ <- skipEmptyLines
+  return result
+
+-- Parse multiple top-level statements separated by empty lines
+parseMultipleTopStmts :: Parser [ExprBodyExpr]
+parseMultipleTopStmts = do
+  -- Try to parse a statement
+  mTok <- peek
+  case mTok of
+    Just TEOF -> return []  -- End of input
+    Just _ -> do
+      -- Parse one statement
+      stmt <- parseTopStmt
+      -- Skip any trailing newlines/empty lines
+      _ <- skipEmptyLines
+      -- Parse more statements
+      rest <- parseMultipleTopStmts
+      return (stmt : rest)
+    Nothing -> return []  -- No more tokens
+
+--------------------------------------------------------------------------------
+-- Expression Parsers Producing Our Actual AST
+--------------------------------------------------------------------------------
+
+-- Parse a lambda expression (anonymous function)
+parseLambda :: Parser Expr
+parseLambda = do
+  _ <- consume (== TSymbol "(")
+  _ <- consume (== TKeyword "fn")
+  _ <- consume (== TSymbol "(")
+  args <- parseArgs
+  _ <- consume (== TSymbol ")")
+  _ <- consume (== TSymbol ":")
+  body <- parseExpr
+  _ <- consume (== TSymbol ")")
+  return (ELam args (ExprBody [] body))
+
+-- Parse a macro usage expression (unless(condition): body)
+parseMacroUsage :: Parser Expr
+parseMacroUsage = do
+  macroName <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+  let name = case macroName of TIdent n -> n; _ -> ""
+  _ <- consume (== TSymbol "(")
+  arg1 <- parseExpr
+  _ <- consume (== TSymbol ")")
+  _ <- consume (== TSymbol ":")
+  arg2 <- parseExpr
+  return (EApp (EVar name) [arg1, arg2])
+
+-- Expressions include if-expressions, addition, function calls, and primaries.
+parseExpr :: Parser Expr
+parseExpr = do
+  nextTok <- peek
+  case nextTok of
+    Just (TKeyword "if") -> parseIf
+    Just (TIdent "unless") -> parseMacroUsage
+    Just (TIdent "let") -> parseLet
+    _ -> parseAdd >>= parseExprWithCall
+  where
+    parseExprWithCall expr = (do
+      _ <- tryConsume (== TSymbol "(")
+      arg <- parseExpr
+      _ <- consume (== TSymbol ")")
+      let callExpr = EApp expr [arg]
+      -- Check for additional function applications
+      parseExprWithCall callExpr) <|> return expr
+
+-- Parse expressions separated by semicolons for top-level statements
+parseExprList :: Parser Expr
+parseExprList = do
+  -- Parse the first expression
+  first <- parseExpr
+
+  -- See if there's a semicolon followed by more expressions
+  semi <- tryConsume (== TSymbol ";")
+  case semi of
+    Just _ -> do
+      -- Parse the rest of the expressions
+      rest <- parseExprList
+      -- Return a sequence where expressions are evaluated in order
+      return $ EApp (ELam ["_"] (ExprBody [] rest)) [first]
+    Nothing -> return first
+
+-- Parse a list of expressions separated by semicolons
+parseIf :: Parser Expr
+parseIf = do
+  _    <- consume (== TKeyword "if")
+
+  -- Support for 'not' operator within the condition
+  mNot <- tryConsume (== TKeyword "not")
+  cond <- parseExpr
+
+  -- Apply 'not' if present
+  let finalCond = case mNot of
+        Just _  -> EApp (EBuiltinIdent "not") [cond]
+        Nothing -> cond
+
+  _ <- consume (== TSymbol ":")
+  thenE <- parseExpr
+
+  -- Parse optional 'else' clause
+  mElse <- tryConsume (== TKeyword "else")
+  case mElse of
+    Just _  -> do
+      _ <- consume (== TSymbol ":")
+      elseE <- parseExpr
+      return (EIf finalCond thenE elseE)
+    Nothing -> return (EIf finalCond thenE (ELit LNil))
+
+-- Helper for parsing separated lists
+sepBy :: Parser a -> Parser b -> Parser [a]
+sepBy p sep = (do
+  first <- p
+  rest <- many (do
+    _ <- sep
+    p)
+  return (first : rest)) <|> return []
+
+-- Parse left-associative addition.
+parseAdd :: Parser Expr
+parseAdd = do
+  lhs <- parseCall
+  moreAdd lhs
+  where
+    moreAdd lhs = (do
+      _ <- consume (== TSymbol "+")
+      rhs <- parseCall
+      let addExpr = EApp (EBuiltinIdent "+") [lhs, rhs]
+      moreAdd addExpr) <|> return lhs
+
+-- Parse function application with either space or parentheses syntax
+parseCall :: Parser Expr
+parseCall = do
+  primary <- parsePrimary
+  parseCall' primary
+  where
+    parseCall' fun =
+      -- Try parentheses syntax first
+      (do
+        _ <- consume (== TSymbol "(")
+        arg <- parseExpr
+        _ <- consume (== TSymbol ")")
+        let callExpr = EApp fun [arg]
+        parseCall' callExpr)
+      <|>
+      -- Try space-separated syntax for builtins
+      (case fun of
+        EBuiltinIdent _ -> do
+          arg <- parsePrimary  -- Use parsePrimary to avoid left recursion
+          let callExpr = EApp fun [arg]
+          parseCall' callExpr
+        _ -> return fun)
+      <|> return fun
+
+-- Parse a primary expression.
+parsePrimary :: Parser Expr
+parsePrimary = parseLambda <|> parseParens <|> parseTermSimple
+  where
+    parseParens = do
+      _ <- consume (== TSymbol "(")
+      e <- parseExpr
+      _ <- consume (== TSymbol ")")
+      return e
+
+-- Parse a simple term: identifier or number.
+parseTermSimple :: Parser Expr
+parseTermSimple = do
+  t <- consume isTerm
+  case t of
+    TIdent name -> if (isBuiltin name)
+                   then return (EBuiltinIdent name)
+                   else return (EVar name)
+    TNumber n -> return (ELit (LInt n))
+    TString s -> return (ELit (LString s))  -- Handle string literals
+    TKeyword "nil" -> return (ELit LNil)
+    TKeyword "true" -> return (ELit (LBool True))
+    TKeyword "false" -> return (ELit (LBool False))
+    _ -> Parser $ \_ -> return (Left "Expected a term")
+  where
+    isTerm tok = case tok of
+      TIdent _  -> True
+      TNumber _ -> True
+      TString _ -> True
+      TKeyword k -> k `elem` ["nil", "true", "false"]
+      _         -> False
+
+--------------------------------------------------------------------------------
+-- Helpers to Combine Top-Level Statements
+--------------------------------------------------------------------------------
+
+-- Partition a list of top-level statements into definitions and expressions.
+partitionDefs :: [ExprBodyExpr] -> ([ExprBodyExpr], [Expr])
+partitionDefs = foldr f ([], [])
+  where
+    f (Def n e) (defs, exprs) = (Def n e : defs, exprs)
+    f (Expr e) (defs, exprs)  = (defs, e : exprs)
+
+-- Combine a list of top-level statements into a single AST.
+combineStmts :: [ExprBodyExpr] -> Expr
+combineStmts stmts =
+  let (defs, exprs) = partitionDefs stmts
+  in case exprs of
+       -- Handle the case where there are only function definitions (no expressions)
+       [] | not (null defs) -> let mainExpr = ELit LNil  -- Implicit nil result
+                               in EApp (ELam [] (ExprBody defs mainExpr)) []
+
+       -- If there are truly no statements at all, this is an error
+       []  -> error "No final expression in program"
+
+       -- Standard case: one or more expressions
+       [e] -> EApp (ELam [] (ExprBody defs e)) []  -- Single expression case
+       _   -> let finalExpr = last exprs
+                  preceding = init exprs
+                  -- Generate proper sequence with exit continuations
+                  chainedExprs = foldr1 makeSequenceWithExit preceding
+                  finalSequence = makeSequenceWithExit chainedExprs finalExpr
+              in EApp (ELam [] (ExprBody defs finalSequence)) []
+  where
+    -- Chain expressions with continuations that don't depend on earlier results
+    makeSequenceWithExit e1 e2 =
+      EApp (ELam ["_"] (ExprBody [] e2)) [e1]
+
+--------------------------------------------------------------------------------
+-- Top-Level parseProgram Function
+--------------------------------------------------------------------------------
+
+dropLayout :: [Token] -> [Token]
+dropLayout = filter (not . isLayout)
+  where
+    isLayout t = case t of
+      TIndent  -> True
+      TDedent  -> True
+      TNewline -> True
+      _        -> False
+
+-- Add a version that takes the debug flag
+parseWithDebug :: Bool -> Text -> IO (Either String Expr)
+parseWithDebug debugMode input = do
+  tokens <- lexZayin debugMode input
+  runStderrLoggingT $ runReaderT (parseAction tokens) debugMode
+  where
+    parseAction tokens = do
+      debugLog $ "Tokens after layout: " <> T.pack (show tokens)
+      res <- runParser parseProgramExprs tokens
+      case res of
+        Right (stmts, remaining) ->
+           if dropLayout remaining == [TEOF]
+              then do
+                let progAst = combineStmts stmts
+                debugLog $ "Parsing complete: " <> T.pack (show progAst)
+                return (Right progAst)
+              else do
+                debugLog $ "Unconsumed tokens: " <> T.pack (show remaining)
+                return (Left ("Parsing error: unconsumed tokens " ++ show remaining))
+        Left err -> return (Left err)
+
+-- Updated top-level API for backward compatibility
+parseProgram :: Text -> IO (Either String Expr)
+parseProgram = parseWithDebug False
+{-# LANGUAGE OverloadedStrings #-}
+
+module Zayin.Transforms (toFExprM) where
+
+import Control.Monad (foldM, when)
+import Control.Monad.Logger
+import Control.Monad.State
+import qualified Data.Map as Map
+import Data.Semigroup ((<>))
+import qualified Data.Text as T
+import Zayin.AST (Fresh, Gen (..), freshName)
+import qualified Zayin.BoundExpr as BE
+import qualified Zayin.CPS as CPS
+import qualified Zayin.FlatExpr as FE
+import Zayin.Literals
+
+toFExprM :: Bool -> BE.BExpr -> CPS.AExp -> Fresh FE.FExpr
+toFExprM debugMode e k = do
+  when debugMode $
+    logDebugN $ T.pack $ "\n=== Starting CPS Transformation ===\n"
+      ++ "Initial bound expression: "
+      ++ show e
+      ++ "\n"
+      ++ "Initial continuation: "
+      ++ show k
+
+  -- Use the debug-aware functions
+  c_expr <- tC debugMode e k
+
+  when debugMode $
+    logDebugN $ T.pack $ "\nAfter tC transformation:\n" ++ show c_expr
+
+  -- Use the debug-aware functions for pure transformations
+  let result = intotoFExpr debugMode c_expr
+
+  when debugMode $
+    logDebugN $ T.pack $ "\nAfter intotoFExpr transformation:\n" ++ show result
+
+  return result
+
+-- Make intotoFExpr respect debug flag without using error
+intotoFExpr :: Bool -> CPS.CExp -> FE.FExpr
+intotoFExpr debugMode cexp =
+  let result = case cexp of
+        CPS.If c t f ->
+          FE.If
+            (intoAExpr debugMode c)
+            (intotoFExpr debugMode t)
+            (intotoFExpr debugMode f)
+        CPS.SetThen n v c ->
+          FE.SetThen
+            n
+            (intoAExpr debugMode v)
+            (intotoFExpr debugMode c)
+        CPS.Call1 f v ->
+          FE.CallOne
+            (intoAExpr debugMode f)
+            (intoAExpr debugMode v)
+        CPS.Call2 f v c ->
+          FE.CallTwo
+            (intoAExpr debugMode f)
+            (intoAExpr debugMode v)
+            (intoAExpr debugMode c)
+  in result  -- No debug logging in pure functions to avoid the error
+
+intoAExpr :: Bool -> CPS.AExp -> FE.FExpr
+intoAExpr debugMode aexp =
+  let result = case aexp of
+        CPS.Lam2 p k c ->
+          FE.LamTwo p k (intotoFExpr debugMode c)
+        CPS.Lam1 p c ->
+          FE.LamOne p (intotoFExpr debugMode c)
+        CPS.Var v ->
+          FE.Var v
+        CPS.BuiltinIdent s ->
+          FE.BuiltinIdent s
+        CPS.Lit l ->
+          FE.Lit l
+  in result  -- No debug logging in pure functions to avoid the error
+
+tC :: Bool -> BE.BExpr -> CPS.AExp -> Fresh CPS.CExp
+tC debugMode expr c = do
+  when debugMode $
+    logDebugN $ T.pack $ "\ntC: Processing expression: "
+      ++ show expr
+      ++ "\nwith continuation: "
+      ++ show c
+
+  case expr of
+    BE.Var v -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tC: Variable reference: " ++ show v
+      return $ CPS.Call1 c (CPS.Var v)
+
+    BE.Lit lit -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tC: Literal: " ++ show lit
+      return $ CPS.Call1 c (CPS.Lit lit)
+
+    BE.BuiltinIdent s -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tC: Builtin identifier: " ++ show s
+      return $ CPS.Call1 c (CPS.BuiltinIdent s)
+
+    BE.Set n e -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tC: Processing Set: " ++ show n ++ " = " ++ show e
+      tK debugMode e $ \val -> do
+        let result = CPS.SetThen n val (CPS.Call1 c (CPS.Lit LNil))
+        when debugMode $
+          logDebugN $ T.pack $ "tC: Set result: " ++ show result
+        return result
+
+    BE.If cond t f -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tC: Processing If expression"
+      k <- freshName "k"
+      when debugMode $
+        logDebugN $ T.pack $ "tC: Created fresh continuation for If: " ++ show k
+      condExpr <- tK debugMode cond $ \v -> do
+        t' <- tC debugMode t (CPS.Var k)
+        f' <- tC debugMode f (CPS.Var k)
+        let result = CPS.If v t' f'
+        when debugMode $
+          logDebugN $ T.pack $ "tC: If result: " ++ show result
+        return result
+      let result = CPS.Call1 (CPS.Lam1 k condExpr) c
+      when debugMode $
+        logDebugN $ T.pack $ "tC: Final If result: " ++ show result
+      return result
+
+    BE.Lam params body -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tC: Processing Lambda: params=" ++ show params
+      mexpr <- m debugMode expr
+      let result = CPS.Call1 c mexpr
+      when debugMode $
+        logDebugN $ T.pack $ "tC: Lambda result: " ++ show result
+      return result
+
+    BE.App f a -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tC: Processing Application: " ++ show f ++ " applied to " ++ show a
+
+      when debugMode $
+        logDebugN $ T.pack $ "tC: Using continuation: " ++ show c
+
+      tK debugMode f $ \fval -> do
+        when debugMode $
+          logDebugN $ T.pack $ "tC: Function value: " ++ show fval
+
+        tK debugMode a $ \aval -> do
+          let result = CPS.Call2 fval aval c
+          when debugMode $
+            logDebugN $ T.pack $ "tC: Application result with direct continuation: " ++ show result
+          return result
+
+tK :: Bool -> BE.BExpr -> (CPS.AExp -> Fresh CPS.CExp) -> Fresh CPS.CExp
+tK debugMode expr fk = do
+  when debugMode $
+    logDebugN $ T.pack $ "\ntK: Processing expression: " ++ show expr
+
+  case expr of
+    BE.Var v -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tK: Variable reference: " ++ show v
+      fk (CPS.Var v)
+
+    BE.Lit lit -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tK: Literal: " ++ show lit
+      fk (CPS.Lit lit)
+
+    BE.BuiltinIdent s -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tK: Builtin: " ++ show s
+      fk (CPS.BuiltinIdent s)
+
+    BE.Lam _ _ -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tK: Lambda"
+      mexpr <- m debugMode expr
+      fk mexpr
+
+    BE.Set n e -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tK: Setting variable: " ++ show n
+      tK debugMode e $ \v -> do
+        kexpr <- fk (CPS.Lit LNil)
+        let result = CPS.SetThen n v kexpr
+        when debugMode $
+          logDebugN $ T.pack $ "tK: Set result: " ++ show result
+        return result
+
+    BE.If cond t f -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tK: If expression"
+      rv <- freshName "rv"
+      kexpr <- fk (CPS.Var rv)
+      tK debugMode cond $ \v -> do
+        t' <- tC debugMode t (CPS.Lam1 rv kexpr)
+        f' <- tC debugMode f (CPS.Lam1 rv kexpr)
+        let result = CPS.If v t' f'
+        when debugMode $
+          logDebugN $ T.pack $ "tK: If result: " ++ show result
+        return result
+
+    BE.App f a -> do
+      when debugMode $
+        logDebugN $ T.pack $ "tK: Function application"
+      rv <- freshName "rv"
+      kexpr <- fk (CPS.Var rv)
+      let cont = CPS.Lam1 rv kexpr
+      when debugMode $
+        logDebugN $ T.pack $ "tK: Created continuation: " ++ show cont
+      tK debugMode f $ \fval -> do
+        when debugMode $
+          logDebugN $ T.pack $ "tK: Function value: " ++ show fval
+        tK debugMode a $ \aval -> do
+          let result = CPS.Call2 fval aval cont
+          when debugMode $
+            logDebugN $ T.pack $ "tK: Application result: " ++ show result
+          return result
+
+m :: Bool -> BE.BExpr -> Fresh CPS.AExp
+m debugMode expr = do
+  when debugMode $
+    logDebugN $ T.pack $ "m: Processing expression: " ++ show expr
+
+  case expr of
+    BE.Var v -> do
+      let result = CPS.Var v
+      when debugMode $
+        logDebugN $ T.pack $ "m: Created Var expression: " ++ show result
+      return result
+
+    BE.Lit l -> do
+      let result = CPS.Lit l
+      when debugMode $
+        logDebugN $ T.pack $ "m: Created Lit expression: " ++ show result
+      return result
+
+    BE.BuiltinIdent s -> do
+      let result = CPS.BuiltinIdent s
+      when debugMode $
+        logDebugN $ T.pack $ "m: Created BuiltinIdent expression: " ++ show result
+      return result
+
+    BE.Lam p e -> do
+      k <- freshName "k"
+      when debugMode $
+        logDebugN $ T.pack $ "m: Created continuation name for lambda: " ++ show k
+      body <- tC debugMode e (CPS.Var k)
+      let result = CPS.Lam2 p k body
+      when debugMode $
+        logDebugN $ T.pack $ "m: Created lambda expression: " ++ show result
+      return result
+
+    _ -> error "m: invalid input"

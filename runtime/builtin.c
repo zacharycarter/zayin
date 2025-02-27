@@ -297,31 +297,3 @@ struct obj *string_chars_innner(struct obj *string_obj) {
 }
 
 MAKE_ONE_ARG_FROM_BUILTIN_EXPLICIT_RETURN(string_chars, string_chars_innner);
-
-// NEW Implementation
-
-static boolean_type t_boolean = { {0}, boolean_tag, "t" };
-static boolean_type f_boolean = { {0}, boolean_tag, "f" };
-
-const object boolean_t = &t_boolean;
-const object boolean_f = &f_boolean;
-
-void zyn_exit(void *data, object clo, int argc, object * args)
-{
-  object obj = boolean_f;
-  if (argc > 0) {
-    obj = args[0];
-  }
-#if DEBUG_SHOW_DIAG
-  gc_print_stats(Cyc_heap);
-#endif
-  if (obj_is_int(obj)) {
-    exit(obj_obj2int(obj));
-  }
-
-  if (obj == boolean_f) {
-    exit(1);
-  }
-
-  exit(0);
-}

@@ -44,7 +44,7 @@ struct gc_funcs {
 
   // Marks an object and any child pointers
   // Stack objects are copied to the heap and the context updated
-  void (*const mark)(struct obj *, struct gc_context *);
+  void (*const zyn_mark)(struct obj *, struct gc_context *);
 
   // Frees an object
   // Acts as the cleanup routine, the gc will decide whether to call free on
@@ -87,7 +87,7 @@ void free_ht(struct obj *);
 struct gc_context gc_make_context(void);
 
 void gc_free_context(struct gc_context *);
-void gc_minor(struct gc_context *, struct thunk *);
+void zyn_gc_minor(struct gc_context *, struct thunk *);
 void gc_major(struct gc_context *, struct thunk *);
 
 struct obj *gc_toheap(struct gc_context *, struct obj *);
@@ -95,8 +95,5 @@ void gc_mark_obj(struct gc_context *, struct obj *);
 
 void gc_heap_maintain(void);
 void *gc_malloc(size_t);
-
-// NEW Implementation
-
 
 #endif // SOMESCHEME_GC_H

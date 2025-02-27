@@ -35,7 +35,7 @@ import qualified Zayin.CPS as CPS
 import Zayin.Codegen (codegen)
 import Zayin.FlatExpr (liftLambdas)
 import Zayin.FlatExpr.Pretty (renderFExpr)
-import Zayin.Interpreter (emptyEnv, interpretWithEnv, valueToString, Environment(..), Value(..))
+import Zayin.Interpreter (emptyEnv, emptyLambdaMap, interpretWithEnv, valueToString, Environment(..), LambdaMap(..), Value(..))
 import Zayin.LiftedExpr.Pretty (renderLExpr, renderLiftedLambda)
 import Zayin.Literals
 import Zayin.Macros (expandMacros)
@@ -125,6 +125,9 @@ runtimeFiles =
     ("queue.h", $(makeRelativeToProject "runtime/queue.h" >>= embedFile)),
     ("test_queue.c", $(makeRelativeToProject "runtime/test_queue.c" >>= embedFile)),
     ("vec.h", $(makeRelativeToProject "runtime/vec.h" >>= embedFile)),
+    ("bignum.h", $(makeRelativeToProject "runtime/bignum.h" >>= embedFile)),
+    ("ck_ht_hash.h", $(makeRelativeToProject "runtime/ck_ht_hash.h" >>= embedFile)),
+    ("runtime_main.h", $(makeRelativeToProject "runtime/runtime_main.h" >>= embedFile)),
     ("Makefile", $(makeRelativeToProject "runtime/Makefile" >>= embedFile))
   ]
 
@@ -203,6 +206,42 @@ generateBuildDir = do
     BS.writeFile fullPath contents
   return tmpDir
 
+-- generateProgramSource :: T.Text -> T.Text
+-- generateProgramSource src =
+--   T.concat
+--     [ T.unlines
+--         [ "#include <mimalloc.h>",
+--           "#include <stdlib.h>",
+--           "#include <string.h>",
+--           "#include <unistd.h>",
+--           "#include \"base.h\"",
+--           "#include \"builtin.h\""
+--         ],
+--       src,
+--       T.unlines
+--         [ "int main(void) {",
+--           "    mi_version();",
+--           "    gc_thread_data *thd;",
+--           "    long stack_size = global_stack_size = STACK_SIZE;",
+--           "    long heap_size = global_heap_size = HEAP_SIZE;",
+--           "    mclosure0(clos_exit,&zyn_exit);",
+--           "    mclosure0(entry_pt,&c_entry_pt);",
+--           "    gc_initialize();",
+--           "    thd = mi_malloc(sizeof(gc_thread_data));",
+--           "    gc_thread_data_init(thd, 0, (char *) &stack_size, stack_size);",
+--           "    thd->gc_cont = &entry_pt;",
+--           "    thd->gc_args[0] = &clos_halt;",
+--           "    thd->gc_num_args = 1;",
+--           "    thd->thread_id = pthread_self();",
+--           "    gc_add_mutator(thd);",
+--           "    Cyc_heap_init(heap_size);",
+--           "    thd->thread_state = CYC_THREAD_STATE_RUNNABLE;"
+--           "    zyn_start_trampoline(thd);",
+--           "    return 0;"
+--           "}"
+--         ]
+--     ]
+
 generateProgramSource :: T.Text -> T.Text
 generateProgramSource src =
   T.concat
@@ -212,29 +251,22 @@ generateProgramSource src =
           "#include <string.h>",
           "#include <unistd.h>",
           "#include \"base.h\"",
-          "#include \"builtin.h\""
+          "#include \"builtin.h\"",
+          "#include \"runtime_main.h\""
         ],
       src,
       T.unlines
         [ "int main(void) {",
           "    mi_version();",
-          "    gc_thread_data *thd;",
-          "    long stack_size = global_stack_size = STACK_SIZE;",
-          "    long heap_size = global_heap_size = HEAP_SIZE;",
-          "    mclosure0(clos_exit,&zyn_exit);",
-          "    mclosure0(entry_pt,&c_entry_pt);",
-          "    gc_initialize();",
-          "    thd = mi_malloc(sizeof(gc_thread_data));",
-          "    gc_thread_data_init(thd, 0, (char *) &stack_size, stack_size);",
-          "    thd->gc_cont = &entry_pt;",
-          "    thd->gc_args[0] = &clos_halt;",
-          "    thd->gc_num_args = 1;",
-          "    thd->thread_id = pthread_self();",
-          "    gc_add_mutator(thd);",
-          "    Cyc_heap_init(heap_size);",
-          "    thd->thread_state = CYC_THREAD_STATE_RUNNABLE;"
-          "    zyn_start_trampoline(thd);",
-          "    return 0;"
+          "    struct closure_obj initial_closure = object_closure_one_new(main_lambda, NULL);",
+          "    struct thunk initial_thunk = {",
+          "        .closr = &initial_closure,",
+          "        .one = {NULL},",
+          "    };",
+          "",
+          "    struct thunk *thnk_heap = mi_malloc(sizeof(struct thunk));",
+          "    memcpy(thnk_heap, &initial_thunk, sizeof(struct thunk));",
+          "    zayin_start(thnk_heap);",
           "}"
         ]
     ]
@@ -484,32 +516,18 @@ replLoop opts state = do
                     let (lexpr, lambdas) = liftLambdas debugMode fExpr
 
                     -- Pass the current environment to interpret and get new environment back
-                    interpretWithEnv lexpr lambdas True (interpreterEnv updatedState) (interpreterEnv updatedState)
+                    interpretWithEnv lexpr (lambdaMap updatedState) True (interpreterEnv updatedState)
 
-        case result of
-          Left err -> do
-            outputStrLn err
-            replLoop opts updatedState  -- Keep the same state on error
-          Right (val, newEnv, newLambdaMap) -> do  -- Extract the lambda map too
-            -- Store both the updated environment and lambda map
-            let finalState = updatedState {
-                  interpreterEnv = newEnv,
-                  lambdaMap = newLambdaMap  -- Update lambda map
-                }
-
-            -- Only print the result if it's not VNoop
-            case val of
-              VNoop -> replLoop opts finalState
-              _ -> do
-                outputStrLn $ valueToString val
-                replLoop opts finalState
           case result of
             Left err -> do
               outputStrLn err
-              replLoop opts updatedState  -- Keep the same environment on error
-            Right (val, newEnv) -> do
-              -- Store the updated environment
-              let finalState = updatedState { interpreterEnv = newEnv }
+              replLoop opts updatedState  -- Keep the same state on error
+            Right (val, newEnv, newLambdaMap) -> do  -- Extract the lambda map too
+              -- Store both the updated environment and lambda map
+              let finalState = updatedState {
+                    interpreterEnv = newEnv,
+                    lambdaMap = newLambdaMap  -- Update lambda map
+                  }
 
               -- Only print the result if it's not VNoop
               case val of

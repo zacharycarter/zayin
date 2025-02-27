@@ -1,0 +1,3414 @@
+#include <mimalloc.h>
+#include <setjmp.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+
+#include "base.h"
+#include "common.h"
+#include "gc.h"
+#include "hash_table.h"
+#include "vec.h"
+
+static bool stack_check(void);
+
+static struct thunk *current_thunk;
+static void *stack_initial;
+static jmp_buf setjmp_env_buf;
+
+void call_closure_one(struct obj *rator, struct obj *rand) {
+  if (rator->tag != OBJ_CLOSURE) {
+    RUNTIME_ERROR("Called object (%p) was not a closure but was: %d", rator,
+                  rator->tag);
+  }
+
+  struct closure_obj *closure = (struct closure_obj *)rator;
+
+  if (closure->size != CLOSURE_ONE) {
+    printf("Trying to call: %p\n", closure->fn_1);
+    RUNTIME_ERROR("Called a closure that takes two args with one arg");
+  }
+
+  if (stack_check()) {
+    closure->fn_1(rand, closure->env);
+  } else {
+    // TODO: move to our own gc allocator?
+    struct thunk *thnk_heap = mi_malloc(sizeof(struct thunk));
+    thnk_heap->closr = closure;
+    thnk_heap->one.rand = rand;
+    run_minor_gc(thnk_heap);
+  }
+}
+
+void call_closure_two(struct obj *rator, struct obj *rand, struct obj *cont) {
+  if (rator->tag != OBJ_CLOSURE) {
+    RUNTIME_ERROR("Called object (%p) was not a closure but was: %d", rator,
+                  rator->tag);
+  }
+
+  struct closure_obj *closure = (struct closure_obj *)rator;
+
+  if (closure->size != CLOSURE_TWO) {
+    RUNTIME_ERROR("Called a closure that takes one arg with two args");
+  }
+
+  if (stack_check()) {
+    closure->fn_2(rand, cont, closure->env);
+  } else {
+    // TODO: move to our own gc allocator?
+    struct thunk *thnk_heap = mi_malloc(sizeof(struct thunk));
+    thnk_heap->closr = closure;
+    thnk_heap->two.rand = rand;
+    thnk_heap->two.cont = cont;
+    run_minor_gc(thnk_heap);
+  }
+}
+
+static size_t get_stack_limit(void) {
+  static size_t cached_limit = 0;
+
+  if (cached_limit != 0) {
+    return cached_limit;
+  }
+
+  struct rlimit limit;
+  getrlimit(RLIMIT_STACK, &limit);
+  cached_limit = limit.rlim_cur;
+  return cached_limit;
+}
+
+void *stack_ptr(void) { return __builtin_frame_address(0); }
+
+/*
+ * Are we above the stack limit
+ */
+static bool stack_check(void) {
+  // buffer area at the end of the stack since idk how accurate this is
+  // so reserve 256K for anything we might do after getting to the 'limit'
+  static size_t stack_buffer = 1024 * 256;
+  uintptr_t stack_ptr_val = (uintptr_t)stack_ptr();
+  uintptr_t stack_end_val =
+      (uintptr_t)(stack_initial - get_stack_limit() + stack_buffer);
+
+  return stack_ptr_val > stack_end_val;
+}
+
+void zayin_start(struct thunk *initial_thunk) {
+  stack_initial = stack_ptr();
+  current_thunk = initial_thunk;
+
+  gc_init();
+
+  // This is our trampoline, when we come back from a longjmp a different
+  // current_thunk will be set and we will just trampoline into the new
+  // thunk
+  setjmp(setjmp_env_buf);
+
+  DEBUG_FPRINTF(stderr, "bouncing\n");
+
+  if (current_thunk->closr->size == CLOSURE_ONE) {
+    struct closure_obj *closr = current_thunk->closr;
+    struct obj *rand = current_thunk->one.rand;
+    struct env_obj *env = current_thunk->closr->env;
+    mi_free(current_thunk);
+    closr->fn_1(rand, env);
+  } else {
+    struct closure_obj *closr = current_thunk->closr;
+    struct obj *rand = current_thunk->two.rand;
+    struct obj *cont = current_thunk->two.cont;
+    struct env_obj *env = current_thunk->closr->env;
+    mi_free(current_thunk);
+    closr->fn_2(rand, cont, env);
+  }
+
+  RUNTIME_ERROR("Control flow returned from trampoline function.");
+}
+
+void run_minor_gc(struct thunk *thnk) {
+  current_thunk = thnk;
+
+  struct gc_context ctx = gc_make_context();
+  gc_minor(&ctx, thnk);
+  gc_free_context(&ctx);
+
+  // Jump back to the start
+  longjmp(setjmp_env_buf, 1);
+}
+
+struct obj object_base_new(enum object_tag tag) {
+  return (struct obj){
+      .tag = tag,
+      .mark = WHITE,
+      .on_stack = true,
+#ifdef DEBUG
+      .last_touched_by = "object_init",
+#endif
+  };
+}
+
+struct closure_obj object_closure_one_new(void (*fn)(struct obj *,
+                                                     struct env_obj *),
+                                          struct env_obj *env) {
+  return (struct closure_obj){.base = object_base_new(OBJ_CLOSURE),
+                              .size = CLOSURE_ONE,
+                              .fn_1 = fn,
+                              .env = env};
+}
+
+struct closure_obj object_closure_two_new(void (*fn)(struct obj *, struct obj *,
+                                                     struct env_obj *),
+                                          struct env_obj *env) {
+  return (struct closure_obj){.base = object_base_new(OBJ_CLOSURE),
+                              .size = CLOSURE_TWO,
+                              .fn_2 = fn,
+                              .env = env};
+}
+
+struct int_obj object_int_obj_new(int64_t val) {
+  return (struct int_obj){.base = object_base_new(OBJ_INT), .val = val};
+}
+
+
+struct bool_obj object_bool_obj_new(bool val) {
+  return (struct bool_obj){.base = object_base_new(OBJ_BOOL), .val = val};
+}
+
+struct cons_obj object_cons_obj_new(struct obj *car, struct obj *cdr) {
+  return (struct cons_obj){
+      .base = object_base_new(OBJ_CONS), .car = car, .cdr = cdr};
+}
+
+static size_t hash_string(const char *buf, size_t len) {
+  size_t hash = 14695981039346656037ull;
+
+  for (size_t i = 0; i < len; i++) {
+    hash ^= (size_t)buf[i];
+    hash *= 1099511628211;
+  }
+
+  return hash;
+}
+
+static size_t hash_combine(size_t a, size_t b) {
+  size_t hash = a;
+
+  hash *= 1099511628211;
+  hash ^= b;
+  hash *= 1099511628211;
+
+  return hash;
+}
+
+size_t hash_obj_impl(struct obj *obj) {
+  if (!obj) {
+    return 0;
+  }
+
+  switch (obj->tag) {
+  case OBJ_INT:
+    return hash_table_default_size_t_hash_fun(((struct int_obj *)obj)->val);
+  case OBJ_BOOL:
+    return hash_table_default_size_t_hash_fun(((struct bool_obj *)obj)->val);
+  case OBJ_STR: {
+    struct string_obj *str_obj = (struct string_obj *)obj;
+    return hash_string(str_obj->buf, str_obj->len);
+  }
+  case OBJ_CONS: {
+    struct cons_obj *cons_obj = (struct cons_obj *)obj;
+    size_t a = hash_obj_impl(cons_obj->car);
+    size_t b = hash_obj_impl(cons_obj->cdr);
+    return hash_combine(a, b);
+  }
+  case OBJ_HT: {
+    struct ht_obj *ht_obj = (struct ht_obj *)obj;
+    size_t hash = 14695981039346656037ull;
+
+    HASH_TABLE_ITER(obj, key, val, ht_obj->ht, {
+      hash = hash_combine(hash, hash_obj_impl(*key));
+      hash = hash_combine(hash, hash_obj_impl(*val));
+    });
+
+    return hash;
+  }
+  case OBJ_CELL:
+    return hash_obj_impl(((struct cell_obj *)obj)->val);
+  default:
+    RUNTIME_ERROR("Unhashable type: %d", obj->tag);
+  }
+}
+
+bool eq_obj_impl(struct obj *a, struct obj *b) {
+  if (!a && !b)
+    return true;
+
+  if (!a || !b)
+    return false;
+
+  if (a->tag != b->tag)
+    return false;
+
+  switch (a->tag) {
+  case OBJ_INT:
+    return ((struct int_obj *)a)->val == ((struct int_obj *)b)->val;
+  case OBJ_BOOL:
+    return ((struct bool_obj *)a)->val == ((struct bool_obj *)b)->val;
+  case OBJ_STR: {
+    struct string_obj *str_obj_a = (struct string_obj *)a;
+    struct string_obj *str_obj_b = (struct string_obj *)b;
+
+    if (str_obj_a->len != str_obj_b->len)
+      return false;
+
+    return strncmp(str_obj_a->buf, str_obj_b->buf, str_obj_a->len) == 0;
+  }
+  case OBJ_CONS: {
+    struct cons_obj *cons_obj_a = (struct cons_obj *)a;
+    struct cons_obj *cons_obj_b = (struct cons_obj *)b;
+    return eq_obj_impl(cons_obj_a->car, cons_obj_b->car) &&
+           eq_obj_impl(cons_obj_a->cdr, cons_obj_b->cdr);
+  }
+  case OBJ_HT: {
+    struct ht_obj *ht_obj_a = (struct ht_obj *)a;
+    struct ht_obj *ht_obj_b = (struct ht_obj *)b;
+
+    HASH_TABLE_ITER(obj, key, val, ht_obj_a->ht, {
+      typeof(*val) *b_val = hash_table_obj_lookup(ht_obj_b->ht, *key);
+
+      if (!b_val)
+        return false;
+
+      if (!eq_obj_impl(*val, *b_val))
+        return false;
+    });
+
+    HASH_TABLE_ITER(obj, key, val, ht_obj_b->ht, {
+      typeof(*val) *a_val = hash_table_obj_lookup(ht_obj_a->ht, *key);
+
+      if (!a_val)
+        return false;
+
+      // we don't need to check equality of values this time
+    });
+
+    return true;
+  }
+  case OBJ_CELL:
+    return eq_obj_impl(((struct cell_obj *)a)->val,
+                       ((struct cell_obj *)b)->val);
+  default:
+    return false;
+  }
+}
+
+MAKE_HASH(struct obj *, struct obj *, hash_obj_impl, eq_obj_impl, obj);
+
+struct ht_obj object_ht_obj_new() {
+  struct hash_table_obj *ht = hash_table_obj_new();
+
+  return (struct ht_obj){.base = object_base_new(OBJ_HT), .ht = ht};
+}
+
+// NEW Implementation
+
+/**
+ * @brief Perform one-time heap initializations for the program
+ * @param heap_size Unused
+ */
+void gc_init_heap(long heap_size)
+{
+  /* if (!ck_hs_init(&lib_table, */
+  /*                 CK_HS_MODE_OBJECT | CK_HS_MODE_SPMC, */
+  /*                 hs_hash, hs_compare, &my_allocator, 32, 43423)) { */
+  /*   fprintf(stderr, "Unable to initialize library table\n"); */
+  /*   exit(1); */
+  /* } */
+  /* if (!ck_hs_init(&symbol_table, */
+  /*                 CK_HS_MODE_OBJECT | CK_HS_MODE_SPMC, */
+  /*                 hs_hash, hs_compare, */
+  /*                 &my_allocator, symbol_table_initial_size, 43423)) { */
+  /*   fprintf(stderr, "Unable to initialize symbol table\n"); */
+  /*   exit(1); */
+  /* } */
+  /* if (pthread_mutex_init(&(symbol_table_lock), NULL) != 0) { */
+  /*   fprintf(stderr, "Unable to initialize symbol_table_lock mutex\n"); */
+  /*   exit(1); */
+  /* } */
+  /* //ht_test(); // JAE - DEBUGGING!! */
+}
+#ifndef ZAYIN_H
+#define ZAYIN_H
+
+#include <pthread.h>
+#include <setjmp.h>
+#include <stdbool.h>
+#include <stdlib.h>
+
+#include "common.h"
+#include "vec.h"
+#include "hash_table.h"
+
+#define NUM_ARGS(...) (sizeof((size_t[]){__VA_ARGS__}) / sizeof(size_t))
+
+#define OBJECT_STRING_OBJ_NEW(NAME, S)                                         \
+  struct obj *(NAME);                                                          \
+  do {                                                                         \
+    size_t len = strlen(S) + 1;                                                \
+    /* we keep the null byte */                                                \
+    struct string_obj *new_obj = alloca(sizeof(struct string_obj) + len);      \
+    new_obj->base = object_base_new(OBJ_STR);                                  \
+    new_obj->len = len;                                                        \
+    memcpy((char *)&new_obj->buf, (S), len);                                   \
+    TOUCH_OBJECT(new_obj, "string_obj_new");                                   \
+    (NAME) = (struct obj *)new_obj;                                            \
+  } while (0)
+
+#define OBJECT_INT_OBJ_NEW(NAME, n)                                            \
+  struct obj *(NAME);                                                          \
+  do {                                                                         \
+    struct int_obj *new_obj = alloca(sizeof(struct int_obj));                  \
+    *new_obj = object_int_obj_new((n));                                        \
+    TOUCH_OBJECT(new_obj, "int_obj_new");                                      \
+    (NAME) = (struct obj *)new_obj;                                            \
+  } while (0)
+
+#define OBJECT_BOOL_OBJ_NEW(NAME, b)                                           \
+  struct obj *(NAME);                                                          \
+  do {                                                                         \
+    struct bool_obj *new_obj =                                                 \
+        (struct bool_obj*)alloca(sizeof(struct bool_obj));                     \
+    *new_obj = object_bool_obj_new((b));                                       \
+    TOUCH_OBJECT(new_obj, "bool_obj_new");                                     \
+    (NAME) = (struct obj *)new_obj;                                            \
+  } while (0)
+
+#define ENV_STRUCT(T)                                                          \
+  struct {                                                                     \
+    struct obj base;                                                           \
+    size_t len;                                                                \
+    T env;                                                                     \
+  }
+
+#define OBJECT_ENV_OBJ_NEW(NAME, S)                                            \
+  struct env_obj *(NAME);                                                      \
+  do {                                                                         \
+    ENV_STRUCT(S) *new_env = alloca(sizeof(ENV_STRUCT(S)));                    \
+    new_env->base = object_base_new(ENV_OBJ);                                  \
+    new_env->len = sizeof(S) / sizeof(struct obj *);                           \
+    memset(&new_env->env, 0, sizeof(S));                                       \
+    (NAME) = (struct env_obj *)new_env;                                        \
+  } while (0)
+
+#define OBJECT_CLOSURE_ONE_NEW(NAME, FN, ENV)                                  \
+  struct obj *(NAME);                                                          \
+  do {                                                                         \
+    struct closure_obj *new_obj = alloca(sizeof(struct closure_obj));          \
+    *new_obj = object_closure_one_new((FN), (ENV));                            \
+    TOUCH_OBJECT(new_obj, "closure_one_new");                                  \
+    (NAME) = (struct obj *)new_obj;                                            \
+  } while (0)
+
+#define OBJECT_CLOSURE_TWO_NEW(NAME, FN, ENV)                                  \
+  struct obj *(NAME);                                                          \
+  do {                                                                         \
+    struct closure_obj *new_obj = alloca(sizeof(struct closure_obj));          \
+    *new_obj = object_closure_two_new((FN), (ENV));                            \
+    TOUCH_OBJECT(new_obj, "closure_two_new");                                  \
+    (NAME) = (struct obj *)new_obj;                                            \
+  } while (0)
+
+#define OBJECT_CELL_OBJ_NEW(NAME, VAL)                                         \
+  struct obj *(NAME);                                                          \
+  do {                                                                         \
+    struct cell_obj *new_obj = alloca(sizeof(struct cell_obj));                \
+    new_obj->base = object_base_new(OBJ_CELL);                                 \
+    new_obj->val = (VAL);                                                      \
+    TOUCH_OBJECT(new_obj, "object_cell_new");                                  \
+    (NAME) = (struct obj *)new_obj;                                            \
+  } while (0)
+
+#define OBJECT_HT_OBJ_NEW(NAME)                 \
+  struct
+
+#ifdef DEBUG_TOUCH
+#define TOUCH_OBJECT(OBJ, S)                                                   \
+  do {                                                                         \
+    fprintf(stderr,                                                            \
+            "touching object %p tag: %d, last touched by %s: (%s:%d:%s)\n",    \
+            (void *)(OBJ), ((struct obj *)(OBJ))->tag,                         \
+            ((struct obj *)(OBJ))->last_touched_by, __func__, __LINE__, (S));  \
+    ALLOC_SPRINTF(((struct obj *)(OBJ))->last_touched_by, "(%s:%d:%s)",        \
+                  __func__, __LINE__, (S));                                    \
+  } while (0)
+#else
+#define TOUCH_OBJECT(OBJ, S)                                                   \
+  do {                                                                         \
+  } while (0)
+#endif // DEBUG_TOUCH
+
+enum __attribute__((__packed__)) closure_size {
+  CLOSURE_ONE = 0,
+  CLOSURE_TWO,
+};
+
+enum __attribute__((__packed__)) object_tag {
+  OBJ_CLOSURE = 1,
+  ENV_OBJ,
+  OBJ_INT,
+  OBJ_STR,
+  OBJ_CONS,
+  OBJ_CELL,
+  OBJ_HT,
+  OBJ_BOOL,
+};
+
+#define LAST_OBJ_TYPE OBJ_HT
+
+enum __attribute__((__packed__)) gc_mark_type { WHITE = 0, GREY, BLACK };
+
+struct obj {
+  enum object_tag tag;
+  enum gc_mark_type mark;
+  bool on_stack;
+#ifdef DEBUG
+  char *last_touched_by;
+#endif
+};
+
+// builtin objects
+
+struct env_obj {
+  struct obj base;
+  size_t len;
+  struct obj *env[];
+};
+
+struct cell_obj {
+  struct obj base;
+  struct obj *val;
+};
+
+struct cons_obj {
+  struct obj base;
+  struct obj *car;
+  struct obj *cdr;
+};
+
+struct closure_obj {
+  struct obj base;
+  enum closure_size size;
+  union {
+    void (*fn_1)(struct obj *, struct env_obj *);
+    void (*fn_2)(struct obj *, struct obj *, struct env_obj *);
+  };
+  struct env_obj *env;
+};
+
+struct int_obj {
+  struct obj base;
+  int64_t val;
+};
+
+struct bool_obj {
+  struct obj base;
+  bool val;
+};
+
+struct string_obj {
+  struct obj base;
+  size_t len;
+  const char buf[];
+};
+
+
+DEFINE_HASH(struct obj *, struct obj *, obj);
+
+struct ht_obj {
+  struct obj base;
+  struct hash_table_obj *ht;
+};
+
+struct thunk {
+  struct closure_obj *closr;
+  union {
+    struct {
+      struct obj *rand;
+    } one;
+    struct {
+      struct obj *rand;
+      struct obj *cont;
+    } two;
+  };
+};
+
+void call_closure_one(struct obj *, struct obj *);
+void call_closure_two(struct obj *, struct obj *, struct obj *);
+void zayin_start(struct thunk *);
+void run_minor_gc(struct thunk *);
+
+struct obj object_base_new(enum object_tag);
+struct closure_obj object_closure_one_new(void (*)(struct obj *,
+                                                   struct env_obj *),
+                                          struct env_obj *);
+struct closure_obj object_closure_two_new(void (*)(struct obj *, struct obj *,
+                                                   struct env_obj *),
+                                          struct env_obj *);
+struct int_obj object_int_obj_new(int64_t);
+struct bool_obj object_bool_obj_new(bool);
+struct cons_obj object_cons_obj_new(struct obj *, struct obj *);
+struct ht_obj object_ht_obj_new(void);
+
+bool eq_obj_impl(struct obj *, struct obj *);
+
+void *stack_ptr(void);
+
+
+// NEW Implementation
+
+/**
+ * Generic object type
+ * \ingroup objects
+ */
+typedef void *object;
+
+/**
+ * Define a unique tag for each possible type of object.
+ *
+ * Remember to update tag_names in runtime.c when adding new tags
+ *\ingroup objects
+ */
+enum zyn_object_tag {
+  closure0_tag = 0, closure1_tag = 1, closureN_tag = 2, macro_tag = 3   // Keep closures here for quick type checking
+  , boolean_tag = 4, bytevector_tag = 5, c_opaque_tag = 6, cond_var_tag =
+      7, cvar_tag = 8, double_tag = 9, eof_tag = 10, forward_tag =
+      11, integer_tag = 12, bignum_tag = 13, mutex_tag = 14, pair_tag =
+      15, port_tag = 16, primitive_tag = 17, string_tag = 18, symbol_tag =
+      19, vector_tag = 20, complex_num_tag = 21, atomic_tag = 22, void_tag =
+      23, record_tag = 24
+};
+
+/**
+ * Returns a true value if object is not a closure, or false otherwise
+ */
+#define obj_is_not_closure(obj) \
+  ((obj == NULL) || is_value_type(obj) || (type_of(obj) > macro_tag))
+
+/**
+ * Defines the size of object tags
+ * \ingroup objects
+ */
+typedef unsigned char tag_type;
+
+/**
+ * Access an object's tag.
+ * \ingroup objects
+ */
+#define type_of(obj) (((pair_type *) obj)->tag)
+
+/**
+ * \defgroup gc Garbage collection
+ *
+ * @brief The Cyclone runtime's garbage collector (GC)
+ *
+ * When using the FFI there is normally no need to call
+ * into this code unless something is specifically mentioned
+ * in the User Manual.
+ */
+/**@{*/
+
+/**
+ * \defgroup gc_major Major GC
+ * @brief Major GC is responsible for removing unused objects from
+ * the heap.
+ */
+/**@{*/
+
+////////////////////////////////
+// Parameters for size of a "page" on the heap (the second generation GC), in bytes.
+
+/** Grow first page by adding this amount to it */
+#define GROW_HEAP_BY_SIZE (2 * 1024 * 1024)
+
+/** Size of the first page */
+#define INITIAL_HEAP_SIZE (3 * 1024 * 1024)
+
+/** Normal size of a heap page */
+#define HEAP_SIZE (8 * 1024 * 1024)
+
+// End heap page size parameters
+////////////////////////////////
+
+/////////////////////////////
+// Major GC tuning parameters
+
+/** Start GC cycle if % heap space free below this percentage */
+#define GC_COLLECTION_THRESHOLD 0.0125  //0.05
+
+/** Start GC cycle if fewer than this many heap pages are unswept */
+#define GC_COLLECT_UNDER_UNSWEPT_HEAP_COUNT 3
+
+/** After major GC, grow the heap so at least this percentage is free */
+#define GC_FREE_THRESHOLD 0.40
+// END GC tuning
+/////////////////////////////
+
+/** Number of functions to save for printing call history */
+#define MAX_STACK_TRACES 10
+
+/** Show diagnostic information for the GC when program terminates */
+#define DEBUG_SHOW_DIAG 0
+
+/** Show diagnostic information before/after sweeping */
+#define GC_DEBUG_SHOW_SWEEP_DIAG 0
+
+/** GC debugging flag */
+#define GC_DEBUG_TRACE 0
+
+/** GC debugging flag */
+#define GC_DEBUG_VERBOSE 0
+
+// Type starts at 0 and ends at LAST_FIXED_SIZE_HEAP_TYPE
+// Presently each type contains buckets of a multiple of 32 bytes
+// EG: 0 ==> 32
+//     1 ==> 64, etc
+typedef int gc_heap_type;
+
+/** The first heap type that is not fixed-size */
+#if INTPTR_MAX == INT64_MAX
+#define LAST_FIXED_SIZE_HEAP_TYPE 2
+#else
+#define LAST_FIXED_SIZE_HEAP_TYPE 1
+#endif
+
+#define HEAP_REST (LAST_FIXED_SIZE_HEAP_TYPE + 1)
+#define HEAP_HUGE (HEAP_REST + 1)
+
+/** The number of `gc_heap_type`'s */
+#define NUM_HEAP_TYPES (HEAP_HUGE + 1)
+
+/**
+ * Linked list of free memory chunks on a heap page
+ */
+typedef struct gc_free_list_t gc_free_list;
+struct gc_free_list_t {
+  unsigned int size;
+  gc_free_list *next;
+};
+
+/**
+ * Heap page
+ *
+ * @brief Contains data for a single page of the heap.
+ *
+ * Note there are groups of parameters to support:
+ * - Bump-allocation - This type of allocation is faster but only applicable when a page is first created or empty.
+ * - Lazy sweep
+ */
+typedef struct gc_heap_t gc_heap;
+struct gc_heap_t {
+  gc_heap_type type;
+  /** Size of the heap page in bytes */
+  unsigned int size;
+  /** Keep empty page alive this many times before freeing */
+  unsigned char ttl;
+  /** Bump: Track remaining space; this is useful for bump&pop style allocation */
+  unsigned int remaining;
+  /** For fixed-size heaps, only allocate blocks of this size */
+  unsigned block_size;
+  /** Lazy-sweep: Amount of heap data that is free */
+  unsigned int free_size;
+  /** Lazy-sweep: Determine if the heap is full */
+  unsigned char is_full;
+  /** Lazy-sweep: Determine if the heap has been swept */
+  unsigned char is_unswept;
+  /** Lazy-sweep: Start GC cycle if fewer than this many heap pages are unswept */
+  int num_unswept_children;
+  /** Last size of object that was allocated, allows for optimizations */
+  unsigned int last_alloc_size;
+  /** Next page that has free space, lets alloc find that page faster */
+  gc_heap *next_free;
+  /** Linked list of free memory blocks in this page */
+  gc_free_list *free_list;
+  /** Next page in this heap */
+  gc_heap *next;                // TBD, linked list is not very efficient, but easy to work with as a start
+  /** Actual data in this page */
+  char *data;
+  /** End of the data when using bump alllocation or NULL when using free lists */
+  char *data_end;
+};
+
+/**
+ * A heap root is the heap's first page
+ */
+typedef struct gc_heap_root_t gc_heap_root;
+struct gc_heap_root_t {
+  gc_heap **heap;
+};
+
+/**
+ * Header added to each object for GC purposes
+ */
+typedef struct gc_header_type_t gc_header_type;
+struct gc_header_type_t {
+  unsigned char mark;           // mark bits
+  unsigned char grayed:1;       // stack object to be grayed when moved to heap
+  unsigned char immutable:1;    // Flag normally mutable obj (EG: pair) as read-only
+};
+
+/** Get an object's `mark` value */
+/* #define mark(x) (((list) x)->hdr.mark) */
+
+/** Get an object's `grayed` value */
+#define grayed(x) (((list) x)->hdr.grayed)
+
+//** Access an object's "immutable" field */
+#define immutable(x) (((list) x)->hdr.immutable)
+
+/** Enums for tri-color marking */
+typedef enum { STATUS_ASYNC, STATUS_SYNC1, STATUS_SYNC2
+} gc_status_type;
+
+/** Stages of the Major GC's collector thread */
+typedef enum { STAGE_CLEAR_OR_MARKING, STAGE_TRACING
+      //, STAGE_REF_PROCESSING
+  , STAGE_SWEEPING, STAGE_RESTING
+} gc_stage_type;
+
+// Constant colors are defined here.
+// The mark/clear colors are defined in the gc module because
+// the collector swaps their values as an optimization.
+
+/** Memory not to be collected by major GC, such as on the stack */
+#define gc_color_red  0
+
+/** Unallocated memory */
+#define gc_color_blue 2
+
+/** Mark buffers */
+typedef struct mark_buffer_t mark_buffer;
+struct mark_buffer_t {
+  void **buf;
+  unsigned buf_len;
+  mark_buffer *next;
+};
+
+/** Threading */
+typedef enum { ZYN_THREAD_STATE_NEW, ZYN_THREAD_STATE_RUNNABLE,
+  ZYN_THREAD_STATE_BLOCKED, ZYN_THREAD_STATE_BLOCKED_COOPERATING,
+  ZYN_THREAD_STATE_TERMINATED
+} zyn_thread_state_type;
+
+/**
+ * Thread data structures
+ * @brief Each thread is given an instance of this struct to
+ *        maintain its state
+ */
+typedef struct gc_thread_data_t gc_thread_data;
+struct gc_thread_data_t {
+  /** Call History: circular buffer of previous calls */
+  char **stack_traces;
+  /** Call History: Current place in the buffer */
+  int stack_trace_idx;
+  /** Call History: Previous frame written to call history; allows us to avoid duplicate entries */
+  char *stack_prev_frame;
+  /** Current state of this thread */
+  zyn_thread_state_type thread_state;
+  /** Minor GC: Data needed to initiate stack-based minor GC */
+  char *stack_start;
+  /** Minor GC: Data needed to initiate stack-based minor GC, defines the end of the memory range */
+  char *stack_limit;
+  /** Minor GC: write barrier */
+  void **mutations;
+  /** Minor GC: Size of the minor GC write barrier */
+  int mutation_buflen;
+  /** Minor GC: Number of entries in the minor GC write barrier */
+  int mutation_count;
+  /** Minor GC: Is minor collection of globals necessary? */
+  unsigned char globals_changed;
+  /** Minor GC: List of objects moved to heap during minor GC */
+  void **moveBuf;
+  /** Minor GC: Length of `moveBuf` */
+  int moveBufLen;
+  /** Heap GC: mark color used for new allocations */
+  unsigned char gc_alloc_color;
+  /** Heap GC: mark color the major GC is currently using tracing. This can be different than the alloc color due to lazy sweeping */
+  unsigned char gc_trace_color;
+  /** Heap GC: Is the major GC done tracing? */
+  uint8_t gc_done_tracing;
+  /** Heap GC: current state of the collector */
+  int gc_status;
+  /** Heap GC: index of last write to the mark buffer */
+  int last_write;
+  /** Heap GC: index of last read from the mark buffer */
+  int last_read;
+  /** Heap GC:
+   *  Need this because minor GC may still be moving objects to the heap and
+   *  if we try to trace before minor GC is done, some of the objects may be
+   *  missed. So we "pend" them until minor GC is done and we know everything
+   *  is on the heap.
+   */
+  int pending_writes;
+  /** Heap GC: buffer of grey objects */
+  mark_buffer *mark_buffer;
+  /** Heap GC: length of the mark buffer */
+  int mark_buffer_len;
+  /** Heap GC: lock used to coordinate access between the collector and this thread */
+  pthread_mutex_t lock;
+  /** Id of the current thread */
+  pthread_t thread_id;
+  /** Heap GC: Root of this thread's heap */
+  gc_heap_root *heap;
+  /** Heap GC: Cached amount of free heap space, so we do not need to recalculate on the fly */
+  uintptr_t *cached_heap_free_sizes;
+  /** Heap GC: Cached total amount of heap space */
+  uintptr_t *cached_heap_total_sizes;
+  /** Heap GC: Number of "huge" allocations by this thread */
+  int heap_num_huge_allocations;
+  /** Heap GC: Keep track of number of minor GC's for use by the major GC */
+  int num_minor_gcs;
+  /** Exception handler stack */
+  object exception_handler_stack;
+  /** Parameter object data */
+  object param_objs;
+  /** Need the following to perform longjmp's */
+  jmp_buf *jmp_start;
+  /** After longjmp, pick up execution here */
+  object gc_cont;
+  /** After longjmp, pass continuation these arguments */
+  object *gc_args;
+  /** Length of `gc_args` */
+  short gc_num_args;
+  /**  Thread object, if applicable */
+  object scm_thread_obj;
+};
+
+
+/**
+ * \defgroup gc_minor Minor GC
+ * @brief Minor GC is called periodically to copy live objects off of a thread stack
+ *
+ */
+/**@{*/
+
+/**
+ * Maximum number of args that GC will accept
+ */
+#define NUM_GC_ARGS 128
+
+/**
+ * Which way does the CPU grow its stack?
+ */
+#define STACK_GROWTH_IS_DOWNWARD 1
+
+/**
+ * Size of the stack buffer, in bytes.
+ * This is used as the first generation of the GC.
+ */
+#define STACK_SIZE 500000
+
+/** Determine if stack has overflowed */
+#if STACK_GROWTH_IS_DOWNWARD
+#define stack_overflow(x,y) ((x) < (y))
+#else
+#define stack_overflow(x,y) ((x) > (y))
+#endif
+
+
+/**
+ * Determine if an object is an integer.
+ */
+#define obj_is_int(x)  ((unsigned long)(x) & (unsigned long)1)
+
+/**
+ * Convert from an object to an integer.
+ */
+//#define obj_obj2int(n)   (((long)((ulong)(n) & ~1))/(long)(1uL<<1))
+#define obj_obj2int(x) ((long)((uintptr_t)x)>>1)
+
+
+/**
+ * \defgroup objects Objects
+ * @brief Definitions and code for memory-allocated objects.
+ *
+ * Most Scheme data types are defined as object types.
+ *
+ * Each object type contains a header for garbage collection and a
+ * tag that identifies the type of object, as well as any object-specific
+ * fields.
+ *
+ * Most object types are allocated on the nursery (the C stack) and
+ * relocated to the garbage-collected heap during minor GC. It is only
+ * safe for an object on the nursery to be used by the thread that
+ * created it, as that object could be relocated at any time.
+ */
+/**@{*/
+
+/** Function type */
+typedef void (*function_type)(void *data, object clo, int argc, object * args);
+
+/** Non-CPS function type */
+typedef object(*inline_function_type) ();
+
+/**
+ * @brief The boolean type: True or False
+ *
+ * Booleans always refer to one of the objects `boolean_t` or `boolean_f`
+ * which are created by the runtime.
+ */
+typedef struct {
+  gc_header_type hdr;
+  const tag_type tag;
+  const char *desc;
+} boolean_type;
+typedef boolean_type *boolean;
+
+
+/* Closure types */
+
+/** @brief Closure for a macro */
+typedef struct {
+  gc_header_type hdr;
+  tag_type tag;
+  function_type fn;
+  int num_args;
+} macro_type;
+
+/** @brief A closed-over function with no variables */
+typedef struct {
+  gc_header_type hdr;
+  tag_type tag;
+  function_type fn;
+  int num_args;
+} closure0_type;
+/** @brief A closed-over function with one variable */
+typedef struct {
+  gc_header_type hdr;
+  tag_type tag;
+  function_type fn;
+  int num_args;
+  object element;
+} closure1_type;
+/** @brief A closed-over function with zero or more closed-over variables */
+typedef struct {
+  gc_header_type hdr;
+  tag_type tag;
+  function_type fn;
+  int num_args;
+  int num_elements;
+  object *elements;
+} closureN_type;
+
+typedef closure0_type *closure0;
+typedef closure1_type *closure1;
+typedef closureN_type *closureN;
+typedef closure0_type *closure;
+typedef closure0_type *macro;
+
+#define mmacro(c,f) \
+  macro_type c; \
+  c.hdr.mark = gc_color_red; \
+  c.hdr.grayed = 0; \
+  c.tag = macro_tag; \
+  c.fn = f; \
+  c.num_args = -1;
+
+/**
+ * Create a closure0 object
+ * These objects are special and can be statically allocated as an optimization
+ */
+#define mclosure0(c, f) \
+ static closure0_type c = { .hdr.mark = gc_color_red, .hdr.grayed = 0, .tag = closure0_tag, .fn = f, .num_args = -1 };  /* TODO: need a new macro that initializes num_args */
+
+#define maclosure0(c,f,na) \
+  closure0_type c; \
+  c.hdr.mark = gc_color_red; \
+  c.hdr.grayed = 0; \
+  c.tag = closure0_tag; \
+  c.fn = f; \
+  c.num_args = na;
+
+/**
+ * The boolean True value.
+ * \ingroup objects
+ */
+extern const object boolean_t;
+
+/**
+ * \ingroup gc_minor
+ */
+void GC(void *, closure, object *, int);
+
+/**
+ * \ingroup gc_major
+ */
+void gc_init_heap(long heap_size);
+
+
+void gc_initialize(void);
+void gc_add_mutator(gc_thread_data * thd);
+gc_heap *gc_heap_create(int heap_type, size_t size, gc_thread_data * thd);
+
+void gc_thr_grow_move_buffer(gc_thread_data * d);
+void gc_thread_data_init(gc_thread_data * thd, int mut_num, char *stack_base,
+                         long stack_size);
+
+void gc_start_collector();
+
+extern long global_stack_size;
+extern long global_heap_size;
+
+/**
+ * \defgroup prim_thd Threads
+ * @brief Thread-oriented functions
+ *
+ * Most of these are internal and should not be called from
+ * an FFI function.
+ */
+/**@{*/
+object zyn_spawn_thread(object thunk);
+void zyn_start_trampoline(gc_thread_data * thd);
+void zyn_end_thread(gc_thread_data * thd);
+void zyn_exit_thread(void *data, object _, int argc, object * args);
+object zyn_thread_sleep(void *data, object timeout);
+/**@}*/
+
+#endif /* ZAYIN_H */
+#include <mimalloc.h>
+#include <stdio.h>
+
+#include "bit_array.h"
+
+size_t index_in_bitarray(size_t idx) { return idx / 8; }
+
+size_t bit_index_in_bitarray(size_t idx) { return idx % 8; }
+
+uint8_t *bit_array_new(size_t num_bits) {
+  size_t num_bytes = (num_bits + 8) / 8;
+
+  return mi_calloc(num_bytes, sizeof(uint8_t));
+}
+
+bool get_bit_in_bitarray(uint8_t *bitarray, size_t idx) {
+  size_t arr_idx = index_in_bitarray(idx);
+  size_t bit_idx = bit_index_in_bitarray(idx);
+
+  return bitarray[arr_idx] & (1 << bit_idx);
+}
+
+bool set_bit_in_bitarray(uint8_t *bitarray, size_t idx, bool val) {
+  size_t arr_idx = index_in_bitarray(idx);
+  size_t bit_idx = bit_index_in_bitarray(idx);
+
+  bool old_val = get_bit_in_bitarray(bitarray, idx);
+
+  bitarray[arr_idx] = (bitarray[arr_idx] & ~(1 << bit_idx)) | (val << bit_idx);
+
+  return old_val;
+}
+#ifndef __BIT_ARRAY_H_
+#define __BIT_ARRAY_H_
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+size_t index_in_bitarray(size_t idx);
+
+size_t bit_index_in_bitarray(size_t idx);
+
+uint8_t *bit_array_new(size_t num_bits);
+
+/**
+ * Get a bit from a bit array.
+ */
+bool get_bit_in_bitarray(uint8_t *bitarray, size_t idx);
+
+/**
+ * Set a bit in a bit array, returns the previous value.
+ */
+bool set_bit_in_bitarray(uint8_t *bitarray, size_t idx, bool val);
+
+#endif // __BIT_ARRAY_H_
+#include <mimalloc.h>
+#include "builtin.h"
+#include "base.h"
+#include "common.h"
+#include "gc.h"
+#include <stdbool.h>
+
+#define MAKE_INT_BINOP(NAME, OP)                                               \
+  struct int_obj object_int_obj_##NAME(struct obj *lhs, struct obj *rhs) {     \
+    if (lhs->tag != OBJ_INT)                                                   \
+      RUNTIME_ERROR("Left operand to binary " #NAME " not of integer type");   \
+    if (rhs->tag != OBJ_INT)                                                   \
+      RUNTIME_ERROR("Right operand to binary " #NAME " not of integer type");  \
+                                                                               \
+    struct int_obj *lhs_int = (struct int_obj *)lhs;                           \
+    struct int_obj *rhs_int = (struct int_obj *)rhs;                           \
+                                                                               \
+    return object_int_obj_new(lhs_int->val OP rhs_int->val);                   \
+  } MAKE_TWO_ARG_FROM_BUILTIN(NAME, object_int_obj_##NAME, struct int_obj)
+
+MAKE_INT_BINOP(add, +);
+MAKE_INT_BINOP(sub, -);
+MAKE_INT_BINOP(mul, *);
+MAKE_INT_BINOP(div, /);
+MAKE_INT_BINOP(xor, ^);
+MAKE_INT_BINOP(lt, <);
+MAKE_INT_BINOP(leq, <=);
+MAKE_INT_BINOP(gt, >);
+MAKE_INT_BINOP(geq, >=);
+
+struct int_obj object_int_obj_mod(struct obj *lhs, struct obj *rhs) {
+  if (lhs->tag != OBJ_INT)
+    RUNTIME_ERROR("Left operand to binary mod not of integer type");
+  if (rhs->tag != OBJ_INT)
+    RUNTIME_ERROR("Right operand to binary mod not of integer type");
+
+  struct int_obj *lhs_int = (struct int_obj *)lhs;
+  struct int_obj *rhs_int = (struct int_obj *)rhs;
+
+  if (rhs_int->val == 0)
+    RUNTIME_ERROR("Divide by zero (%ld %% %ld)", lhs_int->val, rhs_int->val);
+
+  return object_int_obj_new(lhs_int->val % rhs_int->val);
+}
+
+MAKE_TWO_ARG_FROM_BUILTIN(mod, object_int_obj_mod, struct int_obj);
+
+MAKE_TWO_ARG_FROM_BUILTIN(cons, object_cons_obj_new, struct cons_obj);
+
+int exit_inner() { exit(0); }
+
+MAKE_ZERO_ARG_FROM_BUILTIN(exit, exit_inner, int);
+
+char *obj_to_string_internal(struct obj *val) {
+  char *res;
+
+  if (!val) {
+    ALLOC_SPRINTF(res, "()");
+  }
+
+  switch (val->tag) {
+  case OBJ_CONS:
+    ALLOC_SPRINTF(res, "cons");
+    break;
+  case OBJ_CLOSURE:
+    ALLOC_SPRINTF(res, "closure|%p", (void *)((struct closure_obj *)val)->fn_1);
+    break;
+  case OBJ_INT:
+    ALLOC_SPRINTF(res, "%ld", ((struct int_obj *)val)->val);
+    break;
+  case OBJ_BOOL:
+    ALLOC_SPRINTF(res, "%s", ((struct bool_obj *)val)->val ? "true" : "false");
+    break;
+  case OBJ_STR:
+    ALLOC_SPRINTF(res, "%s", ((struct string_obj *)val)->buf);
+    break;
+  case OBJ_CELL:
+    return obj_to_string_internal(((struct cell_obj *)val)->val);
+  case OBJ_HT:
+    ALLOC_SPRINTF(res, "hash table");
+    break;
+  default:
+    RUNTIME_ERROR("Unexpected object tag to to_string: %d", val->tag);
+  }
+
+  return res;
+}
+
+void to_string_k(struct obj *v, struct obj *k, struct env_obj *env) {
+  char *res = obj_to_string_internal(v);
+
+  OBJECT_STRING_OBJ_NEW(result_str, res);
+
+  mi_free(res);
+
+  call_closure_one(k, result_str);
+
+  __builtin_unreachable();
+}
+
+void display_k(struct obj *v, struct obj *k, struct env_obj *env) {
+  char *res = obj_to_string_internal(v);
+
+  printf("%s\n", res);
+
+  mi_free(res);
+
+  call_closure_one(k, NULL);
+
+  __builtin_unreachable();
+}
+
+_Bool obj_is_truthy(struct obj *obj) {
+  if (!obj) return false;
+
+  switch (obj->tag) {
+  case OBJ_INT:
+    return ((struct int_obj *)obj)->val != 0;
+  case OBJ_STR:
+    return ((struct string_obj *)obj)->len != 0;
+  case OBJ_BOOL:
+    return ((struct bool_obj *)obj)->val;
+  default:
+    return true;
+  }
+}
+
+struct int_obj object_int_obj_not(struct obj *v) {
+  // If you want to only allow certain types, do an explicit check:
+  if (v->tag != OBJ_INT && v->tag != OBJ_STR && v->tag != OBJ_BOOL && v->tag) {
+    RUNTIME_ERROR("'not' expects an int, string, bool; received tag %d", v->tag);
+  }
+  _Bool result = !obj_is_truthy(v);
+  return object_int_obj_new(result);
+}
+
+MAKE_ONE_ARG_FROM_BUILTIN(not, object_int_obj_not, struct int_obj);
+
+void car_k(struct obj *cons, struct obj *k, struct env_obj *env) {
+  struct obj *car = ((struct cons_obj *)cons)->car;
+
+  call_closure_one(k, car);
+
+  __builtin_unreachable();
+}
+
+void cdr_k(struct obj *cons, struct obj *k, struct env_obj *env) {
+  struct obj *cdr = ((struct cons_obj *)cons)->cdr;
+
+  call_closure_one(k, cdr);
+
+  __builtin_unreachable();
+}
+
+void is_cons_k(struct obj *v, struct obj *k, struct env_obj *env) {
+  _Bool r = v->tag == OBJ_CONS;
+
+  OBJECT_INT_OBJ_NEW(res, r);
+
+  call_closure_one(k, res);
+}
+
+void is_null_k(struct obj *v, struct obj *k, struct env_obj *env) {
+  _Bool r = v == NULL;
+
+  OBJECT_INT_OBJ_NEW(res, r);
+
+  call_closure_one(k, res);
+}
+
+void string_concat_k(struct obj *v, struct obj *k, struct env_obj *env) {
+  OBJECT_ENV_OBJ_NEW(tmp_env, struct unary_env);
+  tmp_env->env[0] = v;
+  struct closure_obj func_2_clos =
+      object_closure_two_new(string_concat_k_2, tmp_env);
+
+  call_closure_one(k, (struct obj *)&func_2_clos);
+
+  __builtin_unreachable();
+}
+
+static char *convert_to_str(struct obj *v) {
+  char *res;
+
+  switch (v->tag) {
+  case OBJ_INT:
+    ALLOC_SPRINTF(res, "%c", (int)((struct int_obj *)v)->val);
+    break;
+  case OBJ_BOOL:
+    ALLOC_SPRINTF(res, "%s", (bool)((struct bool_obj *)v)->val ? "true" : "false");
+    break;
+  case OBJ_STR:
+    ALLOC_SPRINTF(res, "%s", ((struct string_obj *)v)->buf);
+    break;
+  case OBJ_CELL:
+    res = convert_to_str(((struct cell_obj *)v)->val);
+    break;
+  default:
+    RUNTIME_ERROR("Unexpected object tag to convert_to_str: %d", v->tag);
+  }
+
+  return res;
+}
+
+void string_concat_k_2(struct obj *v, struct obj *k, struct env_obj *env) {
+  char *lhs = convert_to_str(env->env[0]);
+  char *rhs = convert_to_str(v);
+
+  char *res;
+  ALLOC_SPRINTF(res, "%s%s", lhs, rhs);
+
+  mi_free(lhs);
+  mi_free(rhs);
+
+  OBJECT_STRING_OBJ_NEW(result_str, res);
+
+  mi_free(res);
+
+  call_closure_one(k, result_str);
+
+  __builtin_unreachable();
+}
+
+struct ht_obj ht_new_inner(struct obj *always_void) {
+  return object_ht_obj_new();
+}
+
+MAKE_ONE_ARG_FROM_BUILTIN(ht_new, ht_new_inner, struct ht_obj);
+
+struct obj *ht_set_inner(struct obj *ht_obj, struct obj *k, struct obj *v) {
+  struct ht_obj *ht = (struct ht_obj *)ht_obj;
+
+  hash_table_obj_insert(ht->ht, k, v);
+
+  return NULL;
+}
+
+MAKE_THREE_ARG_FROM_BUILTIN_EXPLICIT_RETURN(ht_set, ht_set_inner);
+
+struct int_obj ht_del_inner(struct obj *ht_obj, struct obj *k) {
+  struct ht_obj *ht = (struct ht_obj *)ht_obj;
+
+  bool ret = hash_table_obj_delete(ht->ht, k);
+
+  return object_int_obj_new(ret);
+}
+
+MAKE_TWO_ARG_FROM_BUILTIN(ht_del, ht_del_inner, struct int_obj);
+
+struct obj *ht_get_inner(struct obj *ht_obj, struct obj *k) {
+  struct ht_obj *ht = (struct ht_obj *)ht_obj;
+
+  struct obj **ret = hash_table_obj_lookup(ht->ht, k);
+
+  if (!ret)
+    return NULL;
+
+  return *ret;
+}
+
+MAKE_TWO_ARG_FROM_BUILTIN_EXPLICIT_RETURN(ht_get, ht_get_inner);
+
+struct obj *ht_keys_inner(struct obj *ht_obj) {
+  struct ht_obj *ht = (struct ht_obj *)ht_obj;
+  struct cons_obj *c = NULL;
+
+  HASH_TABLE_ITER(obj, key, val, ht->ht, {
+    struct cons_obj *c2 = gc_malloc(sizeof(struct cons_obj));
+    *c2 = object_cons_obj_new(*key, (struct obj *)c);
+    c = c2;
+  });
+
+  return (struct obj *)c;
+}
+
+MAKE_ONE_ARG_FROM_BUILTIN_EXPLICIT_RETURN(ht_keys, ht_keys_inner);
+
+struct int_obj eq_inner(struct obj *a, struct obj *b) {
+  return object_int_obj_new(eq_obj_impl(a, b));
+}
+
+MAKE_TWO_ARG_FROM_BUILTIN(eq, eq_inner, struct int_obj);
+
+struct obj *string_chars_innner(struct obj *string_obj) {
+  struct string_obj *str = (struct string_obj *)string_obj;
+  struct cons_obj *c = NULL;
+
+  for (size_t i = 0; i < str->len; i++) {
+    struct cons_obj *c2 = gc_malloc(sizeof(struct cons_obj));
+    struct int_obj *chr = gc_malloc(sizeof(struct int_obj));
+    *chr = object_int_obj_new(str->buf[str->len - (i + 1)]);
+    *c2 = object_cons_obj_new((struct obj *)chr, (struct obj *)c);
+    c = c2;
+  }
+
+  return (struct obj *)c;
+}
+
+MAKE_ONE_ARG_FROM_BUILTIN_EXPLICIT_RETURN(string_chars, string_chars_innner);
+
+// NEW Implementation
+
+static boolean_type t_boolean = { {0}, boolean_tag, "t" };
+static boolean_type f_boolean = { {0}, boolean_tag, "f" };
+
+const object boolean_t = &t_boolean;
+const object boolean_f = &f_boolean;
+
+void zyn_exit(void *data, object clo, int argc, object * args)
+{
+  object obj = boolean_f;
+  if (argc > 0) {
+    obj = args[0];
+  }
+#if DEBUG_SHOW_DIAG
+  gc_print_stats(Cyc_heap);
+#endif
+  if (obj_is_int(obj)) {
+    exit(obj_obj2int(obj));
+  }
+
+  if (obj == boolean_f) {
+    exit(1);
+  }
+
+  exit(0);
+}
+#ifndef SOMESCHEME_BUILTIN_H
+#define SOMESCHEME_BUILTIN_H
+
+#include "base.h"
+
+#define DEFINE_ZERO_ARG_FROM_BUILTIN(NAME)                                     \
+  void NAME##_k(struct obj *, struct env_obj *) __attribute__((noreturn))
+
+#define MAKE_ZERO_ARG_FROM_BUILTIN(NAME, INNER, TYPE)                          \
+  void NAME##_k(struct obj *k, struct env_obj *env) {                          \
+    TYPE result = (INNER)();                                                   \
+                                                                               \
+    call_closure_one(k, (struct obj *)&result);                                \
+                                                                               \
+    __builtin_unreachable();                                                   \
+  }
+
+#define DEFINE_ONE_ARG_FROM_BUILTIN(NAME)                                      \
+  void NAME##_k(struct obj *, struct obj *, struct env_obj *)
+
+#define MAKE_ONE_ARG_FROM_BUILTIN(NAME, INNER, TYPE)                           \
+  void NAME##_k(struct obj *v, struct obj *k, struct env_obj *env) {           \
+    TYPE result = (INNER)(v);                                                  \
+                                                                               \
+    call_closure_one(k, (struct obj *)&result);                                \
+                                                                               \
+    __builtin_unreachable();                                                   \
+  }
+#define MAKE_ONE_ARG_FROM_BUILTIN_EXPLICIT_RETURN(NAME, INNER)                 \
+  void NAME##_k(struct obj *v, struct obj *k, struct env_obj *env) {           \
+    struct obj *result = (INNER)(v);                                           \
+                                                                               \
+    call_closure_one(k, result);                                               \
+                                                                               \
+    __builtin_unreachable();                                                   \
+  }
+
+#define DEFINE_TWO_ARG_FROM_BUILTIN(NAME)                                      \
+  void NAME##_k(struct obj *, struct obj *, struct env_obj *)                  \
+      __attribute__((noreturn));                                               \
+  void NAME##_k_2(struct obj *, struct obj *, struct env_obj *)                \
+      __attribute__((noreturn))
+
+struct unary_env {
+  struct obj *val;
+};
+
+#define MAKE_TWO_ARG_FROM_BUILTIN(NAME, INNER, TYPE)                           \
+  void NAME##_k(struct obj *v, struct obj *k, struct env_obj *env) {           \
+    OBJECT_ENV_OBJ_NEW(tmp_env, struct unary_env);                             \
+    tmp_env->env[0] = v;                                                       \
+    struct closure_obj func_2_clos =                                           \
+        object_closure_two_new(NAME##_k_2, tmp_env);                           \
+                                                                               \
+    call_closure_one(k, (struct obj *)&func_2_clos);                           \
+                                                                               \
+    __builtin_unreachable();                                                   \
+  }                                                                            \
+  void NAME##_k_2(struct obj *v, struct obj *k, struct env_obj *env) {         \
+                                                                               \
+    TYPE result = (INNER)(env->env[0], v);                                     \
+                                                                               \
+    call_closure_one(k, (struct obj *)&result);                                \
+                                                                               \
+    __builtin_unreachable();                                                   \
+  }
+
+#define MAKE_TWO_ARG_FROM_BUILTIN_EXPLICIT_RETURN(NAME, INNER)                 \
+  void NAME##_k(struct obj *v, struct obj *k, struct env_obj *env) {           \
+    OBJECT_ENV_OBJ_NEW(tmp_env, struct unary_env);                             \
+    tmp_env->env[0] = v;                                                       \
+    struct closure_obj func_2_clos =                                           \
+        object_closure_two_new(NAME##_k_2, tmp_env);                           \
+                                                                               \
+    call_closure_one(k, (struct obj *)&func_2_clos);                           \
+                                                                               \
+    __builtin_unreachable();                                                   \
+  }                                                                            \
+  void NAME##_k_2(struct obj *v, struct obj *k, struct env_obj *env) {         \
+                                                                               \
+    struct obj *result = (INNER)(env->env[0], v);                              \
+                                                                               \
+    call_closure_one(k, result);                                               \
+                                                                               \
+    __builtin_unreachable();                                                   \
+  }
+
+#define DEFINE_THREE_ARG_FROM_BUILTIN(NAME)                                    \
+  void NAME##_k(struct obj *, struct obj *, struct env_obj *)                  \
+      __attribute__((noreturn));                                               \
+  void NAME##_k_2(struct obj *, struct obj *, struct env_obj *)                \
+      __attribute__((noreturn));                                               \
+  void NAME##_k_3(struct obj *, struct obj *, struct env_obj *)                \
+      __attribute__((noreturn))
+
+struct binary_env {
+  struct obj *a;
+  struct obj *b;
+};
+
+#define MAKE_THREE_ARG_FROM_BUILTIN_EXPLICIT_RETURN(NAME, INNER)               \
+  void NAME##_k(struct obj *v, struct obj *k, struct env_obj *env) {           \
+    OBJECT_ENV_OBJ_NEW(tmp_env, struct binary_env);                            \
+    tmp_env->env[0] = v;                                                       \
+    struct closure_obj func_2_clos =                                           \
+        object_closure_two_new(NAME##_k_2, tmp_env);                           \
+                                                                               \
+    call_closure_one(k, (struct obj *)&func_2_clos);                           \
+                                                                               \
+    __builtin_unreachable();                                                   \
+  }                                                                            \
+  void NAME##_k_2(struct obj *v, struct obj *k, struct env_obj *env) {         \
+    env->env[1] = v;                                                           \
+    struct closure_obj func_3_clos = object_closure_two_new(NAME##_k_3, env);  \
+                                                                               \
+    call_closure_one(k, (struct obj *)&func_3_clos);                           \
+                                                                               \
+    __builtin_unreachable();                                                   \
+  }                                                                            \
+  void NAME##_k_3(struct obj *v, struct obj *k, struct env_obj *env) {         \
+    struct obj *result = (INNER)(env->env[0], env->env[1], v);                 \
+                                                                               \
+    call_closure_one(k, result);                                               \
+                                                                               \
+    __builtin_unreachable();                                                   \
+  }
+
+// builtin operations
+DEFINE_TWO_ARG_FROM_BUILTIN(add);
+DEFINE_TWO_ARG_FROM_BUILTIN(sub);
+DEFINE_TWO_ARG_FROM_BUILTIN(mul);
+DEFINE_TWO_ARG_FROM_BUILTIN(div);
+DEFINE_TWO_ARG_FROM_BUILTIN(mod);
+DEFINE_TWO_ARG_FROM_BUILTIN(xor);
+DEFINE_ONE_ARG_FROM_BUILTIN(not);
+DEFINE_TWO_ARG_FROM_BUILTIN(lt);
+DEFINE_TWO_ARG_FROM_BUILTIN(leq);
+DEFINE_TWO_ARG_FROM_BUILTIN(gt);
+DEFINE_TWO_ARG_FROM_BUILTIN(geq);
+
+DEFINE_TWO_ARG_FROM_BUILTIN(cons);
+
+DEFINE_TWO_ARG_FROM_BUILTIN(string_concat);
+DEFINE_ONE_ARG_FROM_BUILTIN(string_chars);
+
+DEFINE_ZERO_ARG_FROM_BUILTIN(exit);
+
+DEFINE_ONE_ARG_FROM_BUILTIN(to_string);
+DEFINE_ONE_ARG_FROM_BUILTIN(display);
+
+DEFINE_ONE_ARG_FROM_BUILTIN(is_cons);
+DEFINE_ONE_ARG_FROM_BUILTIN(is_null);
+DEFINE_ONE_ARG_FROM_BUILTIN(car);
+DEFINE_ONE_ARG_FROM_BUILTIN(cdr);
+
+DEFINE_ONE_ARG_FROM_BUILTIN(ht_new);
+DEFINE_THREE_ARG_FROM_BUILTIN(ht_set);
+DEFINE_TWO_ARG_FROM_BUILTIN(ht_del);
+DEFINE_TWO_ARG_FROM_BUILTIN(ht_get);
+DEFINE_TWO_ARG_FROM_BUILTIN(ht_get);
+DEFINE_ONE_ARG_FROM_BUILTIN(ht_keys);
+
+DEFINE_TWO_ARG_FROM_BUILTIN(eq);
+
+_Bool obj_is_truthy(struct obj *);
+
+// NEW Implementation
+
+void zyn_exit(void *data, object clo, int argc, object * args);
+
+#endif // SOMESCHEME_BUILTIN_H
+#ifndef SOMESCHEME_COMMON_H
+#define SOMESCHEME_COMMON_H
+
+#define RUNTIME_ERROR(F, ...)                                                  \
+  do {                                                                         \
+    fprintf(stderr, "Runtime Error (%s:%d): ", __func__, __LINE__);            \
+    fprintf(stderr, F "\n", ##__VA_ARGS__);                                    \
+    exit(1);                                                                   \
+  } while (0)
+
+#ifdef DEBUG
+#define DEBUG_LOG(F, ...)                                                      \
+  do {                                                                         \
+    fprintf(stderr, "DEBUG (%s:%d): ", __func__, __LINE__);                    \
+    fprintf(stderr, (F "\n"), ##__VA_ARGS__);                                  \
+  } while (0)
+#else
+#define DEBUG_LOG(...)                                                         \
+  do {                                                                         \
+  } while (0)
+#endif // DEBUG
+
+#endif // SOMESCHEME_COMMON_H
+
+#define SAFE_SPRINTF(buf, size, format, ...) \
+    snprintf(buf, size, format, ##__VA_ARGS__)
+
+#define ALLOC_SPRINTF(S, ...)                                                 \
+  do {                                                                        \
+    size_t needed = snprintf(NULL, 0, __VA_ARGS__) + 1;                       \
+    char *buf = mi_malloc(needed);                                            \
+    SAFE_SPRINTF(buf, needed, __VA_ARGS__);                                   \
+    (S) = buf;                                                                \
+  } while (0)
+
+
+#define SWAP(A, B)                                                             \
+  do {                                                                         \
+    typeof(A) temp = (A);                                                      \
+    (A) = (B);                                                                 \
+    (B) = temp;                                                                \
+  } while (0)
+
+#ifdef DEBUG
+#define DEBUG_FPRINTF(...) fprintf(__VA_ARGS__)
+#else
+#define DEBUG_FPRINTF(...) (void)0
+#endif // DEBUG
+
+#ifdef DEBUG
+#define DEBUG_ONLY(expr) expr
+#else
+#define DEBUG_ONLY(expr) 0
+#endif // DEBUG
+#include <assert.h>
+#include <stdbool.h>
+#include <string.h>
+
+#include <mimalloc.h>
+#include <ck_array.h>
+
+#include "base.h"
+#include "common.h"
+#include "gc.h"
+#include "hash_table.h"
+#include "queue.h"
+#include "vec.h"
+
+MAKE_VECTOR(struct obj *, gc_heap_nodes);
+MAKE_VECTOR(size_t, size_t);
+MAKE_QUEUE(struct obj *, gc_grey_nodes);
+MAKE_QUEUE(struct ptr_toupdate_pair, ptr_toupdate_pair);
+
+bool size_t_eq(size_t a, size_t b) { return a == b; }
+
+MAKE_HASH(size_t, struct obj *, hash_table_default_size_t_hash_fun, size_t_eq,
+          ptr_map);
+
+static struct gc_data gc_global_data;
+
+// array of gc_funcs for each object type
+static struct gc_funcs gc_func_map[] = {
+    [OBJ_CLOSURE] = (struct gc_funcs){.toheap = toheap_closure,
+                                      .mark = mark_closure,
+                                      .free = gc_free_noop},
+    [ENV_OBJ] = (struct gc_funcs){.toheap = toheap_env,
+                                  .mark = mark_env,
+                                  .free = gc_free_noop},
+    [OBJ_CELL] = (struct gc_funcs){.toheap = toheap_cell,
+                                   .mark = mark_cell,
+                                   .free = gc_free_noop},
+    [OBJ_CONS] = (struct gc_funcs){.toheap = toheap_cons,
+                                   .mark = mark_cons,
+                                   .free = gc_free_noop},
+    [OBJ_INT] = (struct gc_funcs){.toheap = toheap_int_obj,
+                                  .mark = gc_mark_noop,
+                                  .free = gc_free_noop},
+
+    [OBJ_STR] =
+        (struct gc_funcs){
+            .toheap = toheap_string_obj,
+            .mark = gc_mark_noop,
+            .free = gc_free_noop,
+        },
+    [OBJ_HT] = (struct gc_funcs){.toheap = toheap_ht,
+                                 .mark = mark_ht,
+                                 .free = free_ht},
+    [OBJ_BOOL] = (struct gc_funcs){.toheap = toheap_bool_obj,
+                                  .mark = gc_mark_noop,
+                                  .free = gc_free_noop},
+};
+
+
+
+// This does nothing, the gc will call free() on the object if it was heap
+// allocated
+void gc_free_noop(struct obj *obj) { (void)obj; }
+
+// This does nothing, for objects where marking them should mark them as black
+// and nothing more
+void gc_mark_noop(struct obj *obj, struct gc_context *ctx) {
+  (void)obj;
+  (void)ctx;
+}
+
+// Mark an object as grey and add it to the queue of grey nodes 'if' it is not
+// already grey or black
+static bool maybe_mark_grey_and_queue(struct gc_context *ctx, struct obj *obj) {
+  if (DEBUG_ONLY(!obj)) {
+    DEBUG_FPRINTF(stderr, "trying to mark NULL!\n");
+  }
+  switch (obj->mark) {
+  case BLACK:
+  case GREY:
+    return false;
+  case WHITE:
+    obj->mark = GREY;
+    queue_gc_grey_nodes_enqueue(&ctx->grey_nodes, obj);
+    return true;
+  }
+}
+
+struct obj *toheap_ht(struct obj *ht_obj, struct gc_context *ctx) {
+  struct ht_obj *ht = (struct ht_obj *)ht_obj;
+
+  if (ht->base.on_stack) {
+    TOUCH_OBJECT(ht, "toheap_ht");
+    struct ht_obj *heap_ht = gc_malloc(sizeof(struct ht_obj));
+    *heap_ht = *ht;
+    ht = heap_ht;
+  }
+
+  HASH_TABLE_ITER(obj, key, val, ht->ht, {
+    if (*key) {
+      struct ptr_toupdate_pair pk = {.toupdate = (struct obj **)key,
+                                     .on_stack = (struct obj *)*key};
+      queue_ptr_toupdate_pair_enqueue(&ctx->pointers_toupdate, pk);
+    }
+    if (*val) {
+      struct ptr_toupdate_pair pv = {.toupdate = (struct obj **)val,
+                                     .on_stack = (struct obj *)*val};
+      queue_ptr_toupdate_pair_enqueue(&ctx->pointers_toupdate, pv);
+    }
+  });
+
+  return (struct obj *)ht;
+}
+
+void mark_ht(struct obj *ht_obj, struct gc_context *ctx) {
+  struct ht_obj *ht = (struct ht_obj *)ht_obj;
+
+  HASH_TABLE_ITER(obj, key, val, ht->ht, {
+    if (*key)
+      maybe_mark_grey_and_queue(ctx, *key);
+    if (*val)
+      maybe_mark_grey_and_queue(ctx, *val);
+  });
+}
+
+void free_ht(struct obj *ht_obj) {
+  struct ht_obj *ht = (struct ht_obj *)ht_obj;
+
+  hash_table_obj_free(ht->ht);
+}
+
+struct obj *toheap_cons(struct obj *cons_obj, struct gc_context *ctx) {
+  struct cons_obj *cons = (struct cons_obj *)cons_obj;
+
+  if (cons->base.on_stack) {
+    TOUCH_OBJECT(cons, "toheap_cons");
+    struct cons_obj *heap_cons = gc_malloc(sizeof(struct cons_obj));
+    *heap_cons = *cons;
+    cons = heap_cons;
+  }
+
+  if (cons->car) {
+    struct ptr_toupdate_pair p = {.toupdate = (struct obj **)&cons->car,
+                                  .on_stack = (struct obj *)cons->car};
+    queue_ptr_toupdate_pair_enqueue(&ctx->pointers_toupdate, p);
+  }
+
+  if (cons->cdr) {
+    struct ptr_toupdate_pair p = {.toupdate = (struct obj **)&cons->cdr,
+                                  .on_stack = (struct obj *)cons->cdr};
+    queue_ptr_toupdate_pair_enqueue(&ctx->pointers_toupdate, p);
+  }
+
+  return (struct obj *)cons;
+}
+
+void mark_cons(struct obj *cons_obj, struct gc_context *ctx) {
+  struct cons_obj *cons = (struct cons_obj *)cons_obj;
+
+  if (cons->car) {
+    maybe_mark_grey_and_queue(ctx, cons->car);
+  }
+
+  if (cons->cdr) {
+    maybe_mark_grey_and_queue(ctx, cons->cdr);
+  }
+}
+
+struct obj *toheap_cell(struct obj *cell_obj, struct gc_context *ctx) {
+  struct cell_obj *cell = (struct cell_obj *)cell_obj;
+
+  if (cell->base.on_stack) {
+    TOUCH_OBJECT(cell, "toheap_cell");
+    struct cell_obj *heap_cell = gc_malloc(sizeof(struct cell_obj));
+    *heap_cell = *cell;
+    cell = heap_cell;
+  }
+
+  if (cell->val) {
+    struct ptr_toupdate_pair p = {.toupdate = (struct obj **)&cell->val,
+                                  .on_stack = (struct obj *)cell->val};
+    queue_ptr_toupdate_pair_enqueue(&ctx->pointers_toupdate, p);
+  }
+
+  return (struct obj *)cell;
+}
+
+void mark_cell(struct obj *cell_obj, struct gc_context *ctx) {
+  struct cell_obj *cell = (struct cell_obj *)cell_obj;
+
+  if (cell->val) {
+    maybe_mark_grey_and_queue(ctx, cell->val);
+  }
+}
+
+struct obj *toheap_env(struct obj *env_obj, struct gc_context *ctx) {
+  struct env_obj *env = (struct env_obj *)env_obj;
+  struct env_obj *orig_env = env;
+
+  if (env->base.on_stack) {
+    TOUCH_OBJECT(env, "toheap_env");
+    struct env_obj *heap_env =
+        gc_malloc(sizeof(struct env_obj) + env->len * sizeof(struct obj *));
+
+    heap_env->base = env->base;
+    heap_env->len = env->len;
+    memset(&heap_env->env, 0, env->len * sizeof(struct obj *));
+    env = heap_env;
+  }
+
+  for (size_t i = 0; i < env->len; i++) {
+    struct obj *obj_ptr = orig_env->env[i];
+
+    if (!obj_ptr)
+      continue;
+
+    struct ptr_toupdate_pair p = {.toupdate = &env->env[i],
+                                  .on_stack = obj_ptr};
+    queue_ptr_toupdate_pair_enqueue(&ctx->pointers_toupdate, p);
+  }
+
+  return (struct obj *)env;
+}
+
+void mark_env(struct obj *env_obj, struct gc_context *ctx) {
+  struct env_obj *env = (struct env_obj *)env_obj;
+  for (size_t i = 0; i < env->len; i++) {
+    if (!env->env[i])
+      continue;
+    maybe_mark_grey_and_queue(ctx, env->env[i]);
+  }
+}
+
+struct obj *toheap_closure(struct obj *obj, struct gc_context *ctx) {
+  struct closure_obj *clos = (struct closure_obj *)obj;
+
+  if (obj->on_stack) {
+    TOUCH_OBJECT(obj, "toheap_closure");
+    struct closure_obj *heap_clos = gc_malloc(sizeof(struct closure_obj));
+    memcpy(heap_clos, obj, sizeof(struct closure_obj));
+    clos = heap_clos;
+  }
+
+  if (clos->env) {
+    struct ptr_toupdate_pair p = {.toupdate = (struct obj **)&clos->env,
+                                  .on_stack = (struct obj *)clos->env};
+    queue_ptr_toupdate_pair_enqueue(&ctx->pointers_toupdate, p);
+  }
+
+  return (struct obj *)clos;
+}
+
+void mark_closure(struct obj *obj, struct gc_context *ctx) {
+  struct closure_obj *clos = (struct closure_obj *)obj;
+
+  if (clos->env) {
+    maybe_mark_grey_and_queue(ctx, (struct obj *)clos->env);
+  }
+}
+
+struct obj *toheap_int_obj(struct obj *obj, struct gc_context *ctx) {
+  struct int_obj *intobj = (struct int_obj *)obj;
+
+  if (obj->on_stack) {
+    TOUCH_OBJECT(obj, "toheap_int");
+    struct int_obj *heap_intobj = gc_malloc(sizeof(struct int_obj));
+    memcpy(heap_intobj, intobj, sizeof(struct int_obj));
+    intobj = heap_intobj;
+  }
+
+  return (struct obj *)intobj;
+}
+
+struct obj *toheap_bool_obj(struct obj *obj, struct gc_context *ctx) {
+  struct bool_obj *boolobj = (struct bool_obj *)obj;
+
+  if (obj->on_stack) {
+    TOUCH_OBJECT(obj, "toheap_bool");
+    struct bool_obj *heap_boolobj = gc_malloc(sizeof(struct bool_obj));
+    memcpy(heap_boolobj, boolobj, sizeof(struct bool_obj));
+    boolobj = heap_boolobj;
+  }
+
+  return (struct obj *)boolobj;
+}
+
+struct obj *toheap_string_obj(struct obj *obj, struct gc_context *ctx) {
+  struct string_obj *strobj = (struct string_obj *)obj;
+
+  if (obj->on_stack) {
+    TOUCH_OBJECT(obj, "toheap_string");
+    size_t total_size = sizeof(struct string_obj) + strobj->len;
+
+    struct string_obj *heap_stringobj = gc_malloc(total_size);
+
+    memcpy(heap_stringobj, strobj, total_size);
+
+    strobj = heap_stringobj;
+  }
+
+  return (struct obj *)strobj;
+}
+
+struct gc_context gc_make_context(void) {
+  return (struct gc_context){
+      .grey_nodes = queue_gc_grey_nodes_new(10),
+      .pointers_toupdate = queue_ptr_toupdate_pair_new(10),
+      .updated_pointers = hash_table_ptr_map_new(),
+  };
+}
+
+void gc_free_context(struct gc_context *ctx) {
+  queue_gc_grey_nodes_free(&ctx->grey_nodes);
+  queue_ptr_toupdate_pair_free(&ctx->pointers_toupdate);
+  hash_table_ptr_map_free(ctx->updated_pointers);
+}
+
+void gc_mark_obj(struct gc_context *ctx, struct obj *obj) {
+  obj->mark = BLACK;
+  gc_func_map[obj->tag].mark(obj, ctx);
+}
+
+// Moves all live objects on the stack over to the heap
+struct obj *gc_toheap(struct gc_context *ctx, struct obj *obj) {
+  if (!obj) {
+    return NULL;
+  }
+
+  // if we've already copied this object,
+  // we know that anything it points to must also be sorted
+  struct obj **maybe_copied =
+      hash_table_ptr_map_lookup(ctx->updated_pointers, (size_t)obj);
+  if (maybe_copied != NULL) {
+    return *maybe_copied;
+  }
+
+  if (DEBUG_ONLY(obj->tag > LAST_OBJ_TYPE)) {
+    RUNTIME_ERROR("object %p is corrupted\n", (void *)obj);
+  }
+  DEBUG_FPRINTF(stderr, "copying object of type: %u to heap\n", obj->tag);
+
+  struct obj *new_obj = gc_func_map[obj->tag].toheap(obj, ctx);
+
+  // mark the object as now being on the heap
+  new_obj->on_stack = false;
+
+  // Add it to the updated map
+  // Even if it was on the heap already we still insert
+  // since we then won't process child objects further
+  hash_table_ptr_map_insert(ctx->updated_pointers, (size_t)obj, new_obj);
+
+  return new_obj;
+}
+
+// The minor gc, moves all stack objects to the heap
+// The parameter 'thnk' is the current thunk holding everything together
+// The thunk should be heap allocated and freed after being called
+void gc_minor(struct gc_context *ctx, struct thunk *thnk) {
+  DEBUG_FPRINTF(stderr, "minor gc occuring\n");
+
+  // initially mark the closure and it's arguments to be applied
+  thnk->closr = (struct closure_obj *)gc_toheap(ctx, (struct obj *)thnk->closr);
+
+  switch (thnk->closr->size) {
+  case CLOSURE_ONE:
+    if (thnk->one.rand != NULL) {
+      thnk->one.rand = gc_toheap(ctx, thnk->one.rand);
+    }
+    break;
+  case CLOSURE_TWO:
+    if (thnk->two.rand != NULL) {
+      thnk->two.rand = gc_toheap(ctx, thnk->two.rand);
+    }
+    if (thnk->two.cont != NULL) {
+      thnk->two.cont = gc_toheap(ctx, thnk->two.cont);
+    }
+    break;
+  }
+
+  // work through each pointer that needs to be updated
+  while (queue_ptr_toupdate_pair_len(&ctx->pointers_toupdate) > 0) {
+    struct ptr_toupdate_pair to_update =
+        queue_ptr_toupdate_pair_dequeue(&ctx->pointers_toupdate);
+
+    struct obj **maybe_copied = hash_table_ptr_map_lookup(
+        ctx->updated_pointers, (size_t)to_update.on_stack);
+
+    if (maybe_copied != NULL) {
+      // we've already updated this pointer, just update the pointer that
+      // needs to be updated
+      *to_update.toupdate = *maybe_copied;
+    } else {
+      // we haven't seen this yet, perform a copy and update
+
+      assert(to_update.on_stack != NULL);
+
+      struct obj *on_heap = gc_toheap(ctx, to_update.on_stack);
+      hash_table_ptr_map_insert(ctx->updated_pointers,
+                                (size_t)to_update.on_stack, on_heap);
+      *to_update.toupdate = on_heap;
+    }
+  }
+
+  gc_major(ctx, thnk);
+}
+
+// The major gc, collects objects on the heap
+void gc_major(struct gc_context *ctx, struct thunk *thnk) {
+  size_t num_freed = 0;
+  size_t num_marked = 0;
+
+  gc_mark_obj(ctx, &thnk->closr->base);
+  num_marked++;
+
+  switch (thnk->closr->size) {
+  case CLOSURE_ONE:
+    if (thnk->one.rand)
+      gc_mark_obj(ctx, thnk->one.rand);
+    num_marked++;
+    break;
+  case CLOSURE_TWO:
+    if (thnk->two.rand)
+      gc_mark_obj(ctx, thnk->two.rand);
+    if (thnk->two.cont)
+      gc_mark_obj(ctx, thnk->two.cont);
+    num_marked++;
+    num_marked++;
+    break;
+  }
+
+  while (queue_gc_grey_nodes_len(&ctx->grey_nodes) > 0) {
+    struct obj *next_obj = queue_gc_grey_nodes_dequeue(&ctx->grey_nodes);
+    if (DEBUG_ONLY(!next_obj)) {
+      RUNTIME_ERROR("NULL was added to mark queue!");
+    }
+    gc_mark_obj(ctx, next_obj);
+    num_marked++;
+  }
+
+  DEBUG_FPRINTF("marked %zu objects\n", num_marked);
+
+#ifdef DEBUG
+  int seen_types[LAST_OBJ_TYPE] = {0};
+#endif
+
+  // go through each heap allocated object and gc them
+  // not really the best, but it would be easy to improve
+  for (size_t i = 0; i < gc_global_data.nodes.length; i++) {
+    struct obj **ptr = vector_gc_heap_nodes_index_ptr(&gc_global_data.nodes, i);
+    struct obj *obj = *ptr;
+
+    if (obj == NULL) {
+      continue;
+    }
+
+#ifdef DEBUG
+    seen_types[obj->tag - 1]++;
+#endif
+
+    if (obj->mark == WHITE) {
+      // free it, should this be done if the object is on the stack?
+      if (DEBUG_ONLY(obj->on_stack)) {
+        DEBUG_ONLY(RUNTIME_ERROR(
+            "Object (%p, tag: %d, %s) was on the stack during a major GC!",
+            (void *)obj, obj->tag, obj->last_touched_by));
+      }
+
+      // execute this object's free function
+      gc_func_map[obj->tag].free(obj);
+
+      mi_free(obj);
+      num_freed++;
+
+      // set the pointer in the vector to null
+      *ptr = NULL;
+    } else if (DEBUG_ONLY(obj->mark == GREY)) {
+      // this shouldn't happen, but just incase
+      RUNTIME_ERROR("Object was marked grey at time of major GC!");
+    } else {
+      // reset marker now
+      obj->mark = WHITE;
+    }
+  }
+
+  DEBUG_FPRINTF(stderr, "freed %zu objects\n", num_freed);
+  DEBUG_FPRINTF(stderr, "size of heap nodes: %zu\n",
+                gc_global_data.nodes.length);
+
+#ifdef DEBUG
+  for (int i = 0; i < LAST_OBJ_TYPE; i++) {
+    printf("tag %d seen %d times\n", i + 1, seen_types[i]);
+  }
+#endif
+
+  gc_heap_maintain();
+}
+
+void gc_init(void)
+{
+  gc_global_data.nodes = vector_gc_heap_nodes_new(100);
+}
+
+// wrapped malloc that adds allocated stuff to the bookkeeper
+void *gc_malloc(size_t size) {
+  void *ptr = mi_malloc(size);
+
+  vector_gc_heap_nodes_push(&gc_global_data.nodes, ptr);
+  return ptr;
+}
+
+void gc_heap_maintain(void) {
+  size_t last_i = 0;
+  size_t original_len = gc_global_data.nodes.length;
+  for (size_t i = 0; i < gc_global_data.nodes.length; i++) {
+    struct obj *obj = vector_gc_heap_nodes_index(&gc_global_data.nodes, i);
+    if (obj != NULL) {
+      vector_gc_heap_nodes_set(&gc_global_data.nodes, obj, last_i++);
+    }
+  }
+
+  gc_global_data.nodes.length = last_i;
+  if (last_i && (original_len / last_i) > 2)
+    vector_gc_heap_nodes_shrink_to_fit(&gc_global_data.nodes);
+}
+
+// NEW Implementation
+
+typedef struct vpbuffer_t vpbuffer;
+struct vpbuffer_t {
+  void **buf;
+  int len;
+  int count;
+};
+
+vpbuffer *vp_create(void);
+void vp_add(vpbuffer * v, void *obj);
+
+/* Utility functions */
+void **vpbuffer_realloc(void **buf, int *len);
+void **vpbuffer_add(void **buf, int *len, int i, void *obj);
+void vpbuffer_free(void **buf);
+
+// Generic buffer functions
+void **vpbuffer_realloc(void **buf, int *len)
+{
+  return realloc(buf, (*len) * sizeof(void *));
+}
+
+void **vpbuffer_add(void **buf, int *len, int i, void *obj)
+{
+  if (i == *len) {
+    *len *= 2;
+    buf = vpbuffer_realloc(buf, len);
+  }
+  buf[i] = obj;
+  return buf;
+}
+
+void vpbuffer_free(void **buf)
+{
+  free(buf);
+}
+
+vpbuffer *vp_create(void)
+{
+  vpbuffer *v = malloc(sizeof(vpbuffer));
+  v->len = 128;
+  v->count = 0;
+  v->buf = NULL;
+  v->buf = vpbuffer_realloc(v->buf, &(v->len));
+  return v;
+}
+
+void vp_add(vpbuffer * v, void *obj)
+{
+  v->buf = vpbuffer_add(v->buf, &(v->len), v->count++, obj);
+}
+
+////////////////////
+// Global defines
+
+// 64-bit is 3, 32-bit is 2
+#define GC_BLOCK_BITS 5
+
+/* HEAP definitions, based off heap from Chibi scheme */
+#define gc_heap_first_block(h) ((object)(h->data + gc_heap_align(gc_free_chunk_size)))
+#define gc_heap_end(h) ((object)((char*)h->data + h->size))
+#define gc_heap_pad_size(s) (sizeof(struct gc_heap_t) + (s) + gc_heap_align(1))
+#define gc_free_chunk_size (sizeof(gc_free_list))
+
+#define gc_align(n, bits) (((n)+(1<<(bits))-1)&(((uintptr_t)-1)-((1<<(bits))-1)))
+
+// Align to 8 byte block size (EG: 8, 16, etc)
+#define gc_word_align(n) gc_align((n), 3)
+
+// Align on GC_BLOCK_BITS, currently block size of 32 bytes
+#define gc_heap_align(n) gc_align(n, GC_BLOCK_BITS)
+
+////////////////////
+// Global variables
+
+// Note: will need to use atomics and/or locking to access any
+// variables shared between threads
+static unsigned char gc_color_mark = 5; // Black, is swapped during GC
+static unsigned char gc_color_clear = 3;        // White, is swapped during GC
+static unsigned char gc_color_purple = 1;       // There are many "shades" of purple, this is the most recent one
+// unfortunately this had to be split up; const colors are located in types.h
+
+static int gc_status_col = STATUS_SYNC1;
+static int gc_stage = STAGE_RESTING;
+static int gc_threads_merged = 0;
+
+static void **mark_stack = NULL;
+static int mark_stack_len = 0;
+static int mark_stack_i = 0;
+
+// Data for the "main" thread which is guaranteed to always be there.
+static gc_thread_data *primordial_thread = NULL;
+
+static ck_array_t new_mutators;
+static ck_array_t zyn_mutators;
+static ck_array_t old_mutators;
+static pthread_mutex_t mutators_lock;
+
+static void zyn_free(void *p, size_t m, bool d)
+{
+  mi_free(p);
+  return;
+}
+
+static void *zyn_malloc(size_t b)
+{
+  return mi_malloc(b);
+}
+
+static void *zyn_realloc(void *r, size_t a, size_t b, bool d)
+{
+  return mi_realloc(r, b);
+}
+
+static struct ck_malloc zyn_allocator = {
+  .malloc = zyn_malloc,
+  .free = zyn_free,
+  .realloc = zyn_realloc
+};
+
+/** Mark buffers
+ *
+ * For these, we need a buffer than can grow as needed but that can also be
+ * used concurrently by both a mutator thread and a collector thread.
+ */
+
+static mark_buffer *mark_buffer_init(unsigned initial_size)
+{
+  mark_buffer *mb = malloc(sizeof(mark_buffer));
+  mb->buf = malloc(sizeof(void *) * initial_size);
+  mb->buf_len = initial_size;
+  mb->next = NULL;
+  return mb;
+}
+
+/////////////
+// Functions
+
+/**
+ * @brief Perform one-time initialization before mutators can be executed
+ */
+void gc_initialize(void)
+{
+  if (ck_array_init(&zyn_mutators, CK_ARRAY_MODE_SPMC, &zyn_allocator, 10) == 0) {
+    fprintf(stderr, "Unable to initialize mutator array\n");
+    exit(1);
+  }
+  if (ck_array_init(&new_mutators, CK_ARRAY_MODE_SPMC, &zyn_allocator, 10) == 0) {
+    fprintf(stderr, "Unable to initialize mutator array\n");
+    exit(1);
+  }
+  if (ck_array_init(&old_mutators, CK_ARRAY_MODE_SPMC, &zyn_allocator, 10) == 0) {
+    fprintf(stderr, "Unable to initialize mutator array\n");
+    exit(1);
+  }
+
+  // Initialize collector's mark stack
+  mark_stack_len = 128;
+  mark_stack = vpbuffer_realloc(mark_stack, &(mark_stack_len));
+
+  // Here is as good a place as any to do this...
+  if (pthread_mutex_init(&(mutators_lock), NULL) != 0) {
+    fprintf(stderr, "Unable to initialize mutators_lock mutex\n");
+    exit(1);
+  }
+}
+
+/**
+ * @brief  Add data for a new mutator that is starting to run.
+ * @param  thd  Thread data for the mutator
+ */
+void gc_add_mutator(gc_thread_data * thd)
+{
+  pthread_mutex_lock(&mutators_lock);
+  if (ck_array_put_unique(&zyn_mutators, (void *)thd) < 0) {
+    fprintf(stderr, "Unable to allocate memory for a new thread, exiting\n");
+    exit(1);
+  }
+  ck_array_commit(&zyn_mutators);
+  pthread_mutex_unlock(&mutators_lock);
+
+  // Main thread is always the first one added
+  if (primordial_thread == NULL) {
+    primordial_thread = thd;
+  } else {
+    // At this point the mutator is running, so remove it from the new list
+    pthread_mutex_lock(&mutators_lock);
+    ck_array_remove(&new_mutators, (void *)thd);
+    ck_array_commit(&new_mutators);
+    pthread_mutex_unlock(&mutators_lock);
+  }
+}
+
+/**
+ * @brief Create a new heap page.
+ *        The caller must hold the necessary locks.
+ * @param  heap_type  Define the size of objects that will be allocated on this heap
+ * @param  size       Requested size (unpadded) of the heap
+ * @param  thd        Calling mutator's thread data object
+ * @return Pointer to the newly allocated heap page, or NULL
+ *         if the allocation failed.
+ */
+gc_heap *gc_heap_create(int heap_type, size_t size, gc_thread_data * thd)
+{
+  gc_free_list *free, *next;
+  gc_heap *h;
+  size_t padded_size;
+  size = gc_heap_align(size);
+  padded_size = gc_heap_pad_size(size);
+  h = malloc(padded_size);
+  if (!h)
+    return NULL;
+  h->type = heap_type;
+  h->size = size;
+  h->ttl = 10;
+  h->next_free = h;
+  h->last_alloc_size = 0;
+  thd->cached_heap_total_sizes[heap_type] += size;
+  thd->cached_heap_free_sizes[heap_type] += size;
+  h->data = (char *)gc_heap_align(sizeof(h->data) + (uintptr_t) & (h->data));
+  h->next = NULL;
+  h->num_unswept_children = 0;
+  free = h->free_list = (gc_free_list *) h->data;
+  next = (gc_free_list *) (((char *)free) + gc_heap_align(gc_free_chunk_size));
+  free->size = 0;               // First one is just a dummy record
+  free->next = next;
+  next->size = size - gc_heap_align(gc_free_chunk_size);
+  next->next = NULL;
+#if GC_DEBUG_TRACE
+  fprintf(stderr, "DEBUG h->data addr: %p\n", &(h->data));
+  fprintf(stderr, "DEBUG h->data addr: %p\n", h->data);
+  fprintf(stderr, ("heap: %p-%p data: %p-%p size: %zu\n"),
+          h, ((char *)h) + gc_heap_pad_size(size), h->data, h->data + size,
+          size);
+  fprintf(stderr, ("first: %p end: %p\n"), (object) gc_heap_first_block(h),
+          (object) gc_heap_end(h));
+  fprintf(stderr, ("free1: %p-%p free2: %p-%p\n"), free,
+          ((char *)free) + free->size, next, ((char *)next) + next->size);
+#endif
+  if (heap_type <= LAST_FIXED_SIZE_HEAP_TYPE) {
+    h->block_size = (heap_type + 1) * 32;
+//
+    h->remaining = size - (size % h->block_size);
+    h->data_end = h->data + h->remaining;
+    h->free_list = NULL;        // No free lists with bump&pop
+// This is for starting with a free list, but we want bump&pop instead
+//    h->remaining = 0;
+//    h->data_end = NULL;
+//    gc_init_fixed_size_free_list(h);
+  } else {
+    h->block_size = 0;
+    h->remaining = 0;
+    h->data_end = NULL;
+  }
+  // Lazy sweeping
+  h->free_size = size;
+  h->is_full = 0;
+  h->is_unswept = 0;
+  return h;
+}
+
+void gc_thread_data_init(gc_thread_data * thd, int mut_num, char *stack_base,
+                         long stack_size)
+{
+  char stack_ref;
+  thd->stack_start = stack_base;
+#if STACK_GROWTH_IS_DOWNWARD
+  thd->stack_limit = stack_base - stack_size;
+#else
+  thd->stack_limit = stack_base + stack_size;
+#endif
+  if (stack_overflow(stack_base, &stack_ref)) {
+    fprintf(stderr,
+            "Error: Stack is growing in the wrong direction! Rebuild with STACK_GROWTH_IS_DOWNWARD changed to %d\n",
+            (1 - STACK_GROWTH_IS_DOWNWARD));
+    exit(1);
+  }
+  thd->stack_traces = mi_calloc(MAX_STACK_TRACES, sizeof(char *));
+  thd->stack_trace_idx = 0;
+  thd->stack_prev_frame = NULL;
+  thd->mutations = NULL;
+  thd->mutation_buflen = 128;
+  thd->mutation_count = 0;
+  thd->mutations = vpbuffer_realloc(thd->mutations, &(thd->mutation_buflen));
+  thd->globals_changed = 1;
+  thd->param_objs = NULL;
+  thd->exception_handler_stack = NULL;
+  thd->scm_thread_obj = NULL;
+  thd->thread_state = ZYN_THREAD_STATE_NEW;
+  //thd->mutator_num = mut_num;
+  thd->jmp_start = malloc(sizeof(jmp_buf));
+  thd->gc_args = malloc(sizeof(object) * NUM_GC_ARGS);
+  thd->gc_num_args = 0;
+  thd->moveBufLen = 0;
+  gc_thr_grow_move_buffer(thd);
+  thd->gc_alloc_color = ck_pr_load_8(&gc_color_clear);
+  thd->gc_trace_color = thd->gc_alloc_color;
+  thd->gc_done_tracing = 0;
+  thd->gc_status = ck_pr_load_int(&gc_status_col);
+  thd->pending_writes = 0;
+  thd->last_write = 0;
+  thd->last_read = 0;
+  thd->mark_buffer = mark_buffer_init(128);
+  if (pthread_mutex_init(&(thd->lock), NULL) != 0) {
+    fprintf(stderr, "Unable to initialize thread mutex\n");
+    exit(1);
+  }
+  thd->heap_num_huge_allocations = 0;
+  thd->num_minor_gcs = 0;
+  thd->cached_heap_free_sizes = mi_calloc(5, sizeof(uintptr_t));
+  thd->cached_heap_total_sizes = mi_calloc(5, sizeof(uintptr_t));
+  thd->heap = mi_calloc(1, sizeof(gc_heap_root));
+  thd->heap->heap = mi_calloc(1, sizeof(gc_heap *) * NUM_HEAP_TYPES);
+  thd->heap->heap[HEAP_HUGE] = gc_heap_create(HEAP_HUGE, 1024, thd);
+  for (int i = 0; i < HEAP_HUGE; i++) {
+    thd->heap->heap[i] = gc_heap_create(i, INITIAL_HEAP_SIZE, thd);
+  }
+}
+
+/**
+ * @brief Increase the size of the mutator's move buffer
+ * @param d Mutator's thread data object
+ */
+void gc_thr_grow_move_buffer(gc_thread_data * d)
+{
+  if (!d)
+    return;
+
+  if (d->moveBufLen == 0) {     // Special case
+    d->moveBufLen = 128;
+    d->moveBuf = NULL;
+  } else {
+    d->moveBufLen *= 2;
+  }
+
+  d->moveBuf = realloc(d->moveBuf, d->moveBufLen * sizeof(void *));
+#if GC_DEBUG_TRACE
+  fprintf(stderr, "grew moveBuffer, len = %d\n", d->moveBufLen);
+#endif
+}
+#ifndef SOMESCHEME_GC_H
+#define SOMESCHEME_GC_H
+
+#include <pthread.h>
+#include <setjmp.h>
+
+#include "base.h"
+#include "queue.h"
+#include "hash_table.h"
+#include "vec.h"
+
+DEFINE_VECTOR(size_t, size_t);
+DEFINE_VECTOR(struct obj *, gc_heap_nodes);
+DEFINE_QUEUE(struct obj *, gc_grey_nodes);
+DEFINE_HASH(size_t, struct obj *, ptr_map);
+
+struct ptr_toupdate_pair {
+  struct obj **toupdate;
+  struct obj *on_stack;
+};
+
+DEFINE_QUEUE(struct ptr_toupdate_pair, ptr_toupdate_pair)
+
+struct gc_context {
+  // nodes that are marked grey
+  struct queue_gc_grey_nodes grey_nodes;
+
+  // pointers that need to be updated when
+  // another pointer has been moved to the heap
+  // pair is (pointer_to_update, stack_pointer)
+  struct queue_ptr_toupdate_pair pointers_toupdate;
+
+  // pointers that have been updated to the heap
+  // pair is (stack_pointer, heap_pointer)
+  struct hash_table_ptr_map *updated_pointers;
+};
+
+struct gc_funcs {
+  // Copies the object to the heap and updates
+  // anything it points to to point to the heap
+  // if the object is on the heap already this returns the same
+  // pointer that was put in
+  struct obj *(*const toheap)(struct obj *, struct gc_context *);
+
+  // Marks an object and any child pointers
+  // Stack objects are copied to the heap and the context updated
+  void (*const mark)(struct obj *, struct gc_context *);
+
+  // Frees an object
+  // Acts as the cleanup routine, the gc will decide whether to call free on
+  // the object if it is on the stack or not
+  void (*const free)(struct obj *);
+};
+
+struct gc_data {
+  struct vector_gc_heap_nodes nodes;
+};
+
+void gc_init(void);
+
+void gc_free_noop(struct obj *);
+void gc_mark_noop(struct obj *, struct gc_context *);
+
+struct obj *toheap_closure(struct obj *, struct gc_context *);
+void mark_closure(struct obj *, struct gc_context *);
+
+
+struct obj *toheap_env(struct obj *, struct gc_context *);
+void mark_env(struct obj *, struct gc_context *);
+
+struct obj *toheap_int_obj(struct obj *, struct gc_context *);
+
+struct obj *toheap_bool_obj(struct obj *, struct gc_context *);
+
+struct obj *toheap_string_obj(struct obj *, struct gc_context *);
+
+struct obj *toheap_cell(struct obj *, struct gc_context *);
+void mark_cell(struct obj *, struct gc_context *);
+
+struct obj *toheap_cons(struct obj *, struct gc_context *);
+void mark_cons(struct obj *, struct gc_context *);
+
+struct obj *toheap_ht(struct obj *, struct gc_context *);
+void mark_ht(struct obj *, struct gc_context *);
+void free_ht(struct obj *);
+
+struct gc_context gc_make_context(void);
+
+void gc_free_context(struct gc_context *);
+void gc_minor(struct gc_context *, struct thunk *);
+void gc_major(struct gc_context *, struct thunk *);
+
+struct obj *gc_toheap(struct gc_context *, struct obj *);
+void gc_mark_obj(struct gc_context *, struct obj *);
+
+void gc_heap_maintain(void);
+void *gc_malloc(size_t);
+
+// NEW Implementation
+
+
+#endif // SOMESCHEME_GC_H
+#ifndef __HASH_H_
+#define __HASH_H_
+
+// A hash table implementation using robin hood hashing
+#include <mimalloc.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "bit_array.h"
+#include "common.h"
+
+static const uint32_t hash_table_initial_cap = 64;
+static const uint8_t hash_table_load_factor_to_grow = 90;
+
+#define HASH_TABLE_ITER(NAME, KEY_NAME, VAL_NAME, TABLE, ...)                  \
+  for (size_t hash_table_##NAME##_iter_idx = 0;                                \
+       hash_table_##NAME##_iter_idx < (TABLE)->cap;                            \
+       hash_table_##NAME##_iter_idx++) {                                       \
+    struct hash_table_##NAME##_elem *hash_table_##NAME##_iter_e =              \
+        &(TABLE)->elems[hash_table_##NAME##_iter_idx];                         \
+    if (hash_table_##NAME##_iter_e->hash &&                                    \
+        !hash_table_##NAME##_is_entry_deleted((TABLE),                         \
+                                              hash_table_##NAME##_iter_idx)) { \
+      typeof(hash_table_##NAME##_iter_e->key) *KEY_NAME =                      \
+          &hash_table_##NAME##_iter_e->key;                                    \
+      typeof(hash_table_##NAME##_iter_e->val) *VAL_NAME =                      \
+          &hash_table_##NAME##_iter_e->val;                                    \
+      { __VA_ARGS__ }                                                          \
+    }                                                                          \
+  }
+
+#define DEFINE_HASH(KEYTYPE, VALTYPE, NAME)                                    \
+  struct hash_table_##NAME##_elem {                                            \
+    size_t hash;                                                               \
+    KEYTYPE key;                                                               \
+    VALTYPE val;                                                               \
+  };                                                                           \
+                                                                               \
+  struct hash_table_##NAME {                                                   \
+    struct hash_table_##NAME##_elem *elems;                                    \
+    uint8_t *deleted;                                                          \
+    uint32_t num_elems;                                                        \
+    uint32_t cap;                                                              \
+    size_t mask;                                                               \
+    uint32_t resize_thresh;                                                    \
+  };                                                                           \
+  struct hash_table_##NAME *hash_table_##NAME##_new();                         \
+  void hash_table_##NAME##_free(struct hash_table_##NAME *table);              \
+  void hash_table_##NAME##_insert(struct hash_table_##NAME *table, KEYTYPE k,  \
+                                  VALTYPE v);                                  \
+  VALTYPE *hash_table_##NAME##_lookup(struct hash_table_##NAME *table,         \
+                                      KEYTYPE k);                              \
+  bool hash_table_##NAME##_delete(struct hash_table_##NAME *table, KEYTYPE k); \
+  bool hash_table_##NAME##_is_entry_deleted(struct hash_table_##NAME *table,   \
+                                            size_t idx);                       \
+  void hash_table_##NAME##_clear(struct hash_table_##NAME *table);
+
+#define MAKE_HASH(KEYTYPE, VALTYPE, HASH_FUN, EQ_FUN, NAME)                    \
+  bool hash_table_##NAME##_is_entry_deleted(struct hash_table_##NAME *table,   \
+                                            size_t idx) {                      \
+    return get_bit_in_bitarray(table->deleted, idx);                           \
+  }                                                                            \
+                                                                               \
+  static void hash_table_##NAME##__mark_deleted(                               \
+      struct hash_table_##NAME *table, size_t idx) {                           \
+    set_bit_in_bitarray(table->deleted, idx, true);                            \
+  }                                                                            \
+                                                                               \
+  static void hash_table_##NAME##__reset_deleted(                              \
+      struct hash_table_##NAME *table, size_t idx) {                           \
+    set_bit_in_bitarray(table->deleted, idx, false);                           \
+  }                                                                            \
+                                                                               \
+  static size_t hash_table_##NAME##__fix_hash(size_t h) {                      \
+    if (h) {                                                                   \
+      return h;                                                                \
+    }                                                                          \
+                                                                               \
+    return 1;                                                                  \
+  }                                                                            \
+                                                                               \
+  static size_t hash_table_##NAME##__hash_idx(struct hash_table_##NAME *table, \
+                                              size_t hash) {                   \
+                                                                               \
+    return hash & table->mask;                                                 \
+  }                                                                            \
+                                                                               \
+  static size_t hash_table_##NAME##__max_probes(                               \
+      struct hash_table_##NAME *table, size_t hash, size_t idx) {              \
+    return (table->cap + idx - hash_table_##NAME##__hash_idx(table, hash)) &   \
+           table->mask;                                                        \
+  }                                                                            \
+                                                                               \
+  static void hash_table_##NAME##__insert(struct hash_table_##NAME *table,     \
+                                          struct hash_table_##NAME##_elem e) { \
+    size_t idx = hash_table_##NAME##__hash_idx(table, e.hash);                 \
+    /* printf("%u\n", idx); */                                                 \
+    size_t to_insert_elem_probes = 0;                                          \
+                                                                               \
+    for (;;) {                                                                 \
+      /* fast case, element where we want to insert is empty */                \
+      if (!table->elems[idx].hash) {                                           \
+        table->elems[idx] = e;                                                 \
+                                                                               \
+        return;                                                                \
+      }                                                                        \
+                                                                               \
+      /* fprintf(stderr, "elem at: %d, k: %d, deleted?: %d\n", idx,            \
+       * table->elems[idx].key, */                                             \
+      /* hash_table_##NAME##_is_entry_deleted(table, idx));  */                \
+                                                                               \
+      size_t current_elem_probes =                                             \
+          hash_table_##NAME##__max_probes(table, table->elems[idx].hash, idx); \
+                                                                               \
+      /* the element is deleted, just replace it  */                           \
+      if (hash_table_##NAME##_is_entry_deleted(table, idx)) {                  \
+                                                                               \
+        /* undelete  */                                                        \
+        hash_table_##NAME##__reset_deleted(table, idx);                        \
+                                                                               \
+        table->elems[idx] = e;                                                 \
+                                                                               \
+        return;                                                                \
+      }                                                                        \
+      /* if we're here, the element was occupied or deleted  */                \
+      /* steal from the rich, give to the poor  */                             \
+      if (current_elem_probes < to_insert_elem_probes) {                       \
+        /* element wasn't deleted, swap element to insert with it and continue \
+         */                                                                    \
+        SWAP(e, table->elems[idx]);                                            \
+        to_insert_elem_probes = current_elem_probes;                           \
+      }                                                                        \
+                                                                               \
+      idx++;                                                                   \
+      idx &= table->mask;                                                      \
+      to_insert_elem_probes++;                                                 \
+                                                                               \
+      /* printf("idx: %d, number probes: %d\n", idx, to_insert_elem_probes);   \
+       */                                                                      \
+    }                                                                          \
+  }                                                                            \
+                                                                               \
+  static int64_t hash_table_##NAME##__lookup(struct hash_table_##NAME *table,  \
+                                             KEYTYPE k) {                      \
+    size_t hash = hash_table_##NAME##__fix_hash(HASH_FUN(k));                  \
+    size_t idx = hash_table_##NAME##__hash_idx(table, hash);                   \
+                                                                               \
+    size_t num_probes = 0;                                                     \
+                                                                               \
+    for (;;) {                                                                 \
+      size_t current_hash = table->elems[idx].hash;                            \
+                                                                               \
+      /* if the entry is empty and not deleted, nothing is here  */            \
+      if (!current_hash) {                                                     \
+        return -1;                                                             \
+      }                                                                        \
+                                                                               \
+      /* if we've proved enough times to check every possible entry, nothing   \
+       * is  */                                                                \
+      /* here  */                                                              \
+      if (num_probes >                                                         \
+          hash_table_##NAME##__max_probes(table, current_hash, idx)) {         \
+        return -1;                                                             \
+      }                                                                        \
+                                                                               \
+      /* current element isn't deleted, and both the hash and keys match  */   \
+      if (!hash_table_##NAME##_is_entry_deleted(table, idx) &&                 \
+          current_hash == hash && EQ_FUN(table->elems[idx].key, k)) {          \
+        return idx;                                                            \
+      }                                                                        \
+                                                                               \
+      idx++;                                                                   \
+      idx &= table->mask;                                                      \
+      num_probes++;                                                            \
+    }                                                                          \
+  }                                                                            \
+                                                                               \
+  static void hash_table_##NAME##__construct(struct hash_table_##NAME *table,  \
+                                             uint32_t initial_capacity) {      \
+    table->elems =                                                             \
+        mi_calloc(initial_capacity, sizeof(struct hash_table_##NAME##_elem));     \
+    table->deleted = bit_array_new(initial_capacity);                          \
+    table->num_elems = 0;                                                      \
+    table->cap = initial_capacity;                                             \
+    table->mask = initial_capacity - 1;                                        \
+    table->resize_thresh =                                                     \
+        (initial_capacity * hash_table_load_factor_to_grow) / 100;             \
+  }                                                                            \
+                                                                               \
+  static void hash_table_##NAME##__grow(struct hash_table_##NAME *table) {     \
+    struct hash_table_##NAME new_table;                                        \
+    hash_table_##NAME##__construct(&new_table, table->cap * 2);                \
+                                                                               \
+    new_table.num_elems = table->num_elems;                                    \
+                                                                               \
+    for (uint32_t i = 0; i < table->cap; i++) {                                \
+      struct hash_table_##NAME##_elem e = table->elems[i];                     \
+                                                                               \
+      if (e.hash && !hash_table_##NAME##_is_entry_deleted(table, i)) {         \
+        hash_table_##NAME##__insert(&new_table, e);                            \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    hash_table_##NAME##_free(table);                                           \
+    *table = new_table;                                                        \
+  }                                                                            \
+                                                                               \
+  struct hash_table_##NAME *hash_table_##NAME##_new() {                        \
+    struct hash_table_##NAME *table =                                          \
+        mi_malloc(sizeof(struct hash_table_##NAME));                           \
+    hash_table_##NAME##__construct(table, hash_table_initial_cap);             \
+    return table;                                                              \
+  }                                                                            \
+                                                                               \
+  void hash_table_##NAME##_free(struct hash_table_##NAME *table) {             \
+    mi_free(table->elems);                                                     \
+    mi_free(table->deleted);                                                   \
+  }                                                                            \
+                                                                               \
+  void hash_table_##NAME##_insert(struct hash_table_##NAME *table, KEYTYPE k,  \
+                                  VALTYPE v) {                                 \
+    size_t hash = hash_table_##NAME##__fix_hash(HASH_FUN(k));                  \
+                                                                               \
+    /* printf("num_elems: %d, resize_thresh: %d\n", table->num_elems,          \
+     * table->resize_thresh); */                                               \
+                                                                               \
+    table->num_elems++;                                                        \
+                                                                               \
+    if (table->num_elems >= table->resize_thresh) {                            \
+      /* printf("growing table\n"); */                                         \
+      hash_table_##NAME##__grow(table);                                        \
+    }                                                                          \
+                                                                               \
+    hash_table_##NAME##__insert(                                               \
+        table, (struct hash_table_##NAME##_elem){hash, k, v});                 \
+  }                                                                            \
+                                                                               \
+  VALTYPE *hash_table_##NAME##_lookup(struct hash_table_##NAME *table,         \
+                                      KEYTYPE k) {                             \
+    int64_t idx = hash_table_##NAME##__lookup(table, k);                       \
+                                                                               \
+    if (idx < 0) {                                                             \
+      return NULL;                                                             \
+    }                                                                          \
+    return &table->elems[idx].val;                                             \
+  }                                                                            \
+                                                                               \
+  bool hash_table_##NAME##_delete(struct hash_table_##NAME *table,             \
+                                  KEYTYPE k) {                                 \
+    int64_t idx = hash_table_##NAME##__lookup(table, k);                       \
+                                                                               \
+    if (idx < 0) {                                                             \
+      return false;                                                            \
+    }                                                                          \
+                                                                               \
+    hash_table_##NAME##__mark_deleted(table, idx);                             \
+    table->num_elems--;                                                        \
+    return true;                                                               \
+  }                                                                            \
+  void hash_table_##NAME##_clear(struct hash_table_##NAME *table) {            \
+    memset(table->elems, 0,                                                    \
+           sizeof(struct hash_table_##NAME##_elem) * table->cap);              \
+    memset(table->deleted, 0, table->cap / 8);                                 \
+    table->num_elems = 0;                                                      \
+  }
+
+static size_t hash_table_default_size_t_hash_fun(size_t k) {
+  k = ((k >> 30) ^ k) * 0xbf58476d1ce4e5b9;
+  k = ((k >> 27) ^ k) * 0xbf58476d1ce4e5b9;
+  k = (k >> 31) ^ k;
+
+  return k;
+}
+
+#endif // __HASH_H_
+#ifndef SOMESCHEME_QUEUE_H
+#define SOMESCHEME_QUEUE_H
+
+#include <mimalloc.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "common.h"
+
+#define DEFINE_QUEUE(TYPE, TNAME)                                              \
+  struct queue_##TNAME {                                                       \
+    size_t len;                                                                \
+    size_t head, tail;                                                         \
+    TYPE *data;                                                                \
+  };                                                                           \
+  struct queue_##TNAME queue_##TNAME##_new(size_t);                            \
+  void queue_##TNAME##_enqueue(struct queue_##TNAME *, TYPE);                  \
+  TYPE queue_##TNAME##_dequeue(struct queue_##TNAME *);                        \
+  size_t queue_##TNAME##_len(struct queue_##TNAME *);                          \
+  void queue_##TNAME##_free(struct queue_##TNAME *);
+
+#define MAKE_QUEUE(TYPE, TNAME)                                                \
+  struct queue_##TNAME queue_##TNAME##_new(size_t initial) {                   \
+                                                                               \
+    /* ensure atleast enough space for one element */                          \
+    if (initial < 1) {                                                         \
+      initial = 1;                                                             \
+    }                                                                          \
+                                                                               \
+    TYPE *data = mi_malloc(sizeof(TYPE) * initial);                            \
+    return (struct queue_##TNAME){initial, 0, 0, data};                        \
+  }                                                                            \
+                                                                               \
+  void queue_##TNAME##_enqueue(struct queue_##TNAME *queue, TYPE elem) {       \
+    queue->data[queue->head++] = elem;                                         \
+                                                                               \
+    queue->head %= queue->len;                                                 \
+                                                                               \
+    /* if the head now points to the tail, we need to grow here */             \
+    if (queue->head == queue->tail) {                                          \
+      /* queue full, need to expand */                                         \
+      size_t old_size = queue->len;                                            \
+                                                                               \
+      size_t new_size = 1 + queue->len + (queue->len >> 2);                    \
+      queue->data = realloc(queue->data, new_size * sizeof(TYPE));             \
+      queue->len = new_size;                                                   \
+      DEBUG_LOG("growing queue from %ld to %ld", old_size, new_size);          \
+                                                                               \
+      size_t delta_size = new_size - old_size;                                 \
+                                                                               \
+      /* move tail section to end of queue */                                  \
+      memmove(&queue->data[queue->tail + delta_size],                          \
+              &queue->data[queue->tail],                                       \
+              (old_size - queue->tail) * sizeof(TYPE));                        \
+      queue->tail += delta_size;                                               \
+    }                                                                          \
+  }                                                                            \
+                                                                               \
+  TYPE queue_##TNAME##_dequeue(struct queue_##TNAME *queue) {                  \
+    if (DEBUG_ONLY(queue->tail == queue->head)) {                              \
+      RUNTIME_ERROR("Popping from empty queue");                               \
+    }                                                                          \
+                                                                               \
+    TYPE result = queue->data[queue->tail++];                                  \
+    queue->tail %= queue->len;                                                 \
+    return result;                                                             \
+  }                                                                            \
+                                                                               \
+  size_t queue_##TNAME##_len(struct queue_##TNAME *queue) {                    \
+    /* case 0, the head is pointing to the tail, the queue is empty */         \
+    if (queue->head == queue->tail) {                                          \
+      return 0;                                                                \
+    }                                                                          \
+                                                                               \
+    /* case 1, the head is further up the queue than the tail                  \
+     *                                                                         \
+     * elems with parens around number are used                                \
+     * | 0 | (1) | (2) | (3) | 4 | 5 | 6 |                                     \
+     *       ^ tail            ^ head                                          \
+     * len = head - tail = 4 - 1 = 3                                           \
+     */                                                                        \
+    if (queue->head > queue->tail) {                                           \
+      return queue->head - queue->tail;                                        \
+    }                                                                          \
+                                                                               \
+    /* case 2, the tail is further up the queue than the head                  \
+     *                                                                         \
+     * | (0) | 1 | 2 | (3) | (4) | (5) | (6) |                                 \
+     *         ^ head   ^ tail                                                 \
+     * len = head + array_len - tail = 1 + 7 - 3 = 5                           \
+     */                                                                        \
+    return queue->head + queue->len - queue->tail;                             \
+  }                                                                            \
+                                                                               \
+  void queue_##TNAME##_free(struct queue_##TNAME *queue) { mi_free(queue->data); }
+
+#endif // SOMESCHEME_QUEUE_H
+/* queue_thunk.h */
+#ifndef QUEUE_THUNK_H
+#define QUEUE_THUNK_H
+
+#include <mimalloc.h>
+#include <stdlib.h>
+#include "base.h"
+
+typedef struct queue_thunk {
+    size_t len;
+    size_t head, tail;
+    struct thunk **data;
+} queue_thunk;
+
+// Create a new queue.
+static inline queue_thunk queue_thunk_new(size_t initial) {
+    if (initial < 1) { initial = 1; }
+    queue_thunk q;
+    q.len = initial;
+    q.head = 0;
+    q.tail = 0;
+    q.data = mi_malloc(q.len * sizeof(struct thunk *));
+    return q;
+}
+
+// Enqueue a thunk.
+static inline void queue_thunk_enqueue(queue_thunk *q, struct thunk *t) {
+    q->data[q->head++] = t;
+    q->head %= q->len;
+    if (q->head == q->tail) {
+        size_t old_len = q->len;
+        size_t new_len = old_len + (old_len >> 1) + 1;
+        q->data = mi_realloc(q->data, new_len * sizeof(struct thunk *));
+        q->len = new_len;
+    }
+}
+
+// Dequeue a thunk.
+static inline struct thunk *queue_thunk_dequeue(queue_thunk *q) {
+    struct thunk *t = q->data[q->tail++];
+    q->tail %= q->len;
+    return t;
+}
+
+// Get current length.
+static inline size_t queue_thunk_len(queue_thunk *q) {
+    if (q->head >= q->tail) {
+        return q->head - q->tail;
+    } else {
+        return q->head + q->len - q->tail;
+    }
+}
+
+#endif // QUEUE_THUNK_H
+#ifndef RUNTIME_MAIN_H_
+#define RUNTIME_MAIN_H_
+
+long global_stack_size = 0;
+long global_heap_size = 0;
+
+static void c_entry_pt(void *data, object clo, int argc, object * args);
+static void zyn_heap_init(long heap_size);
+
+static void zyn_heap_init(long heap_size)
+{
+  /* Allocate heap area for second generation. */
+#if DEBUG_SHOW_DIAG
+  printf("main: Allocating and initializing heap...\n");
+#endif
+  gc_init_heap(heap_size);
+  gc_start_collector();
+}
+
+#endif // RUNTIME_MAIN_H_
+#include <mimalloc.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "base.h"
+#include "gc.h"
+#include "queue_thunk.h"   // Your queue implementation for thunks
+#include "scheduler.h"
+#include "thread_context.h"
+
+// Number of worker threads to spawn.
+#define NUM_THREADS 4
+
+// Global work queue for thunks, using your queue_thunk type.
+// We now initialize this queue using the MAKE_QUEUE macro from your queue_thunk module.
+queue_thunk global_work_queue;
+
+// Mutex and condition variable protecting the work queue.
+pthread_mutex_t work_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t work_queue_cond = PTHREAD_COND_INITIALIZER;
+
+/**
+ * scheduler_init
+ *
+ * Optional helper that ensures the global work queue is properly initialized.
+ * This uses your queue_thunk_new() function (generated by your DEFINE_QUEUE/MAKE_QUEUE macros)
+ * to allocate a queue with an initial capacity.
+ */
+static void scheduler_init(void) {
+    pthread_mutex_lock(&work_queue_mutex);
+    if (global_work_queue.data == NULL) {
+        global_work_queue = queue_thunk_new(16);
+    }
+    pthread_mutex_unlock(&work_queue_mutex);
+}
+
+/**
+ * schedule_thunk
+ *
+ * Enqueues a thunk into the global work queue. This implementation uses
+ * the queue_thunk_enqueue() function (from your queue_thunk macros) to add
+ * the thunk to the queue, and then signals a waiting worker.
+ */
+void schedule_thunk(struct thunk *thnk) {
+    pthread_mutex_lock(&work_queue_mutex);
+    // If the work queue hasn't been initialized yet, do so.
+    if (global_work_queue.data == NULL) {
+        global_work_queue = queue_thunk_new(16);
+    }
+    queue_thunk_enqueue(&global_work_queue, thnk);
+    pthread_cond_signal(&work_queue_cond);
+    pthread_mutex_unlock(&work_queue_mutex);
+}
+
+/**
+ * dequeue_thunk
+ *
+ * Removes and returns a thunk from the global work queue.
+ * Returns NULL if the queue is empty.
+ */
+struct thunk *dequeue_thunk(void) {
+    pthread_mutex_lock(&work_queue_mutex);
+    struct thunk *thnk = NULL;
+    if (queue_thunk_len(&global_work_queue) > 0) {
+        thnk = queue_thunk_dequeue(&global_work_queue);
+    }
+    pthread_mutex_unlock(&work_queue_mutex);
+    return thnk;
+}
+
+/**
+ * thread_main
+ *
+ * This is the worker thread function. Each thread initializes its thread
+ * context and then repeatedly waits for work. When a thunk is available in the
+ * global work queue, it is dequeued and executed via zayin_start().
+ */
+static void *thread_main(void *arg) {
+    // Initialize thread context if not already initialized.
+    if (current_ctx == NULL) {
+        current_ctx = mi_malloc(sizeof(thread_context_t));
+    }
+    memset(current_ctx, 0, sizeof(thread_context_t));
+    current_ctx->stack_initial = stack_ptr();
+
+    while (1) {
+        pthread_mutex_lock(&work_queue_mutex);
+        // Wait for work if the queue is empty.
+        while (queue_thunk_len(&global_work_queue) == 0) {
+            pthread_cond_wait(&work_queue_cond, &work_queue_mutex);
+        }
+        struct thunk *thnk = queue_thunk_dequeue(&global_work_queue);
+        pthread_mutex_unlock(&work_queue_mutex);
+
+        // Update current thunk in the thread context and execute it.
+        current_ctx->current_thunk = thnk;
+        zayin_start(thnk);
+    }
+    return NULL;
+}
+
+/**
+ * start_scheduler
+ *
+ * Initializes the global work queue and spawns a fixed number of worker threads.
+ */
+int start_scheduler(void) {
+    // Initialize the global work queue.
+    scheduler_init();
+    // Also initialize GC, if required.
+    gc_init();
+
+    // Create worker threads.
+    pthread_t threads[NUM_THREADS];
+    for (int i = 0; i < NUM_THREADS; i++) {
+        if (pthread_create(&threads[i], NULL, thread_main, NULL) != 0) {
+            perror("pthread_create");
+            exit(1);
+        }
+    }
+
+    return 0;
+}
+#ifndef SCHEDULER_H
+#define SCHEDULER_H
+
+#include "base.h" // Assumes that struct thunk is defined here
+#include "queue_thunk.h"  // Provides the queue_thunk type and functions
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief Starts the scheduler by creating and launching the worker threads.
+ *
+ * This function initializes the global work queue and spawns a fixed number of
+ * worker threads. Each worker thread will run in a loop, waiting for thunks to
+ * be scheduled for execution.
+ *
+ * @return 0 on success, non-zero on error.
+ */
+int start_scheduler(void);
+
+/**
+ * @brief Schedules a thunk for execution by one of the worker threads.
+ *
+ * This function enqueues the given thunk into the global work queue. Worker
+ * threads will pick up scheduled thunks and execute them.
+ *
+ * @param thnk A pointer to the thunk to be scheduled.
+ */
+void schedule_thunk(struct thunk *thnk);
+
+/**
+ * @brief Dequeues a thunk from the global work queue.
+ *
+ * This function removes and returns the next thunk from the work queue. If the
+ * queue is empty, it returns NULL.
+ *
+ * @return A pointer to the dequeued thunk, or NULL if the queue is empty.
+ */
+struct thunk *dequeue_thunk(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // SCHEDULER_H
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "queue.h"
+
+DEFINE_QUEUE(int, int)
+MAKE_QUEUE(int, int)
+
+int main() {
+  struct queue_int queue = queue_int_new(0);
+
+  for (int i = 0; i < 100; i++) {
+    queue_int_enqueue(&queue, i);
+  }
+
+  for (int i = 0; i < 100; i++) {
+    assert(queue_int_len(&queue) > 0);
+    int result = queue_int_dequeue(&queue);
+    // printf("dequeued %d expecting %d\n", result, i);
+    assert(result == i);
+  }
+
+  puts("yeah we're good (test_queue)");
+}
+/* thread_context.c */
+#include "thread_context.h"
+
+// Define the thread-local variable.
+__thread thread_context_t *current_ctx = NULL;
+/* thread_context.h */
+#ifndef THREAD_CONTEXT_H
+#define THREAD_CONTEXT_H
+
+#include <pthread.h>
+#include <setjmp.h>
+#include "base.h"  // Assumes your thunk type is declared here
+
+typedef struct thread_context {
+    struct thunk *current_thunk;
+    void *stack_initial;
+    jmp_buf setjmp_env;
+    // (Optional) Add fields for per‑thread GC context if needed.
+} thread_context_t;
+
+extern __thread thread_context_t *current_ctx;
+
+#endif // THREAD_CONTEXT_H
+#ifndef SOMESCHEME_VEC_H
+#define SOMESCHEME_VEC_H
+
+#include <mimalloc.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "common.h"
+
+#define DEFINE_VECTOR(TYPE, TNAME)                                             \
+  struct vector_##TNAME {                                                      \
+    size_t cap;                                                                \
+    size_t length;                                                             \
+    TYPE *data;                                                                \
+  };                                                                           \
+  struct vector_##TNAME vector_##TNAME##_new(size_t);                          \
+  TYPE vector_##TNAME##_pop(struct vector_##TNAME *);                          \
+  size_t vector_##TNAME##_push(struct vector_##TNAME *, TYPE);                 \
+  TYPE vector_##TNAME##_index(struct vector_##TNAME *, size_t);                \
+  void vector_##TNAME##_set(struct vector_##TNAME *, TYPE, size_t);            \
+  TYPE *vector_##TNAME##_index_ptr(struct vector_##TNAME *, size_t);           \
+  void vector_##TNAME##_shrink_to_fit(struct vector_##TNAME *);                \
+  void vector_##TNAME##_free(struct vector_##TNAME *);                         \
+  void vector_##TNAME##_remove(struct vector_##TNAME *, size_t);               \
+  size_t vector_##TNAME##_indexof(struct vector_##TNAME *, TYPE);
+
+#define MAKE_VECTOR(TYPE, TNAME)                                               \
+  struct vector_##TNAME vector_##TNAME##_new(size_t initial) {                 \
+    TYPE *data = mi_malloc(sizeof(TYPE) * initial);                            \
+    return (struct vector_##TNAME){initial, 0, data};                          \
+  }                                                                            \
+  TYPE vector_##TNAME##_pop(struct vector_##TNAME *vec) {                      \
+    if (DEBUG_ONLY(vec->length == 0)) {                                        \
+      RUNTIME_ERROR("Popping from 0-length vector");                           \
+    }                                                                          \
+    TYPE elem = vec->data[vec->length - 1];                                    \
+    vec->length--;                                                             \
+    return elem;                                                               \
+  }                                                                            \
+  size_t vector_##TNAME##_push(struct vector_##TNAME *vec, TYPE elem) {        \
+    if (vec->length >= vec->cap) {                                             \
+      size_t new_len = 1 + vec->cap + (vec->cap >> 2);                         \
+      DEBUG_LOG("growing vec(%p) from %ld to %ld", (void *)vec, vec->cap,      \
+                new_len);                                                      \
+      vec->data = realloc(vec->data, new_len * sizeof(TYPE));                  \
+      vec->cap = new_len;                                                      \
+    }                                                                          \
+    size_t inserted_idx = vec->length;                                         \
+    vec->data[vec->length++] = elem;                                           \
+    return inserted_idx;                                                       \
+  }                                                                            \
+  TYPE vector_##TNAME##_index(struct vector_##TNAME *vec, size_t idx) {        \
+    if (DEBUG_ONLY(idx < 0 || idx >= vec->length)) {                           \
+      RUNTIME_ERROR("Indexing vector out of bounds");                          \
+    }                                                                          \
+    return vec->data[idx];                                                     \
+  }                                                                            \
+  void vector_##TNAME##_set(struct vector_##TNAME *vec, TYPE elem,             \
+                            size_t idx) {                                      \
+    if (DEBUG_ONLY(idx < 0 || idx >= vec->length)) {                           \
+      RUNTIME_ERROR("Indexing vector out of bounds");                          \
+    }                                                                          \
+    vec->data[idx] = elem;                                                     \
+  }                                                                            \
+  TYPE *vector_##TNAME##_index_ptr(struct vector_##TNAME *vec, size_t idx) {   \
+    if (DEBUG_ONLY(idx < 0 || idx >= vec->length)) {                           \
+      RUNTIME_ERROR("Indexing vector out of bounds");                          \
+    }                                                                          \
+    return &vec->data[idx];                                                    \
+  }                                                                            \
+  void vector_##TNAME##_shrink_to_fit(struct vector_##TNAME *vec) {            \
+    vec->data = realloc(vec->data, vec->length * sizeof(TYPE));                \
+    vec->cap = vec->length;                                                    \
+  }                                                                            \
+  void vector_##TNAME##_free(struct vector_##TNAME *vec) { mi_free(vec->data); }  \
+  void vector_##TNAME##_remove(struct vector_##TNAME *vec, size_t idx) {       \
+    if (DEBUG_ONLY(idx < 0 || idx >= vec->length)) {                           \
+      RUNTIME_ERROR("Indexing vector out of bounds");                          \
+    }                                                                          \
+    memmove(&vec->data[idx], &vec->data[idx + 1], vec->length - idx - 1);      \
+    vec->length--;                                                             \
+  }                                                                            \
+  size_t vector_##TNAME##_indexof(struct vector_##TNAME *vec, TYPE val) {      \
+    for (size_t i = 0; i < vec->length; i++) {                                 \
+      if (memcmp(&vec->data[i], &val, sizeof(TYPE)) == 0) {                    \
+        return i;                                                              \
+      }                                                                        \
+    }                                                                          \
+    return vec->length;                                                        \
+  }
+
+#endif /* SOMESCHEME_VEC_H */
