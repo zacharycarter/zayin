@@ -96,7 +96,9 @@ typedef struct gc_global_state {
     /* Statistics */
     size_t total_collections;       /* Total number of collections */
     size_t total_allocated;         /* Total bytes allocated */
+    size_t objects_marked;          /* Total number of ojbects makred */
     size_t last_collection_time;    /* Time of last collection (ms) */
+    size_t bytes_freed;             /* Number of bytes freed */
 } gc_global_state_t;
 
 /* Make the global state available to other modules */
@@ -200,6 +202,9 @@ void gc_check_pause_for_collection(void);
 void gc_heap_maintain(void);
 void gc_free_noop(struct obj *);
 void gc_mark_noop(struct obj *, struct gc_context *);
+void gc_reset_stats(void);
+void gc_get_stats(size_t *collections, size_t *objects_marked,
+                  size_t *bytes_freed, size_t *allocated);
 
 /* Object handling functions (from original implementation) */
 struct obj *toheap_closure(struct obj *, struct gc_context *);

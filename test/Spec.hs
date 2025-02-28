@@ -70,6 +70,22 @@ main = hspec $ do
         exitCode `shouldBe` ExitSuccess
         output `shouldSatisfy` (\out -> "5" `isInfixOf` out)
 
+    it "cons" $ do
+      withSystemTempDirectory "zayin-test" $ \tmpDir -> do
+        let srcFile = tmpDir </> "arith.zyn"
+            binaryFile = tmpDir </> "a.out"
+            -- A simple program that displays the sum of 2 and 3.
+            source = "display(cons(1, 2))"
+        writeFile srcFile source
+        -- Invoke the compiler in compile mode, specifying the output binary.
+        compileWithOutput binaryFile srcFile
+        exists <- doesFileExist binaryFile
+        exists `shouldBe` True
+        -- Run the produced binary and capture its output.
+        (exitCode, output, _) <- readProcessWithExitCode binaryFile [] ""
+        exitCode `shouldBe` ExitSuccess
+        output `shouldSatisfy` (\out -> "(1 . 2)" `isInfixOf` out)
+
     it "let binding" $ do
       withSystemTempDirectory "zayin-test" $ \tmpDir -> do
         let srcFile = tmpDir </> "let.zyn"
@@ -135,3 +151,28 @@ main = hspec $ do
         (exitCode, output, _) <- readProcessWithExitCode binaryFile [] ""
         exitCode `shouldBe` ExitSuccess
         output `shouldSatisfy` (\out -> "macro works!" `isInfixOf` out)
+
+  describe "Garbage Collection Tests" $ do
+    it "handles allocation pressure" $ do
+      withSystemTempDirectory "zayin-test" $ \tmpDir -> do
+        let srcFile = tmpDir </> "alloc_pressure.zyn"
+            binaryFile = tmpDir </> "a.out"
+            -- Create a program that allocates many objects to trigger GC
+            source = unlines
+              [ "fn allocate_many(count, acc):",
+                "  if count <= 0:",
+                "    acc",
+                "  else:",
+                "    let new_list = cons(count, acc)",
+                "    allocate_many(count - 1, new_list)",
+                "",
+                "let result = allocate_many(5000, nil)",
+                "display(\"Allocation completed successfully\")"
+              ]
+        writeFile srcFile source
+        compileWithOutput binaryFile srcFile
+        exists <- doesFileExist binaryFile
+        exists `shouldBe` True
+        (exitCode, output, stderr) <- readProcessWithExitCode binaryFile ["--debug"] ""
+        exitCode `shouldBe` ExitSuccess
+        output `shouldSatisfy` (\out -> "Allocation completed successfully" `isInfixOf` out)

@@ -298,7 +298,7 @@ generateProgramSource src =
           "    bool use_threading = false;",
           "    parse_args(argc, argv, &use_threading);",
           "    ",
-          "    if (true) {",
+          "    if (false) {",
           "        // Initialize global GC first",
           "        gc_global_init();",
           "        ",

@@ -548,15 +548,23 @@ void *gc_malloc(size_t size) {
     /* Check if we need to pause for collection */
     gc_check_pause_for_collection();
 
+
     thread_context_t *ctx = get_current_thread_context();
 
     /* Try to allocate in the nursery first (via TLAB) */
+    void *result;
     if (ctx && ctx->gc_state.nursery) {
-        return gc_heap_allocate(ctx->gc_state.nursery, size);
+        result = gc_heap_allocate(ctx->gc_state.nursery, size);
+    } else {
+      /* Fallback to shared heap if thread context not initialized */
+      result = gc_heap_allocate(gc_global_state.shared_heap, size);
     }
 
-    /* Fallback to shared heap if thread context not initialized */
-    return gc_heap_allocate(gc_global_state.shared_heap, size);
+    pthread_mutex_lock(&gc_global_state.gc_mutex);
+    gc_global_state.total_allocated += size;
+    pthread_mutex_unlock(&gc_global_state.gc_mutex);
+
+    return result;
 }
 
 /* Allocate memory in a specific region */
@@ -612,6 +620,11 @@ void gc_mark_obj(struct gc_context *ctx, struct obj *obj) {
 
     /* Mark the object as black (fully processed) */
     obj->mark = BLACK;
+
+    /* Increment the marked objects counter */
+    pthread_mutex_lock(&gc_global_state.gc_mutex);
+    gc_global_state.objects_marked++;
+    pthread_mutex_unlock(&gc_global_state.gc_mutex);
 
     /* Call the appropriate mark function for the object type */
     gc_func_map[obj->tag].mark(obj, ctx);
@@ -929,6 +942,10 @@ static void gc_collect_local_heap(struct gc_context *ctx) {
 
     /* Update heap usage statistics */
     thread_ctx->gc_state.local_mature->allocated_size -= freed_bytes;
+
+    pthread_mutex_lock(&gc_global_state.gc_mutex);
+    gc_global_state.bytes_freed += freed_bytes;
+    pthread_mutex_unlock(&gc_global_state.gc_mutex);
 
     /* Update statistics */
     end_time = get_current_time_ms();
@@ -1328,6 +1345,104 @@ void gc_full(gc_flags_t flags) {
     DEBUG_FPRINTF(stderr, "Full GC completed in %llu ms\n",
                  (unsigned long long)(end_time - start_time));
 }
+/* TODO:
+In a production environment, you might want to add more sophisticated object validation, such as:
+Checking if the pointer falls within known heap regions
+Validating object-specific fields based on the tag
+Using memory protection mechanisms to safely access memory
+*/
+
+/* Check if a pointer might point to a valid object */
+static bool is_potential_object(struct obj *ptr) {
+    /* Basic validity checks */
+    if (!ptr) return false;
+
+    /* Check if the address seems reasonable (not in low memory) */
+    if ((uintptr_t)ptr < 4096) return false;
+
+    /* Try to access the memory and check object header */
+    /* We're assuming we can safely read this memory */
+
+    /* Check tag (object type) */
+    if (ptr->tag < 1 || ptr->tag > LAST_OBJ_TYPE) {
+        return false;
+    }
+
+    /* Check mark state */
+    if (ptr->mark != WHITE && ptr->mark != GREY && ptr->mark != BLACK) {
+        return false;
+    }
+
+    /* Check on_stack flag - can add additional logic here */
+    /* In a conservative GC, we just need to be cautious about what we mark */
+
+    return true;
+}
+
+/* Scan the stack to identify and mark all potential object pointers */
+static void scan_stack(struct gc_context *ctx) {
+    thread_context_t *thread_ctx;
+    void *stack_current, *stack_end;
+    uintptr_t *addr;
+    uintptr_t value;
+    struct obj *potential_obj;
+    size_t objects_marked = 0;
+
+    /* Get the thread context */
+    thread_ctx = ctx->thread_ctx;
+    if (!thread_ctx) {
+        thread_ctx = get_current_thread_context();
+        ctx->thread_ctx = thread_ctx;
+    }
+
+    /* Get stack boundaries */
+    stack_current = stack_ptr();
+    stack_end = thread_ctx->stack_initial;
+
+    DEBUG_FPRINTF(stderr, "Thread %d: Scanning stack from %p to %p\n",
+                 thread_ctx->thread_index, stack_current, stack_end);
+
+    /* Determine scan direction based on architecture */
+    /* On most architectures (x86, x86_64, ARM), stacks grow down */
+    /* This means stack_current < stack_end */
+    if ((uintptr_t)stack_current < (uintptr_t)stack_end) {
+        /* Scan from current position (lower address) to end (higher address) */
+        for (addr = (uintptr_t*)stack_current; addr < (uintptr_t*)stack_end; addr++) {
+            value = *addr;
+
+            /* Check if this could be a valid object pointer */
+            if (value && !(value & 3)) { /* Pointers are typically aligned */
+                potential_obj = (struct obj*)value;
+
+                if (is_potential_object(potential_obj)) {
+                    /* Mark this object and all objects it references */
+                    gc_mark_obj(ctx, potential_obj);
+                    objects_marked++;
+                }
+            }
+        }
+    } else {
+        /* For architectures where stack grows up (uncommon) */
+        /* Scan from end (lower address) to current position (higher address) */
+        for (addr = (uintptr_t*)stack_end; addr < (uintptr_t*)stack_current; addr++) {
+            value = *addr;
+
+            /* Check if this could be a valid object pointer */
+            if (value && !(value & 3)) { /* Pointers are typically aligned */
+                potential_obj = (struct obj*)value;
+
+                if (is_potential_object(potential_obj)) {
+                    /* Mark this object and all objects it references */
+                    gc_mark_obj(ctx, potential_obj);
+                    objects_marked++;
+                }
+            }
+        }
+    }
+
+    DEBUG_FPRINTF(stderr, "Thread %d: Stack scan complete, marked %zu potential objects\n",
+                 thread_ctx->thread_index, objects_marked);
+}
 
 /* Mark all roots for a thread */
 void gc_mark_roots(struct gc_context *ctx) {
@@ -1370,8 +1485,8 @@ void gc_mark_roots(struct gc_context *ctx) {
         }
     }
 
-    /* TODO: Implement stack scanning to mark all roots on the stack */
-    /* This is complex and requires careful implementation */
+    /* Scan the thread's stack to find and mark all potential object pointers */
+    scan_stack(ctx);
 }
 
 /* Write barrier for inter-generational or inter-thread references */
@@ -1457,6 +1572,27 @@ void gc_mark_noop(struct obj *obj, struct gc_context *ctx) { (void)obj; (void)ct
 /* Other functions from the original implementation */
 bool size_t_eq(size_t a, size_t b) { return a == b; }
 MAKE_HASH(size_t, struct obj *, hash_table_default_size_t_hash_fun, size_t_eq, ptr_map);
+
+/* Get the current GC statistics */
+void gc_get_stats(size_t *collections, size_t *objects_marked,
+                 size_t *bytes_freed, size_t *allocated) {
+    pthread_mutex_lock(&gc_global_state.gc_mutex);
+    if (collections) *collections = gc_global_state.total_collections;
+    if (objects_marked) *objects_marked = gc_global_state.objects_marked;
+    if (bytes_freed) *bytes_freed = gc_global_state.bytes_freed;
+    if (allocated) *allocated = gc_global_state.total_allocated;
+    pthread_mutex_unlock(&gc_global_state.gc_mutex);
+}
+
+/* Reset GC statistics for testing */
+void gc_reset_stats(void) {
+    pthread_mutex_lock(&gc_global_state.gc_mutex);
+    gc_global_state.total_collections = 0;
+    gc_global_state.objects_marked = 0;
+    gc_global_state.bytes_freed = 0;
+    gc_global_state.total_allocated = 0;
+    pthread_mutex_unlock(&gc_global_state.gc_mutex);
+}
 
 // Mark an object as grey and add it to the queue of grey nodes 'if' it is not
 // already grey or black

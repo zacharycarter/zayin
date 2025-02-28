@@ -1,3 +1,9 @@
-fn foo(a): display a
+fn allocateMany(count, acc):
+  if count <= 0:
+    acc
+  else:
+    let newList = cons(count, acc)
+    allocateMany(count - 1, newList)
 
-foo(1)
+allocateMany(10, 0)
+display("Allocation completed successfully!")

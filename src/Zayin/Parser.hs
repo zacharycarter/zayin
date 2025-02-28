@@ -116,21 +116,29 @@ nextToken t
                         token = TNumber (read (T.unpack num))
                      in token : nextToken rest'
                 | isAlpha c ->
-                    let (word, rest') = T.span isAlphaNum t'
+                    let (word, rest') = T.span isIdentChar t'
                         token = if isKeyword word then TKeyword word else TIdent word
                      in token : nextToken rest'
                 | isPunctuation c ->
-                    TSymbol (T.singleton c) : nextToken rest
+                    -- Check for multi-character operators like <=, >=, ==
+                    if c `elem` ['<', '>', '='] && not (T.null rest) && T.head rest == '=' then
+                      TSymbol (T.pack [c, '=']) : nextToken (T.drop 1 rest)
+                    else
+                      TSymbol (T.singleton c) : nextToken rest
                 | otherwise -> nextToken rest
 
+isIdentChar :: Char -> Bool
+isIdentChar c = isAlphaNum c || c == '_'
+
 isPunctuation :: Char -> Bool
-isPunctuation c = c `elem` ("()+-*/=,:;" :: String)
+isPunctuation c = c `elem` ("()+-*/=,:;<>!" :: String)
 
 isKeyword :: Text -> Bool
 isKeyword w = w `elem` ["if", "then", "else", "fn", "where", "do", "true", "false", "nil", "not"]
 
 isBuiltin :: Text -> Bool
-isBuiltin w = w `elem` ["display", "not"]
+isBuiltin w = w `elem` ["display", "not", "gc_collect", "gc_stats", "spawn", "cons",
+                        "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "eq?", "car", "cdr"]
 
 --------------------------------------------------------------------------------
 -- Expression AST Transformation for Variable Renaming in Macros
@@ -405,6 +413,21 @@ parseArgs =
   )
     <|> return []
 
+-- Parse a comma-separated list of expressions for function arguments
+parseArgList :: Parser [Expr]
+parseArgList =
+  ( do
+      firstArg <- parseExpr
+      restArgs <-
+        many
+          ( do
+              _ <- consume (== TSymbol ",")
+              parseExpr
+          )
+      return (firstArg : restArgs)
+  )
+  <|> return []
+
 -- | Parse a let binding with two possible formats:
 --    1. let <name> = <expr> [, <name> = <expr>]*
 --       <body>
@@ -552,7 +575,7 @@ parseExpr = do
     Just (TKeyword "if") -> parseIf
     Just (TIdent "unless") -> parseMacroUsage
     Just (TIdent "let") -> parseLet
-    _ -> parseAdd >>= parseExprWithCall
+    _ -> parseComparison
   where
     parseExprWithCall expr =
       ( do
@@ -622,46 +645,124 @@ sepBy p sep =
   )
     <|> return []
 
--- Parse left-associative addition.
-parseAdd :: Parser Expr
-parseAdd = do
-  lhs <- parseCall
-  moreAdd lhs
+-- Parse comparisons (lowest precedence)
+parseComparison :: Parser Expr
+parseComparison = do
+  lhs <- parseAddSub
+  (do
+    op <- tryConsume (\t -> case t of
+           TSymbol s -> s `elem` ["<", ">", "<=", ">=", "=="]
+           _ -> False)
+    case op of
+      Just tok -> do
+        rhs <- parseAddSub
+        let opName = case tok of
+              TSymbol "<=" -> "<="
+              TSymbol ">=" -> ">="
+              TSymbol "<" -> "<"
+              TSymbol ">" -> ">"
+              TSymbol "==" -> "eq?"
+              _ -> error "Unknown comparison operator"
+        return $ EApp (EBuiltinIdent opName) [lhs, rhs]
+      Nothing -> return lhs
+   ) <|> return lhs
+
+-- Helper to consume a comparison operator
+consumeComparisonOp :: Parser Token
+consumeComparisonOp =
+  consume (\t -> case t of
+              TSymbol s -> s `elem` ["<", ">", "<=", ">=", "=="]
+              _ -> False)
+
+-- Parse addition and subtraction (middle precedence)
+parseAddSub :: Parser Expr
+parseAddSub = do
+  lhs <- parseMulDiv
+  parseAddSubRest lhs
   where
-    moreAdd lhs =
-      ( do
-          _ <- consume (== TSymbol "+")
-          rhs <- parseCall
-          let addExpr = EApp (EBuiltinIdent "+") [lhs, rhs]
-          moreAdd addExpr
-      )
-        <|> return lhs
+    parseAddSubRest lhs =
+      (do
+        op <- tryConsume (\t -> case t of
+               TSymbol "+" -> True
+               TSymbol "-" -> True
+               _ -> False)
+        case op of
+          Just (TSymbol "+") -> do
+            rhs <- parseMulDiv
+            let addExpr = EApp (EBuiltinIdent "+") [lhs, rhs]
+            parseAddSubRest addExpr
+          Just (TSymbol "-") -> do
+            rhs <- parseMulDiv
+            let subExpr = EApp (EBuiltinIdent "-") [lhs, rhs]
+            parseAddSubRest subExpr
+          _ -> return lhs
+      ) <|> return lhs
+
+-- Parse multiplication and division (highest precedence)
+parseMulDiv :: Parser Expr
+parseMulDiv = do
+  lhs <- parseUnary
+  parseMulDivRest lhs
+  where
+    parseMulDivRest lhs =
+      (do
+        op <- tryConsume (\t -> case t of
+               TSymbol "*" -> True
+               TSymbol "/" -> True
+               _ -> False)
+        case op of
+          Just (TSymbol "*") -> do
+            rhs <- parseUnary
+            let mulExpr = EApp (EBuiltinIdent "*") [lhs, rhs]
+            parseMulDivRest mulExpr
+          Just (TSymbol "/") -> do
+            rhs <- parseUnary
+            let divExpr = EApp (EBuiltinIdent "/") [lhs, rhs]
+            parseMulDivRest divExpr
+          _ -> return lhs
+      ) <|> return lhs
+
+-- Parse unary operators like unary minus or not
+parseUnary :: Parser Expr
+parseUnary = do
+  op <- tryConsume (\t -> case t of
+         TSymbol "-" -> True
+         TKeyword "not" -> True
+         _ -> False)
+  case op of
+    Just (TSymbol "-") -> do
+      expr <- parseUnary
+      return $ EApp (EBuiltinIdent "-") [ELit (LInt 0), expr]  -- Implement unary minus as 0 - expr
+    Just (TKeyword "not") -> do
+      expr <- parseUnary
+      return $ EApp (EBuiltinIdent "not") [expr]
+    Nothing -> parseCall
 
 -- Parse function application with either space or parentheses syntax
 parseCall :: Parser Expr
 parseCall = do
   primary <- parsePrimary
-  parseCall' primary
+  parseCallRest primary
   where
-    parseCall' fun =
-      -- Try parentheses syntax first
+    parseCallRest fun =
+      -- Try parentheses syntax with multiple arguments
       ( do
           _ <- consume (== TSymbol "(")
-          arg <- parseExpr
+          args <- parseArgList
           _ <- consume (== TSymbol ")")
-          let callExpr = EApp fun [arg]
-          parseCall' callExpr
+          let callExpr = EApp fun args
+          parseCallRest callExpr
       )
-        <|>
-        -- Try space-separated syntax for builtins
-        ( case fun of
-            EBuiltinIdent _ -> do
-              arg <- parsePrimary -- Use parsePrimary to avoid left recursion
-              let callExpr = EApp fun [arg]
-              parseCall' callExpr
-            _ -> return fun
-        )
-        <|> return fun
+      <|>
+      -- Try space-separated syntax for builtins
+      ( case fun of
+          EBuiltinIdent _ -> do
+            arg <- parsePrimary -- Use parsePrimary to avoid left recursion
+            let callExpr = EApp fun [arg]
+            parseCallRest callExpr
+          _ -> return fun
+      )
+      <|> return fun
 
 -- Parse a primary expression.
 parsePrimary :: Parser Expr

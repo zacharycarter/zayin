@@ -51,6 +51,36 @@ int exit_inner() { exit(0); }
 
 MAKE_ZERO_ARG_FROM_BUILTIN(exit, exit_inner, int);
 
+struct obj *gc_stats_inner(void) {
+    // Get current GC statistics
+    size_t collections, objects_marked, bytes_freed, allocated;
+    gc_get_stats(&collections, &objects_marked, &bytes_freed, &allocated);
+
+    // Return GC statistics as a hash table
+    struct ht_obj ht = object_ht_obj_new();
+
+    // Create keys and values
+    OBJECT_STRING_OBJ_NEW(k_collections, "collections");
+    OBJECT_INT_OBJ_NEW(v_collections, collections);
+    hash_table_obj_insert(ht.ht, k_collections, v_collections);
+
+    OBJECT_STRING_OBJ_NEW(k_marked, "objects_marked");
+    OBJECT_INT_OBJ_NEW(v_marked, objects_marked);
+    hash_table_obj_insert(ht.ht, k_marked, v_marked);
+
+    OBJECT_STRING_OBJ_NEW(k_freed, "bytes_freed");
+    OBJECT_INT_OBJ_NEW(v_freed, bytes_freed);
+    hash_table_obj_insert(ht.ht, k_freed, v_freed);
+
+    OBJECT_STRING_OBJ_NEW(k_allocs, "allocated_bytes");
+    OBJECT_INT_OBJ_NEW(v_allocs, allocated);
+    hash_table_obj_insert(ht.ht, k_allocs, v_allocs);
+
+    return (struct obj *)&ht;
+}
+
+MAKE_ZERO_ARG_FROM_BUILTIN(gc_stats, gc_stats_inner, struct obj*);
+
 char *obj_to_string_internal(struct obj *val) {
   char *res;
 
@@ -60,7 +90,7 @@ char *obj_to_string_internal(struct obj *val) {
 
   switch (val->tag) {
   case OBJ_CONS:
-    ALLOC_SPRINTF(res, "cons");
+    ALLOC_SPRINTF(res, "(%s . %s)", obj_to_string_internal(((struct cons_obj *)val)->car), obj_to_string_internal(((struct cons_obj *)val)->cdr));
     break;
   case OBJ_CLOSURE:
     ALLOC_SPRINTF(res, "closure|%p", (void *)((struct closure_obj *)val)->fn_1);
