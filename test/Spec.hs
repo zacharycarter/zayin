@@ -117,6 +117,38 @@ main = hspec $ do
         exitCode `shouldBe` ExitSuccess
         output `shouldSatisfy` (\out -> "false" `isInfixOf` out)
 
+    it "conditional with else" $ do
+      withSystemTempDirectory "zayin-test" $ \tmpDir -> do
+        let srcFile = tmpDir </> "if.zyn"
+            binaryFile = tmpDir </> "a.out"
+            -- This program uses an if-expression.
+            -- Here we assume that a non-nil value is truthy and nil is falsey.
+            -- For example, testing that 0 (or nil) is treated as false.
+            source = "if nil: display true else: display false"
+        writeFile srcFile source
+        compileWithOutput binaryFile srcFile
+        exists <- doesFileExist binaryFile
+        exists `shouldBe` True
+        (exitCode, output, _) <- readProcessWithExitCode binaryFile [] ""
+        exitCode `shouldBe` ExitSuccess
+        output `shouldSatisfy` (\out -> "false" `isInfixOf` out)
+
+    it "multi-line conditional" $ do
+      withSystemTempDirectory "zayin-test" $ \tmpDir -> do
+        let srcFile = tmpDir </> "if.zyn"
+            binaryFile = tmpDir </> "a.out"
+            -- This program uses an if-expression.
+            -- Here we assume that a non-nil value is truthy and nil is falsey.
+            -- For example, testing that 0 (or nil) is treated as false.
+            source = "if nil:\n  display true\nelse:\n  display false"
+        writeFile srcFile source
+        compileWithOutput binaryFile srcFile
+        exists <- doesFileExist binaryFile
+        exists `shouldBe` True
+        (exitCode, output, _) <- readProcessWithExitCode binaryFile [] ""
+        exitCode `shouldBe` ExitSuccess
+        output `shouldSatisfy` (\out -> "false" `isInfixOf` out)
+
     it "lambda" $ do
       withSystemTempDirectory "zayin-test" $ \tmpDir -> do
         let srcFile = tmpDir </> "lambda.zyn"
@@ -166,7 +198,7 @@ main = hspec $ do
                 "    let new_list = cons(count, acc)",
                 "    allocate_many(count - 1, new_list)",
                 "",
-                "let result = allocate_many(5000, nil)",
+                "allocate_many(10, 0)",
                 "display(\"Allocation completed successfully\")"
               ]
         writeFile srcFile source

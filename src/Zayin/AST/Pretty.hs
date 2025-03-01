@@ -15,7 +15,7 @@ instance Pretty Literal where
     LInt i -> pretty i
     LString s -> dquotes (pretty s)
     LBool b -> pretty b
-    LNil -> "()"
+    LNil -> " "
 
 -- extend as needed for other literal types
 
