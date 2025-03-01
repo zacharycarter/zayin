@@ -32,22 +32,18 @@ forceDebugLog :: String -> ParserM ()
 forceDebugLog msg = do
   logInfoN $ T.pack $ "PARSER-DEBUG: " ++ msg
 
--- Enhanced logger specifically for let statements
-letDebugLog :: String -> ParserM ()
-letDebugLog msg = do
-  logInfoN $ T.pack $ "LET-DEBUG: " ++ msg
-
 -- Debug logging that works within Parser monad
 logInParser :: String -> Parser ()
 logInParser msg = Parser $ \ts -> do
   forceDebugLog msg
   return (Right ((), ts))
 
--- Let-specific logging that works within Parser monad
-letLogInParser :: String -> Parser ()
-letLogInParser msg = Parser $ \ts -> do
-  letDebugLog msg
-  return (Right ((), ts))
+-- Helper to inspect the token stream without consuming
+inspectTokenStream :: Int -> Parser [Token]
+inspectTokenStream n = Parser $ \ts -> do
+  let visibleTokens = take n ts
+  forceDebugLog $ "TOKENS: " ++ show visibleTokens
+  return (Right (visibleTokens, ts))
 
 --------------------------------------------------------------------------------
 -- Token Definitions and Lexer with Layout Insertion
@@ -127,7 +123,7 @@ nextToken t
               Nothing -> []
               Just (c, rest)
                 | c == '"' -> -- Put string handling first
-                    case T.breakOn "\"" rest of
+                    case T.breakOn (T.pack "\"") rest of
                       (str, rest')
                         | T.null rest' -> error "Unterminated string literal"
                         | otherwise ->
@@ -156,55 +152,14 @@ isPunctuation :: Char -> Bool
 isPunctuation c = c `elem` ("()+-*/=,:;<>!" :: String)
 
 isKeyword :: Text -> Bool
-isKeyword w = w `elem` ["if", "then", "else", "fn", "where", "do", "true", "false", "nil", "not"]
+isKeyword w = w `elem` [T.pack "if", T.pack "then", T.pack "else", T.pack "fn",
+                       T.pack "where", T.pack "do", T.pack "true", T.pack "false",
+                       T.pack "nil", T.pack "not"]
 
 isBuiltin :: Text -> Bool
-isBuiltin w = w `elem` ["display", "not", "gc_collect", "gc_stats", "spawn", "cons",
-                        "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "eq?", "car", "cdr"]
-
---------------------------------------------------------------------------------
--- Expression AST Transformation for Variable Renaming in Macros
---------------------------------------------------------------------------------
-
--- Rename variables in an expression based on a mapping
-renameVarsInExpr :: Map Text Text -> Expr -> Expr
-renameVarsInExpr varMap expr = case expr of
-  EVar name -> case Map.lookup name varMap of
-    Just newName -> EVar newName
-    Nothing -> EVar name
-  ELit lit -> ELit lit
-  EBuiltinIdent name -> EBuiltinIdent name
-  EIf cond thenE elseE ->
-    EIf
-      (renameVarsInExpr varMap cond)
-      (renameVarsInExpr varMap thenE)
-      (renameVarsInExpr varMap elseE)
-  ESet name value ->
-    ESet name (renameVarsInExpr varMap value)
-  ELet bindings body ->
-    let renamedBindings = [(name, renameVarsInExpr varMap val) | (name, val) <- bindings]
-        renamedBody = renameVarsInExprBody varMap body
-     in ELet renamedBindings renamedBody
-  ELam params body ->
-    -- Don't rename variables shadowed by lambda parameters
-    let filteredMap = foldr Map.delete varMap params
-        renamedBody = renameVarsInExprBody filteredMap body
-     in ELam params renamedBody
-  EApp func args ->
-    EApp (renameVarsInExpr varMap func) (map (renameVarsInExpr varMap) args)
-
--- Rename variables in an expression body
-renameVarsInExprBody :: Map Text Text -> ExprBody -> ExprBody
-renameVarsInExprBody varMap (ExprBody exprs finalExpr) =
-  let renamedExprs = map (renameVarsInBodyExpr varMap) exprs
-      renamedFinal = renameVarsInExpr varMap finalExpr
-   in ExprBody renamedExprs renamedFinal
-
--- Rename variables in a body expression
-renameVarsInBodyExpr :: Map Text Text -> ExprBodyExpr -> ExprBodyExpr
-renameVarsInBodyExpr varMap bodyExpr = case bodyExpr of
-  Def name expr -> Def name (renameVarsInExpr varMap expr)
-  Expr expr -> Expr (renameVarsInExpr varMap expr)
+isBuiltin w = w `elem` [T.pack "display", T.pack "not", T.pack "gc_collect", T.pack "gc_stats", T.pack "spawn", T.pack "cons",
+                        T.pack "+", T.pack "-", T.pack "*", T.pack "/", T.pack "%", T.pack "<", T.pack ">",
+                        T.pack "<=", T.pack ">=", T.pack "eq?", T.pack "car", T.pack "cdr"]
 
 --------------------------------------------------------------------------------
 -- Parser Combinators using LoggingT IO (with layout skipping)
@@ -327,586 +282,175 @@ peek = Parser $ \ts -> do
       TNewline -> True
       _ -> False
 
--- Examine and log the token stream - useful for debugging
-inspectTokens :: Parser [Token]
-inspectTokens = Parser $ \ts -> do
-  forceDebugLog $ "INSPECTING TOKENS: " ++ show (take 10 ts)
-  return (Right (ts, ts))
+-- Consume a token of a specific type directly (skipping layout tokens)
+consumeToken :: Token -> Parser ()
+consumeToken expected = do
+  _ <- consume (== expected)
+  return ()
+
+-- Consume a token matching a predicate directly (skipping layout tokens)
+consumeTokenMatching :: (Token -> Bool) -> Parser Token
+consumeTokenMatching = consume
+
+-- Helper to check if a token matches
+isToken :: Token -> Token -> Bool
+isToken expected actual = expected == actual
+
+-- Helper for token types
+isTokenOfType :: (Token -> Bool) -> Token -> Bool
+isTokenOfType pred token = pred token
 
 --------------------------------------------------------------------------------
--- Top-Level Statement Parsers Producing ExprBodyExpr
+-- Expression Parsers
 --------------------------------------------------------------------------------
 
--- Parse a let statement at the top level
-parseLet :: Parser [ExprBodyExpr]
-parseLet = do
-  logInParser "Entering parseLet for top-level let"
-  _ <- consume (== TIdent "let")
-  (name, expr) <- parseBinding
-  logInParser $ "Parsed top-level let binding: " ++ T.unpack name
-  return [Def name expr]
+-- Complete rewrite of parseIf with step-by-step handling of tokens
+parseIf :: Parser Expr
+parseIf = do
+  logInParser "Entering parseIf"
 
--- Direct let parsing specifically for blocks, with comprehensive logging
-parseDirectBlockLet :: Parser ExprBodyExpr
-parseDirectBlockLet = Parser $ \tokens -> do
-  forceDebugLog $ "DIRECT BLOCK LET: Initial tokens: " ++ show (take 5 tokens)
+  -- Consume the 'if' keyword
+  _ <- consume (== TKeyword (T.pack "if"))
 
-  -- For each token operation, directly use runParser and check results to avoid nested errors
-  letResult <- runParser (consume (== TIdent "let")) tokens
-  case letResult of
-    Left err -> do
-      forceDebugLog $ "FAILED to consume 'let' token: " ++ err
-      return (Left err)
-    Right (_, tokens1) -> do
-      forceDebugLog "Successfully consumed 'let' token"
+  -- Parse the condition
+  condition <- parseExpr
 
-      -- Get next token in the stream
-      peekResult <- runParser peek tokens1
-      case peekResult of
-        Right (Just nextToken, _) -> forceDebugLog $ "Next token: " ++ show nextToken
-        _ -> forceDebugLog "No next token"
+  -- Consume the colon
+  _ <- consume (== TSymbol (T.pack ":"))
 
-      -- Try to parse the variable name
-      nameResult <- runParser (consume (\t -> case t of TIdent _ -> True; _ -> False)) tokens1
-      case nameResult of
-        Left err -> do
-          forceDebugLog $ "FAILED to parse variable name: " ++ err
-          return (Left err)
-        Right (nameToken, tokens2) -> do
-          let name = case nameToken of TIdent n -> n; _ -> ""
-          forceDebugLog $ "Successfully parsed variable name: " ++ T.unpack name
+  -- Check if we have a block form by looking for newline
+  hasNewline <- isNextToken TNewline
 
-          -- Directly examine the next token
-          forceDebugLog $ "Before equals sign, tokens: " ++ show (take 3 tokens2)
+  thenExpr <- if hasNewline then do
+    logInParser "Handling block if-then form"
 
-          -- Handle equals sign
-          eqResult <- runParser (consume (== TSymbol "=")) tokens2
-          case eqResult of
-            Left err -> do
-              forceDebugLog $ "CRITICAL FAILURE: Could not parse equals sign: " ++ err
-              -- Try to see what the problem is
-              let actualToken = if null tokens2 then "NO TOKENS" else show (head tokens2)
-              forceDebugLog $ "Current token: " ++ actualToken
+    -- Consume newline and indent
+    _ <- consumeToken TNewline
+    _ <- consumeToken TIndent
 
-              -- Give up with detailed error
-              return (Left $ "Failed to parse equals sign after variable name: " ++ T.unpack name)
+    -- Parse block
+    expr <- parseIndentedBlock
 
-            Right (_, tokens3) -> do
-              forceDebugLog "Successfully parsed equals sign"
+    -- Explicitly consume dedent
+    _ <- many (consumeLayout (== TDedent))
 
-              -- Now try to parse the expression
-              exprResult <- runParser parseExpr tokens3
-              case exprResult of
-                Left err -> do
-                  forceDebugLog $ "Failed to parse expression: " ++ err
-                  return (Left err)
-                Right (expr, tokens4) -> do
-                  forceDebugLog $ "Successfully parsed expression: " ++ show expr
-                  return (Right (Def name expr, tokens4))
+    return expr
+  else do
+    logInParser "Handling inline if-then form"
 
--- | Parse a macro definition of the form:
---    macro name(param1, param2): <body>
-parseMacroDef :: Parser ExprBodyExpr
-parseMacroDef = do
-  tok <- peek
-  case tok of
-    Just (TIdent "macro") -> do
-      _ <- consume (== TIdent "macro")
-      nameToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
-      let macroName = case nameToken of TIdent n -> n; _ -> ""
-      _ <- consume (== TSymbol "(")
-      params <- parseArgs
-      _ <- consume (== TSymbol ")")
-      _ <- consume (== TSymbol ":")
+    -- Parse a single expression (which could be a sequence)
+    parseExpr
 
-      -- Try to parse indented block for macro body - with parameter mapping
-      bodyExpr <- parseIndentedExpr params
+  -- Look for else clause
+  hasElse <- isNextTokenOfType (\t -> case t of
+                                 TKeyword k | k == T.pack "else" -> True
+                                 _ -> False)
 
-      -- Skip any trailing newlines
-      skipEmptyLines
+  if hasElse then do
+    logInParser "Found else clause"
 
-      -- Create the macro definition AST node
-      -- First define a lambda with the macro parameters
-      let macroParamNames = map (\i -> "$" <> T.pack (show i)) [1 .. length params]
-      let macroImpl = ELam macroParamNames (ExprBody [] bodyExpr)
+    -- Consume else and colon
+    _ <- consumeToken (TKeyword (T.pack "else"))
+    _ <- consumeToken (TSymbol (T.pack ":"))
 
-      -- Wrap in a lambda that takes the macro name
-      let macroLambda = ELam [macroName] (ExprBody [] macroImpl)
+    -- Check if else has block form
+    hasElseNewline <- isNextToken TNewline
 
-      -- Return as a definition bound to "macro"
-      return (Def "macro" macroLambda)
-    _ -> Parser $ \_ -> return (Left "Not a macro definition")
+    elseExpr <- if hasElseNewline then do
+      logInParser "Handling block else form"
 
--- Parse an indented expression (used for macro body) with parameter renaming
-parseIndentedExpr :: [Text] -> Parser Expr
-parseIndentedExpr params = Parser $ \ts -> do
-  -- We need to look for an indented expression that starts with "if not"
-  -- Find the next line after the newline
-  let skipNewlines = dropWhile (== TNewline) ts
-  case skipNewlines of
-    (TIndent : rest) -> do
-      case dropWhile isLayout rest of
-        (TKeyword "if" : _) -> do
-          debugLog "Found indented if-expression for macro body"
-          -- First parse the expression normally
-          result <- runParser parseIf rest
-          case result of
-            Left err -> return (Left err)
-            Right (expr, remainingTokens) -> do
-              -- Create variable renaming map from parameters to $1, $2, etc.
-              let paramMap = Map.fromList (zip params (map (\i -> "$" <> T.pack (show i)) [1 .. length params]))
-              -- Rename all variables in the expression according to the mapping
-              let renamedExpr = renameVarsInExpr paramMap expr
-              debugLog $ "Renamed variables in macro body: " <> T.pack (show renamedExpr)
-              return (Right (renamedExpr, remainingTokens))
-        _ -> return (Left "Expected if-expression in macro body")
-    _ -> return (Left "Expected indented block for macro body")
-  where
-    isLayout t = case t of
-      TIndent -> True
-      TDedent -> True
-      TNewline -> True
-      _ -> False
+      -- Consume newline and indent
+      _ <- consumeToken TNewline
+      _ <- consumeToken TIndent
 
--- | Parse a function definition of the form:
---    fn <name>(<args>): <body>
-parseFnDef :: Parser ExprBodyExpr
-parseFnDef = do
-  _ <- consume (== TKeyword "fn")
-  nameToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
-  let name = case nameToken of TIdent n -> n; _ -> ""
-  _ <- consume (== TSymbol "(")
-  args <- parseArgs
-  _ <- consume (== TSymbol ")")
-  _ <- consume (== TSymbol ":")
-  bodyExpr <- parseExpr
-  -- Wrap the function body in a lambda with no definitions.
-  return (Def name (ELam args (ExprBody [] bodyExpr)))
+      -- Parse block
+      expr <- parseIndentedBlock
 
--- | Parse a comma-separated list of arguments (identifiers).
-parseArgs :: Parser [Text]
-parseArgs =
-  ( do
-      argToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
-      let arg = case argToken of TIdent a -> a; _ -> ""
-      rest <-
-        many
-          ( do
-              _ <- consume (== TSymbol ",")
-              tok <- consume (\t -> case t of TIdent _ -> True; _ -> False)
-              return (case tok of TIdent a -> a; _ -> "")
-          )
-      return (arg : rest)
-  )
-    <|> return []
+      -- Explicitly consume dedent
+      _ <- many (consumeLayout (== TDedent))
 
--- Parse a comma-separated list of expressions for function arguments
-parseArgList :: Parser [Expr]
-parseArgList =
-  ( do
-      firstArg <- parseExpr
-      restArgs <-
-        many
-          ( do
-              _ <- consume (== TSymbol ",")
-              parseExpr
-          )
-      return (firstArg : restArgs)
-  )
-  <|> return []
+      return expr
+    else do
+      logInParser "Handling inline else form"
 
--- Define a parseBlock function that handles indented blocks
-parseBlock :: Parser Expr
-parseBlock = do
-  logInParser "Entering parseBlock"
-  -- Expect an indentation for the block
-  _ <- consumeLayout (== TIndent)
+      -- Parse a single expression (which could be a sequence)
+      parseExpr
 
-  -- Parse all statements in the block
+    -- Return the complete if-else expression
+    return $ EIf condition thenExpr elseExpr
+  else do
+    logInParser "No else clause, using nil"
+    return $ EIf condition thenExpr (ELit LNil)
+
+-- Helper for parsing indented blocks (multiple statements)
+parseIndentedBlock :: Parser Expr
+parseIndentedBlock = do
+  logInParser "Parsing indented block"
+
+  -- Parse statements until dedent
   stmts <- parseStatementsUntilDedent
 
-  -- Log what we found
-  logInParser $ "Block statements parsed: " ++ show (length stmts)
-
-  -- Convert the statements into a proper expression
+  -- Process statements into an expression
   case stmts of
     [] -> do
       logInParser "Empty block, returning nil"
-      return (ELit LNil)  -- Empty block
+      return (ELit LNil)
     [Expr e] -> do
       logInParser "Single expression block"
-      return e      -- Single expression, no need for wrapping
+      return e
     _ -> do
-      -- Multiple statements need to be wrapped in a lambda
       let (defs, exprs) = partitionDefs stmts
       let finalExpr = if null exprs then ELit LNil else last exprs
-      logInParser $ "Complex block with " ++ show (length defs) ++ " defs and " ++ show (length exprs) ++ " exprs"
+      logInParser "Multiple statements in block"
       return $ EApp (ELam [] (ExprBody defs finalExpr)) []
 
--- Enhanced statement parsing with detailed logging
-parseStatementsUntilDedent :: Parser [ExprBodyExpr]
-parseStatementsUntilDedent = do
-  logInParser "Entering parseStatementsUntilDedent"
-
-  -- First look specifically for a DEDENT token without skipping layout tokens
-  isDedent <- checkForDedent
-  if isDedent then do
-    logInParser "Found DEDENT token, ending block"
-    -- Consume the dedent and return empty list
-    _ <- consumeLayout (== TDedent)
-    return []
-  else do
-    -- Not at a dedent, check what kind of token we have
-    mTok <- peek
-    case mTok of
-      Nothing -> do
-        logInParser "No tokens left, ending block"
-        return []  -- End of input
-
-      Just (TIdent "let") -> do
-        logInParser "Found 'let' in block, special handling activated"
-
-        -- Consume 'let' token
-        _ <- consume (== TIdent "let")
-
-        -- Parse variable name
-        nameToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
-        let name = case nameToken of TIdent n -> n; _ -> ""
-        logInParser $ "Parsed let variable name: " ++ T.unpack name
-
-        -- Consume equals sign
-        _ <- consume (== TSymbol "=")
-        logInParser "Successfully consumed equals sign"
-
-        -- Parse expression after equals
-        expr <- parseExpr
-        logInParser "Successfully parsed let expression value"
-
-        -- Skip newlines and parse rest of block
-        _ <- many (consumeLayout (== TNewline))
-        rest <- parseStatementsUntilDedent
-
-        -- Return definition + rest of statements
-        return (Def name expr : rest)
-
-      Just _ -> do
-        -- Parse a regular statement (non-let)
-        stmt <- parseTopLevelStmt
-        logInParser "Parsed regular statement in block"
-
-        -- Skip newlines
-        _ <- many (consumeLayout (== TNewline))
-
-        -- Parse rest of statements
-        rest <- parseStatementsUntilDedent
-
-        return (stmt : rest)
-
--- Helper to check for a DEDENT token without consuming it
-checkForDedent :: Parser Bool
-checkForDedent = Parser $ \ts -> do
-  -- Only look at the first token
-  let result = case ts of
-        (TDedent:_) -> True
-        _ -> False
-  forceDebugLog $ "checkForDedent result: " ++ show result ++ " from token: " ++
-      (if null ts then "EMPTY" else show (head ts))
-  return (Right (result, ts))
-
--- Parse a let statement inside a block with enhanced debugging
-parseBlockLet :: Parser ExprBodyExpr
-parseBlockLet = Parser $ \tokens -> do
-  debugLog "*** ENTERING parseBlockLet ***"
-  debugLog $ "Initial tokens: " <> T.pack (show (take 10 tokens))
-
-  -- Consume the "let" token
-  letResult <- runParser (consume (== TIdent "let")) tokens
-  case letResult of
-    Left err -> return (Left $ "Failed to consume 'let': " ++ err)
-    Right (letToken, tokens1) -> do
-      debugLog $ "Successfully consumed let token: " <> T.pack (show letToken)
-
-      -- Show next token before parsing name
-      nextTokens1 <- runParser peek tokens1
-      case nextTokens1 of
-        Right (mToken, _) -> debugLog $ "Next token before parsing var name: " <> T.pack (show mToken)
-        _ -> return ()
-
-      -- Parse name
-      nameResult <- runParser (consume (\t -> case t of TIdent _ -> True; _ -> False)) tokens1
-      case nameResult of
-        Left err -> return (Left $ "Failed to parse variable name: " ++ err)
-        Right (nameToken, tokens2) -> do
-          let name = case nameToken of TIdent n -> n; _ -> ""
-          debugLog $ "Successfully consumed var name: " <> name
-
-          -- Show next token before parsing equals
-          nextTokens2 <- runParser peek tokens2
-          case nextTokens2 of
-            Right (mToken, _) -> debugLog $ "Next token before equals sign: " <> T.pack (show mToken)
-            _ -> return ()
-
-          -- Parse equals sign explicitly with detailed error handling
-          eqResult <- runParser (consume (== TSymbol "=")) tokens2
-          case eqResult of
-            Left err -> do
-              debugLog $ "FAILED to consume equals sign: " <> T.pack err
-              -- Examine the tokens more closely
-              let visibleTokens = take 5 $ dropWhile isLayout tokens2
-              debugLog $ "Current tokens: " <> T.pack (show visibleTokens)
-              -- Fail with more information
-              return $ Left $ "Failed to parse equals sign: " ++ err ++ " Tokens: " ++ show visibleTokens
-            Right (eqToken, tokens3) -> do
-              debugLog $ "Successfully consumed equals sign: " <> T.pack (show eqToken)
-
-              -- Show next token before parsing expression
-              nextTokens3 <- runParser peek tokens3
-              case nextTokens3 of
-                Right (mToken, _) -> debugLog $ "Next token before expression: " <> T.pack (show mToken)
-                _ -> return ()
-
-              -- Parse value expression
-              exprResult <- runParser parseExpr tokens3
-              case exprResult of
-                Left err -> return (Left $ "Failed to parse expression: " ++ err)
-                Right (expr, tokens4) -> do
-                  debugLog $ "Successfully parsed expression: " <> T.pack (show expr)
-
-                  -- Return as a definition
-                  debugLog "*** LEAVING parseBlockLet SUCCESSFULLY ***"
-                  return (Right (Def name expr, tokens4))
-  where
-    isLayout t = case t of
-      TIndent -> True
-      TDedent -> True
-      TNewline -> True
-      _ -> False
-
--- Restore parseExprList for handling semicolon-separated expressions
-parseExprList :: Parser Expr
-parseExprList = do
-  -- Parse the first expression
-  first <- parseExpr
-
-  -- See if there's a semicolon followed by more expressions
-  semi <- tryConsume (== TSymbol ";")
-  case semi of
-    Just _ -> do
-      -- Parse the rest of the expressions
-      rest <- parseExprList
-      -- Return a sequence where expressions are evaluated in order
-      return $ EApp (ELam ["_"] (ExprBody [] rest)) [first]
-    Nothing -> return first
-
--- Parse a single statement without top-level concerns
-parseTopLevelStmt :: Parser ExprBodyExpr
-parseTopLevelStmt = parseMacroDef <|> parseFnDef <|> parseExprStmt
-  where
-    parseExprStmt = do
-      e <- parseExprList  -- Use parseExprList to handle semicolons
-      return (Expr e)
-
--- | Parse a sequence of top-level statements.
-parseProgramExprs :: Parser [ExprBodyExpr]
-parseProgramExprs = do
-  _ <- skipEmptyLines
-  result <- parseMultipleTopStmts
-  _ <- skipEmptyLines
-  return result
-
--- Parse multiple top-level statements separated by empty lines
-parseMultipleTopStmts :: Parser [ExprBodyExpr]
-parseMultipleTopStmts = do
-  -- Try to parse a statement
+-- Helper to check if the next token is of a specific type without consuming it
+isNextToken :: Token -> Parser Bool
+isNextToken expected = do
   mTok <- peek
-  case mTok of
-    Just TEOF -> return [] -- End of input
-    Just _ -> do
-      -- Parse one statement
-      stmts <- parseTopStmt
-      -- Skip any trailing newlines/empty lines
-      _ <- skipEmptyLines
-      -- Parse more statements
-      rest <- parseMultipleTopStmts
-      return (stmts ++ rest)
-    Nothing -> return [] -- No more tokens
+  return $ case mTok of
+    Just tok -> tok == expected
+    Nothing -> False
 
--- Update parseTopStmt to handle multiple statements from let
-parseTopStmt :: Parser [ExprBodyExpr]
-parseTopStmt =
-  parseLet <|> -- Try to parse let first, returning multiple Def expressions
-  (do
-    stmt <- parseTopLevelStmt
-    return [stmt]) -- Wrap single statements in a list
+-- Helper to check if the next token satisfies a predicate without consuming it
+isNextTokenOfType :: (Token -> Bool) -> Parser Bool
+isNextTokenOfType pred = do
+  mTok <- peek
+  return $ case mTok of
+    Just tok -> pred tok
+    Nothing -> False
 
---------------------------------------------------------------------------------
--- Expression Parsers Producing Our Actual AST
---------------------------------------------------------------------------------
-
--- Parse a lambda expression (anonymous function)
-parseLambda :: Parser Expr
-parseLambda = do
-  _ <- consume (== TSymbol "(")
-  _ <- consume (== TKeyword "fn")
-  _ <- consume (== TSymbol "(")
-  args <- parseArgs
-  _ <- consume (== TSymbol ")")
-  _ <- consume (== TSymbol ":")
-  body <- parseExpr
-  _ <- consume (== TSymbol ")")
-  return (ELam args (ExprBody [] body))
-
--- Parse a macro usage expression (unless(condition): body)
-parseMacroUsage :: Parser Expr
-parseMacroUsage = do
-  macroName <- consume (\t -> case t of TIdent _ -> True; _ -> False)
-  let name = case macroName of TIdent n -> n; _ -> ""
-  _ <- consume (== TSymbol "(")
-  arg1 <- parseExpr
-  _ <- consume (== TSymbol ")")
-  _ <- consume (== TSymbol ":")
-  arg2 <- parseExpr
-  return (EApp (EVar name) [arg1, arg2])
-
--- This function determines if the next tokens form an indented block
--- and parses accordingly
-parseIndentedOrPlain :: Parser Expr
-parseIndentedOrPlain = Parser $ \tokens -> do
-  -- First, skip any immediate newlines
-  let afterNewlines = dropWhile (== TNewline) tokens
-
-  -- Check if the next token is an indent
-  if not (null afterNewlines) && head afterNewlines == TIndent then do
-    -- We found an indented block
-    forceDebugLog "Found indented block - using parseBlock"
-    runParser parseBlock tokens
-  else do
-    -- No indented block, parse a plain expression
-    forceDebugLog "No indented block - parsing single expression"
-    runParser parseExpr tokens
-
-
--- Expressions include if-expressions, addition, function calls, and primaries.
+-- Parse basic expressions
 parseExpr :: Parser Expr
 parseExpr = do
   nextTok <- peek
   case nextTok of
-    Just (TKeyword "if") -> parseIf
-    Just (TIdent "unless") -> parseMacroUsage
-    -- No let case here, as let is handled specially in blocks
-    _ -> parseComparison
+    Just (TKeyword k) | k == T.pack "if" -> parseIf
+    Just (TIdent i) | i == T.pack "unless" -> parseMacroUsage
+    _ -> parseComparison  -- Direct to comparison, no sequence handling here
 
--- Fix parseIf to handle indented blocks properly
-parseIf :: Parser Expr
-parseIf = do
-  logInParser "Entering parseIf"
-  _ <- consume (== TKeyword "if")
+-- Parse a semicolon-separated sequence of expressions
+parseExprSequence :: Parser Expr
+parseExprSequence = do
+  logInParser "Entering parseExprSequence"
 
-  -- Parse condition
-  logInParser "Parsing if condition"
-  cond <- parseComparison
+  -- Parse the first expression
+  firstExpr <- parseComparison
 
-  -- Expect colon
-  _ <- consume (== TSymbol ":")
-  logInParser "Consumed colon after condition"
+  -- Check if followed by semicolon
+  hasSemicolon <- isNextToken (TSymbol (T.pack ";"))
 
-  -- Check for newline specifically
-  hasNewline <- checkForNewline
-  thenExpr <- if hasNewline then do
-    logInParser "Found newline after if condition"
+  if hasSemicolon then do
+    -- Consume the semicolon
+    _ <- consumeToken (TSymbol (T.pack ";"))
 
-    -- Consume the newline and indent
-    _ <- consumeLayout (== TNewline)
-    _ <- consumeLayout (== TIndent)
+    -- Parse the rest of the sequence
+    restExpr <- parseExprSequence
 
-    -- Parse all statements until dedent
-    stmts <- parseStatementsUntilDedent
-
-    -- Process them into a proper block expression
-    case stmts of
-      [] -> do
-        logInParser "Empty then-block, returning nil"
-        return (ELit LNil)
-      [Expr e] -> do
-        logInParser "Single expression then-block"
-        return e
-      _ -> do
-        let (defs, exprs) = partitionDefs stmts
-        let finalExpr = if null exprs then ELit LNil else last exprs
-        logInParser "Complex then-block with definitions"
-        return $ EApp (ELam [] (ExprBody defs finalExpr)) []
+    -- Return a lambda that evaluates expressions in sequence
+    return $ EApp (ELam [T.pack "_"] (ExprBody [] restExpr)) [firstExpr]
   else do
-    logInParser "No newline, parsing single expression for then branch"
-    parseExpr
-
-  -- Parse optional else clause
-  mElse <- tryConsume (== TKeyword "else")
-  case mElse of
-    Just _ -> do
-      logInParser "Found else clause"
-      _ <- consume (== TSymbol ":")
-      logInParser "Consumed colon after else"
-
-      -- Check for newline after else:
-      hasNewlineElse <- checkForNewline
-      elseExpr <- if hasNewlineElse then do
-        logInParser "Found newline after else:"
-
-        -- Consume the newline and indent
-        _ <- consumeLayout (== TNewline)
-        _ <- consumeLayout (== TIndent)
-
-        -- Parse all statements until dedent
-        stmts <- parseStatementsUntilDedent
-
-        -- Process them into a proper block expression
-        case stmts of
-          [] -> do
-            logInParser "Empty else-block, returning nil"
-            return (ELit LNil)
-          [Expr e] -> do
-            logInParser "Single expression else-block"
-            return e
-          _ -> do
-            let (defs, exprs) = partitionDefs stmts
-            let finalExpr = if null exprs then ELit LNil else last exprs
-            logInParser "Complex else-block with definitions"
-            return $ EApp (ELam [] (ExprBody defs finalExpr)) []
-      else do
-        logInParser "No newline, parsing single expression for else branch"
-        parseExpr
-
-      logInParser "Completed if-else expression"
-      return (EIf cond thenExpr elseExpr)
-    Nothing -> do
-      logInParser "No else clause, using nil for else branch"
-      return (EIf cond thenExpr (ELit LNil))
-
--- Helper to check for a NEWLINE token without consuming it
-checkForNewline :: Parser Bool
-checkForNewline = Parser $ \ts -> do
-  -- Only look at the first token
-  let result = case ts of
-        (TNewline:_) -> True
-        _ -> False
-  forceDebugLog $ "checkForNewline result: " ++ show result ++ " from token: " ++
-      (if null ts then "EMPTY" else show (head ts))
-  return (Right (result, ts))
-
--- Helper for parsing separated lists
-sepBy :: Parser a -> Parser b -> Parser [a]
-sepBy p sep =
-  ( do
-      first <- p
-      rest <-
-        many
-          ( do
-              _ <- sep
-              p
-          )
-      return (first : rest)
-  )
-    <|> return []
+    return firstExpr
 
 -- Parse comparisons (lowest precedence)
 parseComparison :: Parser Expr
@@ -914,28 +458,21 @@ parseComparison = do
   lhs <- parseAddSub
   (do
     op <- tryConsume (\t -> case t of
-           TSymbol s -> s `elem` ["<", ">", "<=", ">=", "=="]
+           TSymbol s -> s `elem` [T.pack "<", T.pack ">", T.pack "<=", T.pack ">=", T.pack "=="]
            _ -> False)
     case op of
       Just tok -> do
         rhs <- parseAddSub
         let opName = case tok of
-              TSymbol "<=" -> "<="
-              TSymbol ">=" -> ">="
-              TSymbol "<" -> "<"
-              TSymbol ">" -> ">"
-              TSymbol "==" -> "eq?"
+              TSymbol s | s == T.pack "<=" -> T.pack "<="
+              TSymbol s | s == T.pack ">=" -> T.pack ">="
+              TSymbol s | s == T.pack "<" -> T.pack "<"
+              TSymbol s | s == T.pack ">" -> T.pack ">"
+              TSymbol s | s == T.pack "==" -> T.pack "eq?"
               _ -> error "Unknown comparison operator"
         return $ EApp (EBuiltinIdent opName) [lhs, rhs]
       Nothing -> return lhs
    ) <|> return lhs
-
--- Helper to consume a comparison operator
-consumeComparisonOp :: Parser Token
-consumeComparisonOp =
-  consume (\t -> case t of
-              TSymbol s -> s `elem` ["<", ">", "<=", ">=", "=="]
-              _ -> False)
 
 -- Parse addition and subtraction (middle precedence)
 parseAddSub :: Parser Expr
@@ -946,17 +483,17 @@ parseAddSub = do
     parseAddSubRest lhs =
       (do
         op <- tryConsume (\t -> case t of
-               TSymbol "+" -> True
-               TSymbol "-" -> True
+               TSymbol s | s == T.pack "+" -> True
+               TSymbol s | s == T.pack "-" -> True
                _ -> False)
         case op of
-          Just (TSymbol "+") -> do
+          Just (TSymbol s) | s == T.pack "+" -> do
             rhs <- parseMulDiv
-            let addExpr = EApp (EBuiltinIdent "+") [lhs, rhs]
+            let addExpr = EApp (EBuiltinIdent (T.pack "+")) [lhs, rhs]
             parseAddSubRest addExpr
-          Just (TSymbol "-") -> do
+          Just (TSymbol s) | s == T.pack "-" -> do
             rhs <- parseMulDiv
-            let subExpr = EApp (EBuiltinIdent "-") [lhs, rhs]
+            let subExpr = EApp (EBuiltinIdent (T.pack "-")) [lhs, rhs]
             parseAddSubRest subExpr
           _ -> return lhs
       ) <|> return lhs
@@ -970,17 +507,17 @@ parseMulDiv = do
     parseMulDivRest lhs =
       (do
         op <- tryConsume (\t -> case t of
-               TSymbol "*" -> True
-               TSymbol "/" -> True
+               TSymbol s | s == T.pack "*" -> True
+               TSymbol s | s == T.pack "/" -> True
                _ -> False)
         case op of
-          Just (TSymbol "*") -> do
+          Just (TSymbol s) | s == T.pack "*" -> do
             rhs <- parseUnary
-            let mulExpr = EApp (EBuiltinIdent "*") [lhs, rhs]
+            let mulExpr = EApp (EBuiltinIdent (T.pack "*")) [lhs, rhs]
             parseMulDivRest mulExpr
-          Just (TSymbol "/") -> do
+          Just (TSymbol s) | s == T.pack "/" -> do
             rhs <- parseUnary
-            let divExpr = EApp (EBuiltinIdent "/") [lhs, rhs]
+            let divExpr = EApp (EBuiltinIdent (T.pack "/")) [lhs, rhs]
             parseMulDivRest divExpr
           _ -> return lhs
       ) <|> return lhs
@@ -989,16 +526,16 @@ parseMulDiv = do
 parseUnary :: Parser Expr
 parseUnary = do
   op <- tryConsume (\t -> case t of
-         TSymbol "-" -> True
-         TKeyword "not" -> True
+         TSymbol s | s == T.pack "-" -> True
+         TKeyword k | k == T.pack "not" -> True
          _ -> False)
   case op of
-    Just (TSymbol "-") -> do
+    Just (TSymbol s) | s == T.pack "-" -> do
       expr <- parseUnary
-      return $ EApp (EBuiltinIdent "-") [ELit (LInt 0), expr]  -- Implement unary minus as 0 - expr
-    Just (TKeyword "not") -> do
+      return $ EApp (EBuiltinIdent (T.pack "-")) [ELit (LInt 0), expr]
+    Just (TKeyword k) | k == T.pack "not" -> do
       expr <- parseUnary
-      return $ EApp (EBuiltinIdent "not") [expr]
+      return $ EApp (EBuiltinIdent (T.pack "not")) [expr]
     Nothing -> parseCall
 
 -- Parse function application with either space or parentheses syntax
@@ -1009,33 +546,114 @@ parseCall = do
   where
     parseCallRest fun =
       -- Try parentheses syntax with multiple arguments
-      ( do
-          _ <- consume (== TSymbol "(")
+      (do
+          _ <- consume (== TSymbol (T.pack "("))
           args <- parseArgList
-          _ <- consume (== TSymbol ")")
+          _ <- consume (== TSymbol (T.pack ")"))
           let callExpr = EApp fun args
-          parseCallRest callExpr
+
+          -- IMPORTANT: Only recurse if we see another open paren
+          mNextTok <- peek
+          case mNextTok of
+            Just (TSymbol s) | s == T.pack "(" -> parseCallRest callExpr
+            _ -> return callExpr
       )
       <|>
       -- Try space-separated syntax for builtins
-      ( case fun of
+      (case fun of
           EBuiltinIdent _ -> do
-            arg <- parsePrimary -- Use parsePrimary to avoid left recursion
-            let callExpr = EApp fun [arg]
-            parseCallRest callExpr
+            -- Check if the next token is suitable for an argument
+            mNextTok <- peek
+            case mNextTok of
+              Just (TSymbol s) | s `elem` [T.pack ")", T.pack ",", T.pack ";", T.pack ":"] -> return fun
+              Just TNewline -> return fun
+              Just TDedent -> return fun
+              Just TEOF -> return fun
+              _ -> do
+                arg <- parsePrimary
+                let callExpr = EApp fun [arg]
+                parseCallRest callExpr
           _ -> return fun
       )
-      <|> return fun
+      <|> (return fun)  -- Always provide a safe fallback
 
--- Parse a primary expression.
 parsePrimary :: Parser Expr
-parsePrimary = parseLambda <|> parseParens <|> parseTermSimple
+parsePrimary = parseLambda <|> parseParens <|> parseMacroUsage <|> parseTermSimple
   where
     parseParens = do
-      _ <- consume (== TSymbol "(")
+      _ <- consume (== TSymbol (T.pack "("))
       e <- parseExpr
-      _ <- consume (== TSymbol ")")
+      _ <- consume (== TSymbol (T.pack ")"))
       return e
+
+-- Parse a lambda expression (anonymous function)
+parseLambda :: Parser Expr
+parseLambda = do
+  _ <- consume (== TSymbol (T.pack "("))
+  _ <- consume (== TKeyword (T.pack "fn"))
+  _ <- consume (== TSymbol (T.pack "("))
+  args <- parseArgs
+  _ <- consume (== TSymbol (T.pack ")"))
+  _ <- consume (== TSymbol (T.pack ":"))
+  body <- parseExpr
+  _ <- consume (== TSymbol (T.pack ")"))
+  return (ELam args (ExprBody [] body))
+
+-- Parse a macro definition
+parseMacroDef :: Parser ExprBodyExpr
+parseMacroDef = do
+  logInParser "Entering parseMacroDef"
+
+  -- Consume the 'macro' token
+  _ <- consume (== TIdent (T.pack "macro"))
+
+  -- Parse macro name
+  nameToken <- consumeTokenMatching (\t -> case t of TIdent _ -> True; _ -> False)
+  let macroName = case nameToken of TIdent n -> n; _ -> T.empty
+
+  -- Parse parameter list
+  _ <- consume (== TSymbol (T.pack "("))
+  params <- parseArgs
+  _ <- consume (== TSymbol (T.pack ")"))
+
+  -- Consume colon
+  _ <- consume (== TSymbol (T.pack ":"))
+
+  -- Check if we have a block form
+  hasNewline <- isNextToken TNewline
+
+  bodyExpr <- if hasNewline then do
+    -- Consume newline and indent
+    _ <- consumeToken TNewline
+    _ <- consumeToken TIndent
+
+    -- Parse the body (an indented block)
+    expr <- parseIndentedBlock
+
+    return expr
+  else do
+    -- Inline form
+    parseExpr
+
+  -- Create macro definition
+  let macroParamNames = map (\i -> T.pack ("$" ++ show i)) [1 .. length params]
+      macroImpl = ELam macroParamNames (ExprBody [] bodyExpr)
+      macroLambda = ELam [macroName] (ExprBody [] macroImpl)
+
+  -- Return definition bound to "macro"
+  return (Def (T.pack "macro") macroLambda)
+
+-- Parse a macro usage expression (unless(condition): body)
+parseMacroUsage :: Parser Expr
+parseMacroUsage = do
+  macroName <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+  let name = case macroName of TIdent n -> n; _ -> T.empty
+  _ <- consume (== TSymbol (T.pack "("))
+  arg1 <- parseExpr
+  _ <- consume (== TSymbol (T.pack ")"))
+  _ <- consume (== TSymbol (T.pack ":"))
+  arg2 <- parseExpr
+  return (EApp (EVar name) [arg1, arg2])
 
 -- Parse a simple term: identifier or number.
 parseTermSimple :: Parser Expr
@@ -1047,18 +665,193 @@ parseTermSimple = do
         then return (EBuiltinIdent name)
         else return (EVar name)
     TNumber n -> return (ELit (LInt n))
-    TString s -> return (ELit (LString s)) -- Handle string literals
-    TKeyword "nil" -> return (ELit LNil)
-    TKeyword "true" -> return (ELit (LBool True))
-    TKeyword "false" -> return (ELit (LBool False))
+    TString s -> return (ELit (LString s))
+    TKeyword k | k == T.pack "nil" -> return (ELit LNil)
+    TKeyword k | k == T.pack "true" -> return (ELit (LBool True))
+    TKeyword k | k == T.pack "false" -> return (ELit (LBool False))
     _ -> Parser $ \_ -> return (Left "Expected a term")
   where
     isTerm tok = case tok of
       TIdent _ -> True
       TNumber _ -> True
       TString _ -> True
-      TKeyword k -> k `elem` ["nil", "true", "false"]
+      TKeyword k -> k `elem` [T.pack "nil", T.pack "true", T.pack "false"]
       _ -> False
+
+--------------------------------------------------------------------------------
+-- Top-Level Statement Parsers
+--------------------------------------------------------------------------------
+
+-- Enhanced statement parsing with detailed logging and correct handling of DEDENTs
+parseStatementsUntilDedent :: Parser [ExprBodyExpr]
+parseStatementsUntilDedent = do
+  logInParser "Entering parseStatementsUntilDedent"
+
+  -- Check if we're at a DEDENT token
+  isDedent <- isNextToken TDedent
+  if isDedent then do
+    logInParser "Found DEDENT, ending block"
+    -- Consume the DEDENT token
+    _ <- consumeToken TDedent
+    return []
+  else do
+    -- Check for different statement types
+    nextTok <- peek
+
+    stmt <- case nextTok of
+      -- Handle let binding inside a block
+      Just (TIdent i) | i == T.pack "let" -> do
+        logInParser "Found let binding in block"
+        -- Consume let token
+        _ <- consumeToken (TIdent (T.pack "let"))
+
+        -- Parse variable name
+        nameToken <- consumeTokenMatching (\t -> case t of TIdent _ -> True; _ -> False)
+        let name = case nameToken of TIdent n -> n; _ -> T.empty
+
+        -- Consume equals sign
+        _ <- consumeToken (TSymbol (T.pack "="))
+
+        -- Parse the expression
+        expr <- parseExpr
+
+        -- Return definition
+        return $ Def name expr
+
+      -- For other statement types
+      _ -> parseTopLevelStmt
+
+    -- Skip newlines
+    _ <- many (consumeLayout (== TNewline))
+
+    -- Parse remaining statements
+    rest <- parseStatementsUntilDedent
+
+    -- Return the statement and the rest
+    return (stmt : rest)
+
+-- Parse a comma-separated list of arguments (identifiers).
+parseArgs :: Parser [Text]
+parseArgs =
+  ( do
+      argToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+      let arg = case argToken of TIdent a -> a; _ -> T.empty
+      rest <-
+        many
+          ( do
+              _ <- consume (== TSymbol (T.pack ","))
+              tok <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+              return (case tok of TIdent a -> a; _ -> T.empty)
+          )
+      return (arg : rest)
+  )
+    <|> return []
+
+-- Parse a comma-separated list of expressions for function arguments
+parseArgList :: Parser [Expr]
+parseArgList =
+  ( do
+      firstArg <- parseExpr
+      restArgs <-
+        many
+          ( do
+              _ <- consume (== TSymbol (T.pack ","))
+              parseExpr
+          )
+      return (firstArg : restArgs)
+  )
+  <|> return []
+
+-- | Parse a function definition of the form:
+--    fn <name>(<args>): <body>
+parseFnDef :: Parser ExprBodyExpr
+parseFnDef = do
+  logInParser "Entering parseFnDef"
+  _ <- consume (== TKeyword (T.pack "fn"))
+  nameToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
+  let name = case nameToken of TIdent n -> n; _ -> T.empty
+  _ <- consume (== TSymbol (T.pack "("))
+  args <- parseArgs
+  _ <- consume (== TSymbol (T.pack ")"))
+  _ <- consume (== TSymbol (T.pack ":"))
+  bodyExpr <- parseExpr
+  -- Wrap the function body in a lambda with no definitions.
+  return (Def name (ELam args (ExprBody [] bodyExpr)))
+
+-- Parse a top-level let binding: let name = expr
+parseTopLevelLet :: Parser ExprBodyExpr
+parseTopLevelLet = do
+  logInParser "Entering parseTopLevelLet"
+
+  -- Consume the 'let' token
+  _ <- consume (== TIdent (T.pack "let"))
+
+  -- Parse the variable name
+  nameToken <- consumeTokenMatching (\t -> case t of TIdent _ -> True; _ -> False)
+  let name = case nameToken of TIdent n -> n; _ -> T.empty
+
+  -- Consume equals sign
+  _ <- consume (== TSymbol (T.pack "="))
+
+  -- Parse the expression
+  expr <- parseExpr
+
+  -- Return a definition
+  return (Def name expr)
+
+-- Parse a single statement without top-level concerns
+parseTopLevelStmt :: Parser ExprBodyExpr
+parseTopLevelStmt =
+  parseMacroDef <|> parseTopLevelLet <|> parseFnDef <|> parseExprStmt
+  where
+    parseExprStmt = do
+      e <- parseExpr
+      return (Expr e)
+
+-- | Parse a sequence of top-level statements.
+parseProgramExprs :: Parser [ExprBodyExpr]
+parseProgramExprs = do
+  _ <- skipEmptyLines
+  parseMultipleTopStmts
+
+-- Parse multiple top-level statements separated by empty lines
+parseMultipleTopStmts :: Parser [ExprBodyExpr]
+parseMultipleTopStmts = do
+  logInParser "Entering parseMultipleTopStmts"
+
+  -- Check if we've reached end of input
+  isEOF <- isNextToken TEOF
+
+  if isEOF then do
+    logInParser "Reached end of file, returning empty list"
+    return []
+  else do
+    -- Parse a single statement first
+    logInParser "Parsing top-level statement"
+    stmt <- parseTopLevelStmt
+
+    -- Check for a semicolon which indicates multiple statements on one line
+    hasSemicolon <- isNextToken (TSymbol (T.pack ";"))
+
+    if hasSemicolon then do
+      logInParser "Found semicolon, parsing next statement on same line"
+      -- Consume the semicolon
+      _ <- consumeToken (TSymbol (T.pack ";"))
+
+      -- Parse the rest of the statements (after the semicolon)
+      rest <- parseMultipleTopStmts
+
+      -- Return this statement and the rest
+      return (stmt : rest)
+    else do
+      -- No semicolon, skip any trailing newlines/empty lines
+      _ <- skipEmptyLines
+
+      -- Continue parsing the rest of the top-level statements
+      rest <- parseMultipleTopStmts
+
+      -- Return this statement and the rest
+      return (stmt : rest)
 
 --------------------------------------------------------------------------------
 -- Helpers to Combine Top-Level Statements
@@ -1095,7 +888,7 @@ combineStmts stmts =
   where
     -- Chain expressions with continuations that don't depend on earlier results
     makeSequenceWithExit e1 e2 =
-      EApp (ELam ["_"] (ExprBody [] e2)) [e1]
+      EApp (ELam [T.pack "_"] (ExprBody [] e2)) [e1]
 
 --------------------------------------------------------------------------------
 -- Top-Level parseProgram Function
@@ -1141,39 +934,3 @@ parseWithDebug debugMode input = do
 -- Updated top-level API for backward compatibility
 parseProgram :: Text -> IO (Either String Expr)
 parseProgram = parseWithDebug False
-
--- Helper to parse a binding (name = expr)
-parseBinding :: Parser (T.Text, Expr)
-parseBinding = do
-  logInParser "Entering parseBinding"
-  nameToken <- consume (\t -> case t of TIdent _ -> True; _ -> False)
-  let name = case nameToken of TIdent n -> n; _ -> ""
-  logInParser $ "Parsed binding name: " ++ T.unpack name
-
-  -- Peek at the next token before trying to consume equals
-  mNextToken <- peek
-  logInParser $ "Next token before equals: " ++ show mNextToken
-
-  -- Try to consume equals sign
-  equalToken <- consume (== TSymbol "=")
-  logInParser $ "Consumed equals sign: " ++ show equalToken
-
-  -- Parse the expression
-  expr <- parseExpr
-  logInParser "Parsed binding expression"
-
-  return (name, expr)
-
--- Helper to parse a binding on a single line with no comma
-parseBindingLine :: Parser (T.Text, Expr)
-parseBindingLine = do
-  binding <- parseBinding
-  _ <- consumeLayout (== TNewline)
-  return binding
-
--- Helper for parsing at least one occurrence of something
-many1 :: Parser a -> Parser [a]
-many1 p = do
-  x <- p
-  xs <- many p
-  return (x : xs)
