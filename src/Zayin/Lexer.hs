@@ -3,7 +3,7 @@
 module Zayin.Lexer (Token(..), tokenize) where
 
 import qualified Data.Text as T
-import Data.Char (isDigit, isAlpha, isAlphaNum, isSpace)
+import Data.Char (isDigit, isAlpha, isAlphaNum, isSpace, isPunctuation, isSymbol)
 import Control.Monad (when)
 import Control.Monad.State
 import Control.Monad.Except
@@ -23,6 +23,7 @@ data Token
   | TRightBrace         -- }
   | TLeftParen          -- (
   | TRightParen         -- )
+  | TOperator T.Text    -- Operators like +, -, *, /, %, etc.
   | TEither             -- either keyword
   | TFunc               -- func keyword
   | TContext            -- context keyword
@@ -110,6 +111,50 @@ skipWhitespaceAndComments = do
 addToken :: Token -> Lexer ()
 addToken token = modify $ \s -> s { tokens = token : tokens s }
 
+-- Check if a character is a valid operator symbol
+isOperatorChar :: Char -> Bool
+isOperatorChar c = c `elem` ("+-*/%^&|" :: String)
+
+-- Check if a character is a valid comparison operator symbol
+isCompareChar :: Char -> Bool
+isCompareChar c = c `elem` ("<>=!" :: String)
+
+-- Tokenize an operator
+tokenizeOperator :: Lexer ()
+tokenizeOperator = do
+  s <- get
+  let (op, rest) = T.span isOperatorChar (input s)
+  let newPos = foldl (flip advancePos) (position s) (T.unpack op)
+  put s { input = rest, position = newPos }
+  addToken (TOperator op)
+
+-- Tokenize a comparison operator
+tokenizeCompare :: Lexer ()
+tokenizeCompare = do
+  s <- get
+  -- Handle two-character operators like <=, >=, ==, !=
+  let firstChar = T.head (input s)
+  let lookAheadChar = if T.length (input s) > 1 then Just (T.index (input s) 1) else Nothing
+
+  case (firstChar, lookAheadChar) of
+    -- Two-character operators
+    (c1, Just c2) | c1 `elem` ("<>=" :: String) && c2 == '=' -> do
+      let op = T.pack [c1, c2]
+      let newPos = advancePos c2 (advancePos c1 (position s))
+      put s { input = T.drop 2 (input s), position = newPos }
+      addToken (TOperator op)
+    ('!', Just '=') -> do
+      let op = T.pack "!="
+      let newPos = advancePos '=' (advancePos '!' (position s))
+      put s { input = T.drop 2 (input s), position = newPos }
+      addToken (TOperator op)
+    -- Single-character operators
+    _ -> do
+      let (op, rest) = T.splitAt 1 (input s)
+      let newPos = advancePos (T.head op) (position s)
+      put s { input = rest, position = newPos }
+      addToken (TOperator op)
+
 -- Tokenize a word (keyword or identifier)
 tokenizeWord :: Lexer ()
 tokenizeWord = do
@@ -196,7 +241,6 @@ tokenizeNumber = do
       addToken (TInteger intVal)
 
 -- Tokenize a single token
--- Tokenize a single token
 tokenizeOne :: Lexer Bool
 tokenizeOne = do
   skipWhitespaceAndComments
@@ -226,11 +270,13 @@ tokenizeOne = do
                   modify $ \s -> s { input = T.cons '-' (input s) }
                   tokenizeNumber
                 _ -> do
-                  -- Not a number, treat as part of an identifier
+                  -- It's an operator
                   modify $ \s -> s { input = T.cons '-' (input s) }
-                  tokenizeWord
-            _ | isDigit c -> tokenizeNumber
+                  tokenizeOperator
+            c | isDigit c -> tokenizeNumber
               | isAlpha c -> tokenizeWord
+              | isOperatorChar c -> tokenizeOperator
+              | isCompareChar c -> tokenizeCompare
               | otherwise -> throwError $ "Unexpected character: " ++ [c]
           return False
         Nothing -> return True

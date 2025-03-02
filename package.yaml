@@ -28,10 +28,10 @@ dependencies:
 - filepath >= 1.4 && < 2
 - file-embed >= 0 && < 1
 - haskeline >= 0.8 && < 1
+- megaparsec >= 9.6 && < 10
 - monad-logger >= 0.3 && < 1
 - mtl >= 2.3 && < 3
 - optparse-applicative >= 0.18 && < 1
-- parsec >= 3.1 && < 4
 - prettyprinter >= 1.7 && < 2
 - prettyprinter-ansi-terminal >= 1.1 && < 2
 - process >= 1.6 && < 2

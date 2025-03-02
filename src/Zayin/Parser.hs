@@ -1,328 +1,243 @@
 {-# LANGUAGE OverloadedStrings #-}
+module Zayin.Parser
+  ( parseProgram  -- :: Text -> Either (ParseErrorBundle Text Void) Expr
+  , Expr(..)
+  , ExprBodyExpr(..)
+  , ExprBody(..)
+  , Literal(..)
+  ) where
 
-module Zayin.Parser (
-  parseWithDebug
-) where
-
-import Control.Monad (unless, when)
-import Control.Monad.Except
-import Control.Monad.IO.Class (liftIO)
-import Control.Monad.State
+import Control.Monad (void)
+import Control.Monad.Logger (MonadLogger, logDebugN)
+import Control.Monad.Trans (lift)
+import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Void (Void)
+import Data.Functor.Identity (Identity)
+import Text.Megaparsec
+  ( ParsecT
+  , (<|>)
+  , between
+  , many
+  , manyTill
+  , notFollowedBy
+  , try
+  , empty
+  , eof
+  , runParserT
+  , sepBy
+  , ParseErrorBundle
+  )
+import qualified Text.Megaparsec.Char as MC
+import qualified Text.Megaparsec.Char.Lexer as L
 
 import Zayin.AST
-import Zayin.Lexer
 import Zayin.Literals
 
--- Parser state
-data ParserState = ParserState
-  { tokens :: [Token]
-  , debugMode :: Bool
-  }
+-- | Our parser type. We use ParsecT over an arbitrary monad m that is an instance of MonadLogger.
+type Parser m = ParsecT Void Text m
 
--- Parser monad
-type Parser a = ExceptT String (StateT ParserState IO) a
+------------------------------------------------------------
+-- Lexing helpers
+------------------------------------------------------------
 
--- Run the parser
-runParser :: Parser a -> ParserState -> IO (Either String a)
-runParser parser state = do
-  (result, _) <- runStateT (runExceptT parser) state
-  return result
+-- | Consume whitespace and comments.
+sc :: (Monad m) => Parser m ()
+sc = L.space MC.space1 lineCmnt blockCmnt
+  where
+    lineCmnt  = L.skipLineComment ";"      -- Rebol often uses ';' for comments.
+    blockCmnt = L.skipBlockComment "/*" "*/" -- if needed
 
--- Log debug info
-logDebugN :: T.Text -> Parser ()
-logDebugN msg = do
-  debug <- gets debugMode
-  when debug $ liftIO $ putStrLn $ T.unpack msg
+-- | Parse a lexeme and consume trailing space.
+lexeme :: (Monad m) => Parser m a -> Parser m a
+lexeme = L.lexeme sc
 
--- Check if text matches builtin name
-isBuiltin :: T.Text -> Bool
-isBuiltin w = w `elem` [T.pack "display", T.pack "not", T.pack "gc_collect", T.pack "gc_stats", T.pack "spawn", T.pack "cons",
-                        T.pack "+", T.pack "-", T.pack "*", T.pack "/", T.pack "%", T.pack "<", T.pack ">",
-                        T.pack "<=", T.pack ">=", T.pack "eq?", T.pack "car", T.pack "cdr"]
+-- | Parse a symbol.
+symbol :: (Monad m) => Text -> Parser m Text
+symbol = L.symbol sc
 
--- Get the next token without consuming it
-peekToken :: Parser (Maybe Token)
-peekToken = do
-  toks <- gets tokens
-  return $ case toks of
-    [] -> Nothing
-    (t:_) -> Just t
+-- | Parse a reserved keyword and make sure it is not used as an identifier.
+reserved :: (Monad m) => Text -> Parser m ()
+reserved w = void (lexeme (MC.string w))
 
--- Consume the next token
-nextToken :: Parser Token
-nextToken = do
-  toks <- gets tokens
-  case toks of
-    [] -> throwError "Unexpected end of input"
-    (t:ts) -> do
-      modify $ \s -> s { tokens = ts }
-      return t
+------------------------------------------------------------
+-- Identifier and literal parsers
+------------------------------------------------------------
 
--- Consume a token if it matches a predicate
-satisfy :: (Token -> Bool) -> String -> Parser Token
-satisfy pred err = do
-  t <- nextToken
-  if pred t
-    then return t
-    else throwError $ err ++ ": " ++ show t
+-- | An identifier starts with a letter or underscore and then alphanumerics,
+-- underscores or hyphens. We disallow reserved words.
+identifier :: (Monad m) => Parser m Text
+identifier = lexeme $ do
+  first <- MC.letterChar <|> MC.char '_'
+  rest  <- many (MC.alphaNumChar <|> MC.char '_' <|> MC.char '-')
+  let ident = T.pack (first:rest)
+  if ident `elem` ["func", "either", "block"]
+     then fail $ "Reserved word: " ++ T.unpack ident
+     else return ident
 
--- Match a specific token
-match :: Token -> Parser ()
-match expected = do
-  t <- nextToken
-  unless (t == expected) $
-    throwError $ "Expected " ++ show expected ++ ", got " ++ show t
+-- | Parse a builtin operator symbol.
+builtinOp :: (Monad m) => Parser m Text
+builtinOp = lexeme $ choice (map MC.string ["+", "-", "*", "/", "<=", ">=", "<", ">", "="])
+  where
+    choice = foldr (<|>) empty
 
--- Parse a literal value
-parseLiteral :: Parser Expr
-parseLiteral = do
-  tok <- nextToken
-  case tok of
-    TString s -> return $ ELit (LString s)
-    TInteger n -> return $ ELit (LInt n)
-    TFloat f -> return $ ELit (LFloat f)
-    TBool b -> return $ ELit (LBool b)
-    TNil -> return $ ELit LNil
-    _ -> throwError $ "Expected literal, got " ++ show tok
+-- | Parse a literal.
+literal :: (Monad m) => Parser m Literal
+literal = try parseBool <|> try parseNil <|> try parseFloat <|> try parseInt <|> parseString
+  where
+    parseString = do
+      _ <- MC.char '"'
+      str <- manyTill L.charLiteral (MC.char '"')
+      return $ LString (T.pack str)
+    parseInt = L.decimal >>= \n -> return (LInt n)
+    parseFloat = L.float >>= \f -> return (LFloat f)
+    parseBool = (MC.string "true" >> return (LBool True))
+            <|> (MC.string "false" >> return (LBool False))
+    parseNil = MC.string "nil" >> return LNil
 
--- Parse a variable reference
-parseVar :: Parser Expr
-parseVar = do
-  tok <- nextToken
-  case tok of
-    TWord name -> return $ EVar name
-    _ -> throwError $ "Expected variable name, got " ++ show tok
+------------------------------------------------------------
+-- Bracketing helpers
+------------------------------------------------------------
 
--- Parse a block of expressions
-parseBlock :: Parser ExprBody
-parseBlock = do
-  match TLeftBracket
-  exprs <- parseBodyExprs []
-  match TRightBracket
-  case exprs of
-    [] -> throwError "Empty block not allowed"
-    _ -> do
-      let bodyExps = init exprs
-      let finalExp = last exprs
-      case finalExp of
-        Expr e -> return $ ExprBody bodyExps e
-        Def name e -> do
-          -- If the last expression is a definition, we consider it part of bodyExprs
-          -- with an implicit nil as the final expression
-          return $ ExprBody (exprs) (ELit LNil)
+-- | Parse content in parentheses.
+parens :: (Monad m) => Parser m a -> Parser m a
+parens = between (symbol "(") (symbol ")")
 
--- Parse a series of body expressions
-parseBodyExprs :: [ExprBodyExpr] -> Parser [ExprBodyExpr]
-parseBodyExprs acc = do
-  maybeToken <- peekToken
-  case maybeToken of
-    Nothing -> return $ reverse acc  -- End of input - return accumulated expressions
-    Just TRightBracket -> return $ reverse acc
-    Just (TWord name) -> do
-      nextToken
-      maybeColon <- peekToken
-      case maybeColon of
-        Just TColon -> do
-          match TColon
-          expr <- parseExpr
-          parseBodyExprs (Def name expr : acc)
-        _ -> do
-          -- Put the token back
-          modify $ \s -> s { tokens = TWord name : tokens s }
-          expr <- parseExpr
-          parseBodyExprs (Expr expr : acc)
-    _ -> do
-      expr <- parseExpr
-      parseBodyExprs (Expr expr : acc)
+-- | Parse content in square brackets.
+brackets :: (Monad m) => Parser m a -> Parser m a
+brackets = between (symbol "[") (symbol "]")
 
--- Parse a set expression (assignment)
-parseSet :: Parser Expr
-parseSet = do
-  name <- nextToken
-  case name of
-    TWord varName -> do
-      match TColon
-      expr <- parseExpr
-      return $ ESet varName expr
-    _ -> throwError $ "Expected variable name, got " ++ show name
+------------------------------------------------------------
+-- Top-level program parser
+------------------------------------------------------------
 
--- Parse an if expression
-parseIf :: Parser Expr
-parseIf = do
-  match TEither
-  cond <- parseExpr
-  thenBlock <- parseBlock
-  elseBlock <- parseBlock
-  return $ EIf cond (finalExpr thenBlock) (finalExpr elseBlock)
+-- | Parse an entire program. A program is a series of definitions and expressions
+-- that is automatically wrapped in an anonymous lambda (with no parameters) and then applied.
+parseProgram :: (MonadLogger m) => Text -> m (Either (ParseErrorBundle Text Void) Expr)
+parseProgram input = runParserT (sc >> program <* eof) "<program>" input
 
--- Parse a lambda expression
-parseLambda :: Parser Expr
-parseLambda = do
-  match TFunc
-  match TLeftBracket
-  params <- parseParams []
-  match TRightBracket
-  body <- parseBlock
+program :: (MonadLogger m) => Parser m Expr
+program = do
+  lift $ logDebugN "Parsing top-level program..."
+  -- Parse zero or more statements (definitions or expressions)
+  stmts <- many stmt
+  -- The final expression of the program.
+  final <- expr
+  let body = ExprBody { bodyExprs = stmts, finalExpr = final }
+  -- Wrap in an anonymous lambda that is immediately applied.
+  return $ EApp (ELam [] body) []
+
+------------------------------------------------------------
+-- Statement and expression bodies
+------------------------------------------------------------
+
+-- | A statement is either a definition or an expression.
+stmt :: (MonadLogger m) => Parser m ExprBodyExpr
+stmt = try definition <|> (Expr <$> expr)
+
+-- | A definition: an identifier followed by ':' and an expression.
+definition :: (MonadLogger m) => Parser m ExprBodyExpr
+definition = do
+  lift $ logDebugN "Parsing definition..."
+  name <- identifier
+  _ <- symbol ":"
+  e <- expr
+  return $ Def name e
+
+-- | Parse an expression body (used for lambda and let bodies).
+exprBody :: (MonadLogger m) => Parser m ExprBody
+exprBody = do
+  lift $ logDebugN "Parsing expression body..."
+  stmts <- many stmt
+  final <- expr
+  return $ ExprBody stmts final
+
+------------------------------------------------------------
+-- Expression parser
+------------------------------------------------------------
+
+-- The top-level expression parser first parses a “term” (which includes infix operators)
+-- and then (if there are subsequent terms that are not infix-bound) treats those as arguments
+-- to a function call. This gives infix operators higher precedence than function application.
+expr :: (MonadLogger m) => Parser m Expr
+expr = do
+  lift $ logDebugN "Parsing expression..."
+  t <- term 
+  args <- many term
+  return $ if null args then t else EApp t args
+
+-- | Parse a term. A term is a primary expression chained (left-associatively)
+-- with infix operators. This ensures that in an expression like “factorial n - 1”
+-- the infix “-” binds to “n” and “1” before being passed as an argument to “factorial”.
+term :: (MonadLogger m) => Parser m Expr
+term = chainl1 primary opParser
+
+-- | Parse an infix operator and return a function to combine two expressions.
+opParser :: (Monad m) => Parser m (Expr -> Expr -> Expr)
+opParser = do
+  opSym <- builtinOp
+  return (\l r -> EApp (EBuiltinIdent opSym) [l, r])
+
+-- | A standard left-associative chain parser.
+chainl1 :: (Monad m) => Parser m a -> Parser m (a -> a -> a) -> Parser m a
+chainl1 p op = do
+  x <- p
+  rest x
+  where
+    rest x = (do
+                f <- op
+                y <- p
+                rest (f x y))
+             <|> return x
+
+------------------------------------------------------------
+-- Primary expressions
+------------------------------------------------------------
+
+-- | A primary expression is one of several atomic constructs.
+primary :: (MonadLogger m) => Parser m Expr
+primary = choice
+  [ try ifExpr
+  , try lamExpr
+  , try letExpr
+  , ELit <$> literal
+  , EVar <$> identifier
+  , parens expr
+  ]
+  where
+    choice = foldr (<|>) empty
+
+------------------------------------------------------------
+-- Special forms
+------------------------------------------------------------
+
+-- | Parse an if-expression (using the “either” keyword).
+-- Syntax: either <cond> [ <then> ] [ <else> ]
+ifExpr :: (MonadLogger m) => Parser m Expr
+ifExpr = do
+  lift $ logDebugN "Parsing if-expression..."
+  _ <- MC.string "either" >> sc
+  cond <- expr
+  thenExpr <- brackets expr
+  elseExpr <- brackets expr
+  return $ EIf cond thenExpr elseExpr
+
+-- | Parse a lambda expression.
+-- Syntax: func [ <params> ] [ <body> ]
+lamExpr :: (MonadLogger m) => Parser m Expr
+lamExpr = do
+  lift $ logDebugN "Parsing lambda expression..."
+  _ <- MC.string "func" >> sc
+  params <- brackets (identifier `sepBy` sc)
+  body <- brackets exprBody
   return $ ELam params body
 
--- Parse lambda parameters
-parseParams :: [T.Text] -> Parser [T.Text]
-parseParams acc = do
-  maybeToken <- peekToken
-  case maybeToken of
-    Just TRightBracket -> return $ reverse acc
-    Just (TWord name) -> do
-      nextToken
-      parseParams (name : acc)
-    Just tok -> throwError $ "Expected parameter name, got " ++ show tok
-    Nothing -> throwError "Unexpected end of input while parsing parameters"
-
--- Parse a let expression
-parseLet :: Parser Expr
-parseLet = do
-  match TContext
-  match TLeftBracket
-  bindings <- parseBindings []
-  match TRightBracket
-  body <- parseBlock
-  return $ ELet bindings body
-
--- Parse let bindings
-parseBindings :: [(T.Text, Expr)] -> Parser [(T.Text, Expr)]
-parseBindings acc = do
-  maybeToken <- peekToken
-  case maybeToken of
-    Just TRightBracket -> return $ reverse acc
-    Just (TWord name) -> do
-      nextToken
-      match TColon
-      expr <- parseExpr
-      parseBindings ((name, expr) : acc)
-    Just tok -> throwError $ "Expected binding name, got " ++ show tok
-    Nothing -> throwError "Unexpected end of input while parsing bindings"
-
--- Parse a function application
-parseApplication :: Expr -> Parser Expr
-parseApplication func = do
-  args <- parseArgs []
-  return $ EApp func args
-
--- Parse function arguments
-parseArgs :: [Expr] -> Parser [Expr]
-parseArgs acc = do
-  maybeToken <- peekToken
-  case maybeToken of
-    Just TRightBracket -> return $ reverse acc
-    Just TRightBrace -> return $ reverse acc
-    Just TRightParen -> return $ reverse acc
-    Nothing -> return $ reverse acc
-    Just token -> do
-      -- Determine if this is the end of arguments
-      isEndOfArgs <- case token of
-        TWord _ -> do
-          -- Check if next token is a colon (indicating var: expr)
-          toks <- gets tokens
-          return $ case drop 1 toks of
-            (TColon:_) -> True
-            _ -> False
-        TEither -> return True
-        TFunc -> return True
-        TContext -> return True
-        _ -> return False
-
-      if isEndOfArgs
-        then return $ reverse acc
-        else do
-          arg <- parseExpr
-          parseArgs (arg : acc)
-
--- Parse an expression
-parseExpr :: Parser Expr
-parseExpr = do
-  maybeToken <- peekToken
-  case maybeToken of
-    Just (TWord name) -> do
-      nextToken
-      -- Look ahead to see if any arguments follow
-      maybeNextToken <- peekToken
-      hasArgs <- checkIfHasArguments maybeNextToken
-      if hasArgs
-        then do
-          -- This is a function application
-          args <- parseArgs []
-          return $ if (isBuiltin name) then EApp (EBuiltinIdent name) args else EApp (EVar name) args
-        else
-          -- This is just a variable reference
-          return $ EVar name
-    Just (TString _) -> parseLiteral
-    Just (TInteger _) -> parseLiteral
-    Just (TFloat _) -> parseLiteral
-    Just (TBool _) -> parseLiteral
-    Just TNil -> parseLiteral
-    Just TEither -> parseIf
-    Just TFunc -> parseLambda
-    Just TContext -> parseLet
-    Just TLeftBracket -> do
-      block <- parseBlock
-      return $ finalExpr block
-    Just tok -> throwError $ "Unexpected token in expression: " ++ show tok
-    Nothing -> throwError "Unexpected end of input while parsing expression"
-
--- Helper to check if arguments follow
-checkIfHasArguments :: Maybe Token -> Parser Bool
-checkIfHasArguments Nothing = return False
-checkIfHasArguments (Just token) = case token of
-  TRightBracket -> return False
-  TRightBrace -> return False
-  TRightParen -> return False
-  TColon -> return False
-  -- Keywords that would start a new expression
-  TEither -> return False
-  TFunc -> return False
-  TContext -> return False
-  TWord name | (isBuiltin name) -> return True
-  -- Any other token suggests an argument
-  _ -> return True
-
--- Parse a program (the entry point)
-parseProgram :: Parser Expr
-parseProgram = do
-  logDebugN "Starting to parse program"
-  -- We wrap the program in a lambda to ensure it's a complete expression
-  exprs <- parseBodyExprs []
-  if null exprs
-    then return $ EApp (ELam [] (ExprBody [] (ELit LNil))) []
-    else do
-      -- If all expressions are definitions (no final expression),
-      -- add an implicit nil as the final expression
-      let allDefs = all isDef exprs
-      if allDefs
-        then do
-          let body = ExprBody exprs (ELit LNil)
-          return $ EApp (ELam [] body) []
-        else do
-          let bodyExps = init exprs
-          let finalExp = last exprs
-          case finalExp of
-            Expr e -> do
-              let body = ExprBody bodyExps e
-              return $ EApp (ELam [] body) []
-            Def name e -> do
-              -- If the last expression is a definition, we consider it part of bodyExprs
-              -- with an implicit nil as the final expression
-              let body = ExprBody exprs (ELit LNil)
-              return $ EApp (ELam [] body) []
-  where
-    isDef (Def _ _) = True
-    isDef _ = False
-
--- Main parse function that's exposed
-parseWithDebug :: Bool -> T.Text -> IO (Either String Expr)
-parseWithDebug debug src = do
-  tokensEither <- return $ tokenize src
-  case tokensEither of
-    Left err -> return $ Left $ "Tokenization error: " ++ err
-    Right toks -> do
-      when debug $ putStrLn $ "Tokens: " ++ show toks
-      runParser parseProgram (ParserState toks debug)
+-- | Parse a let-binding expression.
+-- Syntax: block [ <definitions> ] [ <body> ]
+letExpr :: (MonadLogger m) => Parser m Expr
+letExpr = do
+  lift $ logDebugN "Parsing let-binding expression..."
+  _ <- MC.string "block" >> sc
+  defs <- brackets (many definition)
+  body <- brackets exprBody
+  return $ ELet [ (name, e) | Def name e <- defs ] body
