@@ -36,7 +36,7 @@ import Zayin.Interpreter (Value (..), interpret, valueToString)
 import Zayin.LiftedExpr.Pretty (renderLExpr, renderLiftedLambda)
 import Zayin.Literals
 import Zayin.Macros (expandMacros)
-import Zayin.Parser (parseProgram, parseWithDebug)
+import Zayin.Parser (parseWithDebug)
 import Zayin.Transforms (toFExprM)
 
 --------------------------------------------------------------------------------

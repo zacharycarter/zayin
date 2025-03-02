@@ -35,6 +35,7 @@ library
       Zayin.FlatExpr
       Zayin.FlatExpr.Pretty
       Zayin.Interpreter
+      Zayin.Lexer
       Zayin.LiftedExpr
       Zayin.LiftedExpr.Pretty
       Zayin.Literals

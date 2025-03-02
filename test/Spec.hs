@@ -59,7 +59,7 @@ main = hspec $ do
         let srcFile = tmpDir </> "arith.zyn"
             binaryFile = tmpDir </> "a.out"
             -- A simple program that displays the sum of 2 and 3.
-            source = "display(2 + 3)"
+            source = "display 2 + 3"
         writeFile srcFile source
         -- Invoke the compiler in compile mode, specifying the output binary.
         compileWithOutput binaryFile srcFile
