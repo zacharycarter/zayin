@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
+
 module Zayin.Parser
-  ( parseProgram  -- :: Text -> Either (ParseErrorBundle Text Void) Expr
+  ( parseProgram
   , Expr(..)
   , ExprBodyExpr(..)
   , ExprBody(..)
@@ -13,12 +14,12 @@ import Control.Monad.Trans (lift)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Void (Void)
-import Data.Functor.Identity (Identity)
 import Text.Megaparsec
   ( ParsecT
   , (<|>)
   , between
   , many
+  , some
   , manyTill
   , notFollowedBy
   , try
@@ -26,6 +27,9 @@ import Text.Megaparsec
   , eof
   , runParserT
   , sepBy
+  , sepEndBy1
+  , lookAhead
+  , anySingle
   , ParseErrorBundle
   )
 import qualified Text.Megaparsec.Char as MC
@@ -45,8 +49,8 @@ type Parser m = ParsecT Void Text m
 sc :: (Monad m) => Parser m ()
 sc = L.space MC.space1 lineCmnt blockCmnt
   where
-    lineCmnt  = L.skipLineComment ";"      -- Rebol often uses ';' for comments.
-    blockCmnt = L.skipBlockComment "/*" "*/" -- if needed
+    lineCmnt  = L.skipLineComment ";"      -- Rebol uses ';' for comments
+    blockCmnt = L.skipBlockComment "/*" "*/" -- Alternative style
 
 -- | Parse a lexeme and consume trailing space.
 lexeme :: (Monad m) => Parser m a -> Parser m a
@@ -56,48 +60,175 @@ lexeme = L.lexeme sc
 symbol :: (Monad m) => Text -> Parser m Text
 symbol = L.symbol sc
 
--- | Parse a reserved keyword and make sure it is not used as an identifier.
+-- | Parse a reserved keyword.
 reserved :: (Monad m) => Text -> Parser m ()
-reserved w = void (lexeme (MC.string w))
+reserved w = void $ lexeme $ MC.string w
 
 ------------------------------------------------------------
--- Identifier and literal parsers
+-- Tokens
 ------------------------------------------------------------
 
--- | An identifier starts with a letter or underscore and then alphanumerics,
--- underscores or hyphens. We disallow reserved words.
+-- | Recognized operators
+operators :: [Text]
+operators = ["+", "-", "*", "/", "%", "<", ">", "<=", ">=", "=", "==", "!=", "^", "and", "or"]
+
+-- | Recognized builtin functions
+builtins :: [Text]
+builtins = [
+    "display", "print", "exit", "tostring",
+    "cons", "car", "cdr", "cons?", "null?",
+    "string-concat", "string-chars"
+  ]
+
+-- | Reserved words
+reservedWords :: [Text]
+reservedWords = ["func", "either", "context", "true", "false", "none"]
+
+-- | Parse a number literal
+number :: (Monad m) => Parser m Literal
+number = lexeme $ do
+  try parseFloat <|> parseInt
+  where
+    parseInt = L.signed sc L.decimal >>= \n -> return (LInt n)
+    parseFloat = L.signed sc L.float >>= \f -> return (LFloat f)
+
+-- | Parse a string literal
+string :: (Monad m) => Parser m Literal
+string = lexeme $ do
+  _ <- MC.char '"'
+  str <- manyTill L.charLiteral (MC.char '"')
+  return $ LString (T.pack str)
+
+-- | Parse a boolean literal
+boolean :: (Monad m) => Parser m Literal
+boolean = lexeme $ do
+  b <- try (MC.string "true") <|> try (MC.string "false")
+  return $ LBool (b == "true")
+
+-- | Parse a nil literal
+nil :: (Monad m) => Parser m Literal
+nil = lexeme $ MC.string "none" >> return LNil
+
+-- | Parse an identifier, checking if it's a keyword
 identifier :: (Monad m) => Parser m Text
 identifier = lexeme $ do
   first <- MC.letterChar <|> MC.char '_'
-  rest  <- many (MC.alphaNumChar <|> MC.char '_' <|> MC.char '-')
+  rest <- many (MC.alphaNumChar <|> MC.char '_' <|> MC.char '-' <|> MC.char '?' <|> MC.char '!')
   let ident = T.pack (first:rest)
-  if ident `elem` ["func", "either", "block"]
-     then fail $ "Reserved word: " ++ T.unpack ident
-     else return ident
+  if ident `elem` reservedWords
+    then fail $ "Reserved word: " ++ T.unpack ident
+    else return ident
 
--- | Parse a builtin operator symbol.
-builtinOp :: (Monad m) => Parser m Text
-builtinOp = lexeme $ choice (map MC.string ["+", "-", "*", "/", "<=", ">=", "<", ">", "="])
+------------------------------------------------------------
+-- Top-level program parser
+------------------------------------------------------------
+
+-- Parse an entire program using the Rebol-like approach
+parseProgram :: (MonadLogger m) => Text -> m (Either (ParseErrorBundle Text Void) Expr)
+parseProgram input = runParserT (sc >> program) "<program>" input
+
+-- A program is a sequence of definitions and expressions,
+-- implicitly wrapped in a lambda function that is immediately applied
+program :: (MonadLogger m) => Parser m Expr
+program = do
+  lift $ logDebugN "Parsing top-level program..."
+  sc
+
+  -- Parse all lines as separate statements
+  stmts <- sepEndBy1 statement (some (MC.newline <|> MC.char ';'))
+
+  -- Create the program structure - lambda with body
+  let defs = [def | def@(Def _ _) <- stmts]
+      exprs = [e | Expr e <- stmts]
+      finalExpr = if null exprs then ELit LNil else last exprs
+      body = ExprBody defs finalExpr
+
+  return $ EApp (ELam [] body) []
+
+-- Parse a single statement (definition or expression)
+statement :: (MonadLogger m) => Parser m ExprBodyExpr
+statement = do
+  lift $ logDebugN "Parsing statement..."
+  -- First try to parse a definition, then an expression
+  try definition <|> (Expr <$> expr)
+
+-- Parse a definition: an identifier followed by colon and expression
+definition :: (MonadLogger m) => Parser m ExprBodyExpr
+definition = do
+  lift $ logDebugN "Parsing definition..."
+  name <- identifier
+  void $ symbol ":"
+  value <- expr
+  return $ Def name value
+
+-- Parse an expression using Rebol's approach
+expr :: (MonadLogger m) => Parser m Expr
+expr = do
+  lift $ logDebugN "Parsing expression..."
+
+  -- Parse a left-associative infix expression
+  chainl1 term operator
+
+-- Chain left-associative operations
+chainl1 :: (MonadLogger m) => Parser m Expr -> Parser m (Expr -> Expr -> Expr) -> Parser m Expr
+chainl1 p op = do
+  x <- p
+  rest x
+  where
+    rest x = do
+      f <- op
+      y <- p
+      rest (f x y)
+      <|> return x
+
+-- Parse an operator with precedence handling
+operator :: (MonadLogger m) => Parser m (Expr -> Expr -> Expr)
+operator = do
+  op <- lexeme $ choice (map MC.string operators)
+  return $ \x y -> EApp (EBuiltinIdent op) [x, y]
   where
     choice = foldr (<|>) empty
 
--- | Parse a literal.
-literal :: (Monad m) => Parser m Literal
-literal = try parseBool <|> try parseNil <|> try parseFloat <|> try parseInt <|> parseString
-  where
-    parseString = do
-      _ <- MC.char '"'
-      str <- manyTill L.charLiteral (MC.char '"')
-      return $ LString (T.pack str)
-    parseInt = L.decimal >>= \n -> return (LInt n)
-    parseFloat = L.float >>= \f -> return (LFloat f)
-    parseBool = (MC.string "true" >> return (LBool True))
-            <|> (MC.string "false" >> return (LBool False))
-    parseNil = MC.string "nil" >> return LNil
+-- Parse a term: literal, variable, function call, or special form
+term :: (MonadLogger m) => Parser m Expr
+term = try functionCall <|> primary
 
-------------------------------------------------------------
--- Bracketing helpers
-------------------------------------------------------------
+-- Parse a primary expression
+primary :: (MonadLogger m) => Parser m Expr
+primary = do
+  try ifExpr <|>
+    try funcExpr <|>
+    try contextExpr <|>
+    try literalExpr <|>
+    try identExpr <|>
+    parens expr
+
+-- Parse a literal expression
+literalExpr :: (Monad m) => Parser m Expr
+literalExpr = ELit <$> (try string <|> try number <|> try boolean <|> nil)
+
+-- Parse an identifier: either variable or builtin
+identExpr :: (Monad m) => Parser m Expr
+identExpr = do
+  name <- identifier
+  return $ if name `elem` builtins
+    then EBuiltinIdent name
+    else EVar name
+
+-- Parse a function call: function name followed by argument
+functionCall :: (MonadLogger m) => Parser m Expr
+functionCall = do
+  -- Parse the function name
+  func <- try $ do
+    f <- identExpr
+    -- Must be followed by space and then another expression
+    sc
+    return f
+
+  -- Parse the argument
+  arg <- expr
+
+  return $ EApp func [arg]
 
 -- | Parse content in parentheses.
 parens :: (Monad m) => Parser m a -> Parser m a
@@ -108,136 +239,49 @@ brackets :: (Monad m) => Parser m a -> Parser m a
 brackets = between (symbol "[") (symbol "]")
 
 ------------------------------------------------------------
--- Top-level program parser
-------------------------------------------------------------
-
--- | Parse an entire program. A program is a series of definitions and expressions
--- that is automatically wrapped in an anonymous lambda (with no parameters) and then applied.
-parseProgram :: (MonadLogger m) => Text -> m (Either (ParseErrorBundle Text Void) Expr)
-parseProgram input = runParserT (sc >> program <* eof) "<program>" input
-
-program :: (MonadLogger m) => Parser m Expr
-program = do
-  lift $ logDebugN "Parsing top-level program..."
-  -- Parse zero or more statements (definitions or expressions)
-  stmts <- many stmt
-  -- The final expression of the program.
-  final <- expr
-  let body = ExprBody { bodyExprs = stmts, finalExpr = final }
-  -- Wrap in an anonymous lambda that is immediately applied.
-  return $ EApp (ELam [] body) []
-
-------------------------------------------------------------
--- Statement and expression bodies
-------------------------------------------------------------
-
--- | A statement is either a definition or an expression.
-stmt :: (MonadLogger m) => Parser m ExprBodyExpr
-stmt = try definition <|> (Expr <$> expr)
-
--- | A definition: an identifier followed by ':' and an expression.
-definition :: (MonadLogger m) => Parser m ExprBodyExpr
-definition = do
-  lift $ logDebugN "Parsing definition..."
-  name <- identifier
-  _ <- symbol ":"
-  e <- expr
-  return $ Def name e
-
--- | Parse an expression body (used for lambda and let bodies).
-exprBody :: (MonadLogger m) => Parser m ExprBody
-exprBody = do
-  lift $ logDebugN "Parsing expression body..."
-  stmts <- many stmt
-  final <- expr
-  return $ ExprBody stmts final
-
-------------------------------------------------------------
--- Expression parser
-------------------------------------------------------------
-
--- The top-level expression parser first parses a “term” (which includes infix operators)
--- and then (if there are subsequent terms that are not infix-bound) treats those as arguments
--- to a function call. This gives infix operators higher precedence than function application.
-expr :: (MonadLogger m) => Parser m Expr
-expr = do
-  lift $ logDebugN "Parsing expression..."
-  t <- term 
-  args <- many term
-  return $ if null args then t else EApp t args
-
--- | Parse a term. A term is a primary expression chained (left-associatively)
--- with infix operators. This ensures that in an expression like “factorial n - 1”
--- the infix “-” binds to “n” and “1” before being passed as an argument to “factorial”.
-term :: (MonadLogger m) => Parser m Expr
-term = chainl1 primary opParser
-
--- | Parse an infix operator and return a function to combine two expressions.
-opParser :: (Monad m) => Parser m (Expr -> Expr -> Expr)
-opParser = do
-  opSym <- builtinOp
-  return (\l r -> EApp (EBuiltinIdent opSym) [l, r])
-
--- | A standard left-associative chain parser.
-chainl1 :: (Monad m) => Parser m a -> Parser m (a -> a -> a) -> Parser m a
-chainl1 p op = do
-  x <- p
-  rest x
-  where
-    rest x = (do
-                f <- op
-                y <- p
-                rest (f x y))
-             <|> return x
-
-------------------------------------------------------------
--- Primary expressions
-------------------------------------------------------------
-
--- | A primary expression is one of several atomic constructs.
-primary :: (MonadLogger m) => Parser m Expr
-primary = choice
-  [ try ifExpr
-  , try lamExpr
-  , try letExpr
-  , ELit <$> literal
-  , EVar <$> identifier
-  , parens expr
-  ]
-  where
-    choice = foldr (<|>) empty
-
-------------------------------------------------------------
 -- Special forms
 ------------------------------------------------------------
 
--- | Parse an if-expression (using the “either” keyword).
+-- | Parse an if-expression (using the "either" keyword).
 -- Syntax: either <cond> [ <then> ] [ <else> ]
 ifExpr :: (MonadLogger m) => Parser m Expr
 ifExpr = do
   lift $ logDebugN "Parsing if-expression..."
-  _ <- MC.string "either" >> sc
+  reserved "either"
   cond <- expr
   thenExpr <- brackets expr
   elseExpr <- brackets expr
   return $ EIf cond thenExpr elseExpr
 
 -- | Parse a lambda expression.
--- Syntax: func [ <params> ] [ <body> ]
-lamExpr :: (MonadLogger m) => Parser m Expr
-lamExpr = do
+-- Syntax: func [<params>] [<body>]
+funcExpr :: (MonadLogger m) => Parser m Expr
+funcExpr = do
   lift $ logDebugN "Parsing lambda expression..."
-  _ <- MC.string "func" >> sc
+  reserved "func"
   params <- brackets (identifier `sepBy` sc)
-  body <- brackets exprBody
-  return $ ELam params body
+  bodyBlock <- parseBody
+  return $ ELam params bodyBlock
 
 -- | Parse a let-binding expression.
--- Syntax: block [ <definitions> ] [ <body> ]
-letExpr :: (MonadLogger m) => Parser m Expr
-letExpr = do
+-- Syntax: context [<bindings>] [<body>]
+contextExpr :: (MonadLogger m) => Parser m Expr
+contextExpr = do
   lift $ logDebugN "Parsing let-binding expression..."
-  _ <- MC.string "block" >> sc
-  defs <- brackets (many definition)
-  body <- brackets exprBody
-  return $ ELet [ (name, e) | Def name e <- defs ] body
+  reserved "context"
+  bindings <- brackets (many definition)
+  bodyBlock <- parseBody
+  return $ ELet [ (name, e) | Def name e <- bindings ] bodyBlock
+
+-- Parse a body block (used in special forms)
+parseBody :: (MonadLogger m) => Parser m ExprBody
+parseBody = brackets $ do
+  -- Parse all statements (definitions and expressions)
+  statements <- many $ try definition <|> Expr <$> expr
+
+  -- Extract definitions and expressions
+  let defs = [def | def@(Def _ _) <- statements]
+      exprs = [e | Expr e <- statements]
+      finalExpr = if null exprs then ELit LNil else last exprs
+
+  return $ ExprBody defs finalExpr
