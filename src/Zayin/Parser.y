@@ -9,6 +9,7 @@ import Control.Monad.Except
 import Control.Monad.Logger
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader
+import Debug.Trace
 
 import Zayin.Lexer
 import Zayin.Lexer.Support
@@ -81,6 +82,7 @@ TopLevelExprs :: { [ExprBodyExpr] }
 
 TopLevelExpr :: { ExprBodyExpr }
   : let vopen LetDecls vclose            { combineDecls $3 }
+  | let LetDecl                          { $2 }
   | MacroDef                             { $1 }
   | FuncDef                              { $1 }
   | Expr                                 { Expr $1 }
@@ -236,7 +238,7 @@ wrapExpressions exprs =
       finalExpr = case bodyExprs of
                     [] -> ELit LNil
                     _  -> last bodyExprs
-  in EApp (ELam [] (ExprBody defs finalExpr)) []
+  in trace ("Wrapping expressions!\n  exprs: " ++ show exprs ++ "\n  defs: " ++ show defs ++ "\n  bodyExprs: " ++ show bodyExprs) $ EApp (ELam [] (ExprBody defs finalExpr)) []
 
 -- Partition the declarations into definitions and expressions.
 partitionDecls :: [ExprBodyExpr] -> ([(T.Text, Expr)], [Expr])
@@ -251,7 +253,7 @@ partitionDecls ((Expr e) : rest) =
 -- combineDecls takes a list of declarations from a block let and combines them
 -- into a single let expression.
 combineDecls :: [ExprBodyExpr] -> ExprBodyExpr
-combineDecls decls = Expr (ELet defs (ExprBody extraExprs finalExpr))
+combineDecls decls = trace "Combining Decls!" $ Expr (ELet defs (ExprBody extraExprs finalExpr))
   where
     (defs, exprs) = partitionDecls decls
     -- If there are any expressions, take the last one as the final expression,
