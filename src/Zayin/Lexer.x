@@ -173,5 +173,7 @@ offsideRule _ = do
         LT -> do
           popLayout
           pure TkVClose
-    _ -> continue
+    Nothing -> do
+      popStartCode
+      pure TkVSemi
 }
