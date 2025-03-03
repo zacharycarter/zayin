@@ -8,6 +8,7 @@ module Zayin.Lexer.Support
     LexerState (..),
     Token (..),
     alexGetByte,
+    alexInputPrevChar,
     emit,
     layout,
     popLayout,
@@ -28,14 +29,24 @@ import Data.List.NonEmpty (NonEmpty ((:|)))
 import qualified Data.List.NonEmpty as NE
 import Data.Word
 
+-- | Tokens for the Zayin language
 data Token
-  = TkIdent String -- identifiers
+  = TkIdent String                 -- Identifiers
   | -- Keywords
     TkLet
   | TkIn
   | TkWhere
+  | TkIf
+  | TkElse
+  | TkFn
+  | TkTrue
+  | TkFalse
+  | TkNil
+  | TkNot
+  | TkMacro
   | -- Literals
     TkIntLit Integer
+  | TkStringLit String
   | -- Punctuation
     TkEqual
   | TkOpen
@@ -45,6 +56,17 @@ data Token
   | TkRParen
   | TkBackslash
   | TkArrow
+  | TkColon
+  | TkComma
+  | -- Operators
+    TkPlus
+  | TkMinus
+  | TkStar
+  | TkSlash
+  | TkLT
+  | TkGT
+  | TkLEQ
+  | TkGEQ
   | -- Layout punctuation
     TkVOpen
   | TkVSemi
@@ -52,6 +74,7 @@ data Token
   | TkEOF
   deriving (Eq, Show)
 
+-- | Alex input state
 data AlexInput = Input
   { inpLine :: {-# UNPACK #-} !Int,
     inpColumn :: {-# UNPACK #-} !Int,
@@ -62,6 +85,9 @@ data AlexInput = Input
 
 alexPrevInputChar :: AlexInput -> Char
 alexPrevInputChar = inpLast
+
+alexInputPrevChar :: AlexInput -> Char
+alexInputPrevChar = inpLast
 
 alexGetByte :: AlexInput -> Maybe (Word8, AlexInput)
 alexGetByte inp@Input {inpStream = str} = advance <$> uncons str
@@ -85,12 +111,15 @@ alexGetByte inp@Input {inpStream = str} = advance <$> uncons str
           }
       )
 
+-- | Lexer monad
 newtype Lexer a = Lexer {_getLexer :: StateT LexerState (Either String) a}
   deriving (Functor, Applicative, Monad, MonadState LexerState, MonadError String)
 
+-- | Layout management data type
 data Layout = ExplicitLayout | LayoutColumn Int
   deriving (Eq, Show, Ord)
 
+-- | Lexer state
 data LexerState = LS
   { lexerInput :: {-# UNPACK #-} !AlexInput,
     lexerStartCodes :: {-# UNPACK #-} !(NonEmpty Int),
@@ -98,15 +127,18 @@ data LexerState = LS
   }
   deriving (Eq, Show)
 
+-- | Get the current start code
 startCode :: Lexer Int
 startCode = gets (NE.head . lexerStartCodes)
 
+-- | Push a new start code onto the stack
 pushStartCode :: Int -> Lexer ()
 pushStartCode i = modify' $ \st ->
   st
     { lexerStartCodes = NE.cons i (lexerStartCodes st)
     }
 
+-- | Pop a start code from the stack
 popStartCode :: Lexer ()
 popStartCode = modify' $ \st ->
   st
@@ -116,13 +148,16 @@ popStartCode = modify' $ \st ->
           _ :| (x : xs) -> x :| xs
     }
 
+-- | Get the current layout context
 layout :: Lexer (Maybe Layout)
 layout = gets (fmap fst . uncons . lexerLayout)
 
+-- | Push a new layout context
 pushLayout :: Layout -> Lexer ()
 pushLayout i = modify' $ \st ->
   st {lexerLayout = i : lexerLayout st}
 
+-- | Pop a layout context
 popLayout :: Lexer ()
 popLayout = modify' $ \st ->
   st
@@ -132,6 +167,7 @@ popLayout = modify' $ \st ->
           [] -> []
     }
 
+-- | Create initial lexer state
 initState :: String -> LexerState
 initState str =
   LS
@@ -140,11 +176,14 @@ initState str =
       lexerLayout = []
     }
 
+-- | Emit a token based on lexeme
 emit :: (String -> Token) -> String -> Lexer Token
 emit = (pure .)
 
+-- | Return a constant token
 token :: Token -> String -> Lexer Token
 token = const . pure
 
+-- | Run the lexer on input
 runLexer :: Lexer a -> String -> Either String a
 runLexer act s = fst <$> runStateT (_getLexer act) (initState s)

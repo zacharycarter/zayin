@@ -1,9 +1,2 @@
-fn allocateMany(count, acc):
-  if count <= 0:
-    acc
-  else:
-    let newList = cons(count, acc)
-    allocateMany(count - 1, newList)
-
-allocateMany(10, 0)
-display("Allocation completed successfully!")
+let x = 5
+display x

@@ -14,20 +14,36 @@ import Debug.Trace
 $digit = [ 0-9 ]
 $lower = [ a-z ]
 $upper = [ A-Z ]
+$alpha = [ $lower $upper ]
+$alnum = [ $alpha $digit ]
 
-@ident = $lower [ $lower $upper _ ' ]*
+@ident = $lower [ $alnum _ ]*
 
 :-
 
+-- Ignore whitespace
 [\ \t]+ ;
 
+-- Numbers
 $digit+ { emit (TkIntLit . read) }
 
+-- Basic keywords
+<0> "let" / \n   { layoutKw TkLet }
+<0> "let"   { token TkLet }
 <0> "in"    { token TkIn }
-<0> "let"   { layoutKw TkLet }
-<0> "where" { layoutKw TkWhere }
+<0> "if"    { token TkIf }
+<0> "else"  { token TkElse }
+<0> "fn"    { token TkFn }
+<0> "true"  { token TkTrue }
+<0> "false" { token TkFalse }
+<0> "nil"   { token TkNil }
+<0> "not"   { token TkNot }
+<0> "macro" { token TkMacro }
 
+-- Identifiers
 <0> @ident { emit TkIdent }
+
+-- Operators and punctuation
 <0> \\     { token TkBackslash }
 <0> "->"   { token TkArrow }
 <0> \=     { token TkEqual }
@@ -35,11 +51,28 @@ $digit+ { emit (TkIntLit . read) }
 <0> \)     { token TkRParen }
 <0> \{     { token TkOpen }
 <0> \}     { token TkClose }
+<0> \:     { token TkColon }
+<0> \;     { token TkSemi }
+<0> \,     { token TkComma }
+<0> \+     { token TkPlus }
+<0> \-     { token TkMinus }
+<0> \*     { token TkStar }
+<0> \/     { token TkSlash }
+<0> \<     { token TkLT }
+<0> \>     { token TkGT }
+<0> \<\=   { token TkLEQ }
+<0> \>\=   { token TkGEQ }
+<0> \"     { beginString }
 
-
+-- Layout handling (line breaks, comments)
 <0> "--" .* \n { \_ -> pushStartCode newline *> scan }
 <0> \n         { \_ -> pushStartCode newline *> scan }
 
+-- In string mode
+<string> [^\"]* { emit TkStringLit }
+<string> \"     { endString }
+
+-- Layout rules
 <layout> {
   -- Skip comments and whitespace
   "--" .* \n ;
@@ -61,6 +94,18 @@ $digit+ { emit (TkIntLit . read) }
 <eof> () { doEOF }
 
 {
+-- String handling state
+beginString :: String -> Lexer Token
+beginString _ = do
+  pushStartCode string
+  scan
+
+endString :: String -> Lexer Token
+endString _ = do
+  popStartCode
+  scan
+
+-- EOF handling
 handleEOF = pushStartCode eof *> scan
 
 doEOF _ = do
@@ -88,6 +133,7 @@ scan = do
       modify' $ \s -> s { lexerInput = input' }
       action (take tokl string)
 
+-- Layout handling
 layoutKw t _ = do
   pushStartCode Zayin.Lexer.layout
   pure t
@@ -99,14 +145,11 @@ openBrace _ = do
 
 startLayout _ = do
   popStartCode
-
   reference <- Zayin.Lexer.Support.layout
   col       <- gets (inpColumn . lexerInput)
-
   if Just (LayoutColumn col) <= reference
     then pushStartCode empty_layout
     else pushLayout (LayoutColumn col)
-
   pure TkVOpen
 
 emptyLayout _ = do
