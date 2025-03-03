@@ -190,17 +190,18 @@ main = hspec $ do
         let srcFile = tmpDir </> "alloc_pressure.zyn"
             binaryFile = tmpDir </> "a.out"
             -- Create a program that allocates many objects to trigger GC
-            source = unlines
-              [ "fn allocate_many(count, acc):",
-                "  if count <= 0:",
-                "    acc",
-                "  else:",
-                "    let new_list = cons(count, acc)",
-                "    allocate_many(count - 1, new_list)",
-                "",
-                "allocate_many(10, 0)",
-                "display(\"Allocation completed successfully\")"
-              ]
+            source =
+              unlines
+                [ "fn allocate_many(count, acc):",
+                  "  if count <= 0:",
+                  "    acc",
+                  "  else:",
+                  "    let new_list = cons(count, acc)",
+                  "    allocate_many(count - 1, new_list)",
+                  "",
+                  "allocate_many(10, 0)",
+                  "display(\"Allocation completed successfully\")"
+                ]
         writeFile srcFile source
         compileWithOutput binaryFile srcFile
         exists <- doesFileExist binaryFile
