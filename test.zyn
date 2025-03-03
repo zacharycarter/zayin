@@ -1,2 +1,4 @@
-let x = 5
-display x
+if nil:
+  display true
+else:
+  display false

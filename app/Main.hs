@@ -595,7 +595,7 @@ main = do
         src <- TIO.readFile srcFile
         buildDir <- generateBuildDir
 
-        when debugMode $ putStrLn $ "Created build directory at: " ++ buildDir
+        when debugMode $ putStrLn $ "Created build directory: " ++ buildDir
 
         result <- compileSource opts buildDir src False
         case result of

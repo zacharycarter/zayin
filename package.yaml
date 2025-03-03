@@ -10,6 +10,7 @@ extra-source-files:
 - README.md
 - CHANGELOG.md
 - src/Zayin/Lexer.x
+- src/Zayin/Parser.y
 
 # Metadata used when publishing your package
 # synopsis:            Short description of your package
@@ -66,6 +67,9 @@ executables:
     - -with-rtsopts=-N
     dependencies:
     - zayin
+    build-tool-depends:
+    - alex:alex
+    - happy:happy
 
 tests:
   zayin-test:
