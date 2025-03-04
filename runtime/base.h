@@ -1,5 +1,5 @@
-#ifndef ZAYIN_H
-#define ZAYIN_H
+#ifndef SOMESCHEME_H
+#define SOMESCHEME_H
 
 #include <stdbool.h>
 #include <stdlib.h>
@@ -35,9 +35,8 @@
 #define OBJECT_BOOL_OBJ_NEW(NAME, b)                                           \
   struct obj *(NAME);                                                          \
   do {                                                                         \
-    struct bool_obj *new_obj =                                                 \
-        (struct bool_obj*)alloca(sizeof(struct bool_obj));                     \
-    *new_obj = object_bool_obj_new((b));                                       \
+    struct bool_obj *new_obj = alloca(sizeof(struct bool_obj));                \
+    *new_obj = object_bool_obj_new((b));                                        \
     TOUCH_OBJECT(new_obj, "bool_obj_new");                                     \
     (NAME) = (struct obj *)new_obj;                                            \
   } while (0)
@@ -203,7 +202,7 @@ struct thunk {
 
 void call_closure_one(struct obj *, struct obj *);
 void call_closure_two(struct obj *, struct obj *, struct obj *);
-void zayin_start(struct thunk *);
+void scheme_start(struct thunk *);
 void run_minor_gc(struct thunk *);
 
 struct obj object_base_new(enum object_tag);
@@ -220,7 +219,4 @@ struct ht_obj object_ht_obj_new(void);
 
 bool eq_obj_impl(struct obj *, struct obj *);
 
-void *stack_ptr(void);
-
-
-#endif /* ZAYIN_H */
+#endif /* SOMESCHEME_H */

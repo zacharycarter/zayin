@@ -2,7 +2,7 @@
 #define __HASH_H_
 
 // A hash table implementation using robin hood hashing
-#include <mimalloc.h>
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -42,7 +42,7 @@ static const uint8_t hash_table_load_factor_to_grow = 90;
     uint32_t num_elems;                                                        \
     uint32_t cap;                                                              \
     size_t mask;                                                               \
-    uint32_t resize_thresh;                                                    \
+    uint resize_thresh;                                                        \
   };                                                                           \
   struct hash_table_##NAME *hash_table_##NAME##_new();                         \
   void hash_table_##NAME##_free(struct hash_table_##NAME *table);              \
@@ -178,7 +178,7 @@ static const uint8_t hash_table_load_factor_to_grow = 90;
   static void hash_table_##NAME##__construct(struct hash_table_##NAME *table,  \
                                              uint32_t initial_capacity) {      \
     table->elems =                                                             \
-        mi_calloc(initial_capacity, sizeof(struct hash_table_##NAME##_elem));     \
+        calloc(initial_capacity, sizeof(struct hash_table_##NAME##_elem));     \
     table->deleted = bit_array_new(initial_capacity);                          \
     table->num_elems = 0;                                                      \
     table->cap = initial_capacity;                                             \
@@ -207,14 +207,14 @@ static const uint8_t hash_table_load_factor_to_grow = 90;
                                                                                \
   struct hash_table_##NAME *hash_table_##NAME##_new() {                        \
     struct hash_table_##NAME *table =                                          \
-        mi_malloc(sizeof(struct hash_table_##NAME));                           \
+        malloc(sizeof(struct hash_table_##NAME));                              \
     hash_table_##NAME##__construct(table, hash_table_initial_cap);             \
     return table;                                                              \
   }                                                                            \
                                                                                \
   void hash_table_##NAME##_free(struct hash_table_##NAME *table) {             \
-    mi_free(table->elems);                                                     \
-    mi_free(table->deleted);                                                   \
+    free(table->elems);                                                        \
+    free(table->deleted);                                                      \
   }                                                                            \
                                                                                \
   void hash_table_##NAME##_insert(struct hash_table_##NAME *table, KEYTYPE k,  \

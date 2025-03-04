@@ -1,4 +1,3 @@
-#include <mimalloc.h>
 #include "builtin.h"
 #include "base.h"
 #include "common.h"
@@ -38,7 +37,7 @@ struct int_obj object_int_obj_mod(struct obj *lhs, struct obj *rhs) {
   struct int_obj *rhs_int = (struct int_obj *)rhs;
 
   if (rhs_int->val == 0)
-    RUNTIME_ERROR("Divide by zero (%ld %% %ld)", lhs_int->val, rhs_int->val);
+    RUNTIME_ERROR("Divide by zero (%d %% %d)", lhs_int->val, rhs_int->val);
 
   return object_int_obj_new(lhs_int->val % rhs_int->val);
 }
@@ -50,36 +49,6 @@ MAKE_TWO_ARG_FROM_BUILTIN(cons, object_cons_obj_new, struct cons_obj);
 int exit_inner() { exit(0); }
 
 MAKE_ZERO_ARG_FROM_BUILTIN(exit, exit_inner, int);
-
-struct obj *gc_stats_inner(void) {
-    // Get current GC statistics
-    size_t collections, objects_marked, bytes_freed, allocated;
-    gc_get_stats(&collections, &objects_marked, &bytes_freed, &allocated);
-
-    // Return GC statistics as a hash table
-    struct ht_obj ht = object_ht_obj_new();
-
-    // Create keys and values
-    OBJECT_STRING_OBJ_NEW(k_collections, "collections");
-    OBJECT_INT_OBJ_NEW(v_collections, collections);
-    hash_table_obj_insert(ht.ht, k_collections, v_collections);
-
-    OBJECT_STRING_OBJ_NEW(k_marked, "objects_marked");
-    OBJECT_INT_OBJ_NEW(v_marked, objects_marked);
-    hash_table_obj_insert(ht.ht, k_marked, v_marked);
-
-    OBJECT_STRING_OBJ_NEW(k_freed, "bytes_freed");
-    OBJECT_INT_OBJ_NEW(v_freed, bytes_freed);
-    hash_table_obj_insert(ht.ht, k_freed, v_freed);
-
-    OBJECT_STRING_OBJ_NEW(k_allocs, "allocated_bytes");
-    OBJECT_INT_OBJ_NEW(v_allocs, allocated);
-    hash_table_obj_insert(ht.ht, k_allocs, v_allocs);
-
-    return (struct obj *)&ht;
-}
-
-MAKE_ZERO_ARG_FROM_BUILTIN(gc_stats, gc_stats_inner, struct obj*);
 
 char *obj_to_string_internal(struct obj *val) {
   char *res;
@@ -98,9 +67,6 @@ char *obj_to_string_internal(struct obj *val) {
   case OBJ_INT:
     ALLOC_SPRINTF(res, "%ld", ((struct int_obj *)val)->val);
     break;
-  case OBJ_BOOL:
-    ALLOC_SPRINTF(res, "%s", ((struct bool_obj *)val)->val ? "true" : "false");
-    break;
   case OBJ_STR:
     ALLOC_SPRINTF(res, "%s", ((struct string_obj *)val)->buf);
     break;
@@ -108,6 +74,9 @@ char *obj_to_string_internal(struct obj *val) {
     return obj_to_string_internal(((struct cell_obj *)val)->val);
   case OBJ_HT:
     ALLOC_SPRINTF(res, "hash table");
+    break;
+  case OBJ_BOOL:
+    ALLOC_SPRINTF(res, "%s", ((struct bool_obj *)val)->val ? "true" : "false");
     break;
   default:
     RUNTIME_ERROR("Unexpected object tag to to_string: %d", val->tag);
@@ -121,7 +90,7 @@ void to_string_k(struct obj *v, struct obj *k, struct env_obj *env) {
 
   OBJECT_STRING_OBJ_NEW(result_str, res);
 
-  mi_free(res);
+  free(res);
 
   call_closure_one(k, result_str);
 
@@ -133,7 +102,7 @@ void display_k(struct obj *v, struct obj *k, struct env_obj *env) {
 
   printf("%s\n", res);
 
-  mi_free(res);
+  free(res);
 
   call_closure_one(k, NULL);
 
@@ -149,22 +118,11 @@ _Bool obj_is_truthy(struct obj *obj) {
   case OBJ_STR:
     return ((struct string_obj *)obj)->len != 0;
   case OBJ_BOOL:
-    return ((struct bool_obj *)obj)->val;
+    return ((struct bool_obj *)obj)->val != 0;
   default:
     return true;
   }
 }
-
-struct int_obj object_int_obj_not(struct obj *v) {
-  // If you want to only allow certain types, do an explicit check:
-  if (v->tag != OBJ_INT && v->tag != OBJ_STR && v->tag != OBJ_BOOL && v->tag) {
-    RUNTIME_ERROR("'not' expects an int, string, bool; received tag %d", v->tag);
-  }
-  _Bool result = !obj_is_truthy(v);
-  return object_int_obj_new(result);
-}
-
-MAKE_ONE_ARG_FROM_BUILTIN(not, object_int_obj_not, struct int_obj);
 
 void car_k(struct obj *cons, struct obj *k, struct env_obj *env) {
   struct obj *car = ((struct cons_obj *)cons)->car;
@@ -216,9 +174,6 @@ static char *convert_to_str(struct obj *v) {
   case OBJ_INT:
     ALLOC_SPRINTF(res, "%c", (int)((struct int_obj *)v)->val);
     break;
-  case OBJ_BOOL:
-    ALLOC_SPRINTF(res, "%s", (bool)((struct bool_obj *)v)->val ? "true" : "false");
-    break;
   case OBJ_STR:
     ALLOC_SPRINTF(res, "%s", ((struct string_obj *)v)->buf);
     break;
@@ -239,12 +194,12 @@ void string_concat_k_2(struct obj *v, struct obj *k, struct env_obj *env) {
   char *res;
   ALLOC_SPRINTF(res, "%s%s", lhs, rhs);
 
-  mi_free(lhs);
-  mi_free(rhs);
+  free(lhs);
+  free(rhs);
 
   OBJECT_STRING_OBJ_NEW(result_str, res);
 
-  mi_free(res);
+  free(res);
 
   call_closure_one(k, result_str);
 

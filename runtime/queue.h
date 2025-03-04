@@ -1,7 +1,6 @@
 #ifndef SOMESCHEME_QUEUE_H
 #define SOMESCHEME_QUEUE_H
 
-#include <mimalloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +27,7 @@
       initial = 1;                                                             \
     }                                                                          \
                                                                                \
-    TYPE *data = mi_malloc(sizeof(TYPE) * initial);                            \
+    TYPE *data = malloc(sizeof(TYPE) * initial);                               \
     return (struct queue_##TNAME){initial, 0, 0, data};                        \
   }                                                                            \
                                                                                \
@@ -93,6 +92,6 @@
     return queue->head + queue->len - queue->tail;                             \
   }                                                                            \
                                                                                \
-  void queue_##TNAME##_free(struct queue_##TNAME *queue) { mi_free(queue->data); }
+  void queue_##TNAME##_free(struct queue_##TNAME *queue) { free(queue->data); }
 
 #endif // SOMESCHEME_QUEUE_H

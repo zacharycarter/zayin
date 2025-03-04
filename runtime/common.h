@@ -22,17 +22,13 @@
 
 #endif // SOMESCHEME_COMMON_H
 
-#define SAFE_SPRINTF(buf, size, format, ...) \
-    snprintf(buf, size, format, ##__VA_ARGS__)
-
-#define ALLOC_SPRINTF(S, ...)                                                 \
-  do {                                                                        \
-    size_t needed = snprintf(NULL, 0, __VA_ARGS__) + 1;                       \
-    char *buf = mi_malloc(needed);                                            \
-    SAFE_SPRINTF(buf, needed, __VA_ARGS__);                                   \
-    (S) = buf;                                                                \
+#define ALLOC_SPRINTF(S, ...)                                                  \
+  do {                                                                         \
+    size_t needed = snprintf(NULL, 0, __VA_ARGS__) + 1;                        \
+    char *buf = malloc(needed);                                                \
+    sprintf(buf, __VA_ARGS__);                                                 \
+    (S) = buf;                                                                 \
   } while (0)
-
 
 #define SWAP(A, B)                                                             \
   do {                                                                         \

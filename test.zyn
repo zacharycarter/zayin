@@ -1,4 +1,1 @@
-if nil:
-  display true
-else:
-  display false
+if nil: display true else: display false
